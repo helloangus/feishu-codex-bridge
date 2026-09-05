@@ -211,22 +211,63 @@ class CodexServer:
         self._spawn()
 
     def _spawn(self) -> None:
+        self.pending_lock = threading.Lock()
+        self.pending: dict[int, queue.Queue] = {}
+        self.notifications = queue.Queue()
+        self.completions = queue.Queue()
         self.process = subprocess.Popen(
             self.command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             # stdout is a JSON-RPC stream; diagnostics must never be merged into it.
             stderr=subprocess.DEVNULL, text=True, bufsize=1,
         )
+        self.reader = threading.Thread(target=self._receive_rpc, args=(self.process, self.notifications, self.completions), daemon=True)
+        self.reader.start()
+        threading.Thread(target=self._dispatch_events, args=(self.notifications, self.completions), daemon=True).start()
         self._initialize()
+
+    def _receive_rpc(self, process, notifications, completions) -> None:
+        try:
+            for line in process.stdout:
+                message = json.loads(line)
+                if "method" in message:
+                    notifications.put(message)
+                else:
+                    with self.pending_lock:
+                        waiter = self.pending.get(message.get("id"))
+                    if waiter:
+                        waiter.put(message)
+        finally:
+            error = {"error": "codex app-server 连接已关闭"}
+            with self.pending_lock:
+                for waiter in self.pending.values():
+                    waiter.put(error)
+            notifications.put(None)
+
+    def _dispatch_events(self, notifications, completions) -> None:
+        while True:
+            message = notifications.get()
+            if message is None:
+                completions.put({"error": "codex app-server 连接已关闭"})
+                return
+            try:
+                self.handle_event(message)
+            except Exception as exc:
+                print(f"Codex event delivery failed: {type(exc).__name__}", flush=True)
+            finally:
+                if message.get("method") == "turn/completed":
+                    completions.put(message)
 
     def restart(self) -> None:
         old = self.process
         if old.poll() is None:
             old.kill()
             old.wait(timeout=5)
+        self.reader.join(timeout=5)
         self.rpc_id = 0
         self.approvals.clear()
         self.approval_created.clear()
         self.active_turn.clear()
+        self.threads.clear()
         self._spawn()
 
     def send(self, message: dict[str, Any]) -> None:
@@ -239,26 +280,23 @@ class CodexServer:
         self.request("initialize", {"clientInfo": {"name": "feishu-codex-bridge", "version": "0.1.0"}})
         self.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
-    def _read(self) -> dict[str, Any]:
-        assert self.process.stdout is not None
-        line = self.process.stdout.readline()
-        if not line:
-            raise RuntimeError("codex app-server 已退出")
-        return json.loads(line)
-
     def request(self, method: str, params: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
-        self.rpc_id += 1
-        ident = self.rpc_id
-        self.send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            message = self._read()
-            if message.get("id") == ident:
-                if "error" in message:
-                    raise RuntimeError(message["error"])
-                return message.get("result", {})
-            self.handle_event(message)
-        raise TimeoutError(f"Codex 请求超时：{method}")
+        with self.pending_lock:
+            self.rpc_id += 1
+            ident = self.rpc_id
+            waiter = queue.Queue()
+            self.pending[ident] = waiter
+        try:
+            self.send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
+            message = waiter.get(timeout=timeout)
+            if "error" in message:
+                raise RuntimeError(message["error"])
+            return message.get("result", {})
+        except queue.Empty:
+            raise TimeoutError(f"Codex 请求超时：{method}") from None
+        finally:
+            with self.pending_lock:
+                self.pending.pop(ident, None)
 
     def handle_event(self, message: dict[str, Any]) -> None:
         method = message.get("method", "")
@@ -304,9 +342,12 @@ class CodexServer:
         finally:
             self.starting_turns.discard(key)
         while True:
-            message = self._read()
-            self.handle_event(message)
-            if message.get("method") == "turn/completed":
+            message = self.completions.get()
+            if "error" in message:
+                self.active_turn.pop(key, None)
+                raise RuntimeError(message["error"])
+            completed = message.get("params", {})
+            if completed.get("threadId") == thread_id and completed.get("turn", {}).get("id") == turn.get("id"):
                 self.active_turn.pop(key, None)
                 return
 
@@ -321,10 +362,7 @@ class CodexServer:
             return
         # Do not synchronously read the RPC response here: the worker is already
         # consuming the app-server stream for the active turn.
-        self.send({"jsonrpc": "2.0", "id": self.rpc_id + 1,
-                   "method": "turn/interrupt",
-                   "params": {"threadId": thread_id, "turnId": turn_id}})
-        self.rpc_id += 1
+        self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
         self.pending_interrupt.discard(key)
 
     def interrupt(self, key: str) -> bool:
@@ -727,6 +765,9 @@ class Bridge:
     def command(self, user_id: str, chat_id: str, key: str, text: str, source: str = "") -> None:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
+        if self.current_chat.get("active") and (command in ("/new", "/compact") or (command == "/resume" and argument)):
+            self.feishu.card_or_text(chat_id, "任务执行中", "请等待当前任务结束或先停止任务，再切换会话或压缩上下文。", "yellow")
+            return
         if command == "/help":
             card_id = self.feishu.card_or_text(chat_id, "Codex 控制面板", "点击执行操作，也支持输入 /命令。", buttons=[
                 {"text": f"{label} {cmd}", "group": group, "type": "danger" if cmd == "/stop" else "default", "value": {"command": cmd}}
