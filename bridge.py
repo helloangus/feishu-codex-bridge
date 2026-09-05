@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import mimetypes
 import os
 import queue
@@ -27,6 +28,11 @@ SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-cod
 APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
 STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
 GENERATED_IMAGES = Path(os.environ.get("CODEX_GENERATED_IMAGES", str(Path.home() / ".codex" / "generated_images")))
+
+
+def log_event(event: str, **fields: Any) -> None:
+    """Emit parseable diagnostics without chat or command content."""
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 class Feishu:
@@ -134,7 +140,7 @@ class Feishu:
         try:
             return self.card(chat_id, title, content, color, buttons)
         except Exception as exc:
-            print(f"Feishu card failed ({title}): {exc}", flush=True)
+            log_event("card_send_failed", title=title, error_type=type(exc).__name__)
             self.text(chat_id, f"{title}\n{content}")
             return ""
 
@@ -252,7 +258,7 @@ class CodexServer:
             try:
                 self.handle_event(message)
             except Exception as exc:
-                print(f"Codex event delivery failed: {type(exc).__name__}", flush=True)
+                log_event("codex_event_delivery_failed", error_type=type(exc).__name__)
             finally:
                 if message.get("method") == "turn/completed":
                     completions.put(message)
@@ -440,7 +446,7 @@ class Bridge:
                         {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
                     ])
                 except Exception as exc:
-                    print(f"Progress update failed: {type(exc).__name__}", flush=True)
+                    log_event("progress_update_failed", error_type=type(exc).__name__)
 
     def session_key(self, user_id: str) -> str:
         return f"{user_id}:{ROOT}"
@@ -660,7 +666,7 @@ class Bridge:
                 if deliveries:
                     self.feishu.card_or_text(chat_id, "交付物", "\n".join(deliveries))
             except Exception as exc:
-                print(f"event=worker_error key={key} type={type(exc).__name__} message={exc}", flush=True)
+                log_event("worker_error", error_type=type(exc).__name__)
                 if self.server.process.poll() is not None:
                     try:
                         self.server.restart()
@@ -696,7 +702,7 @@ class Bridge:
                 self.feishu.update_card(card_id, title, chunks[0], color)
                 chunks = chunks[1:]
             except Exception as exc:
-                print(f"Feishu card update failed ({title}): {exc}", flush=True)
+                log_event("card_update_failed", title=title, error_type=type(exc).__name__)
         for chunk in chunks:
             self.feishu.card_or_text(chat_id, title, chunk, color)
 
@@ -747,9 +753,10 @@ class Bridge:
             return
         sender = getattr(getattr(event, "sender", None), "sender_id", None)
         user_id = getattr(sender, "open_id", "")
-        print(f"Received Feishu message: open_id={user_id or '<missing>'}", flush=True)
+        user_tag = hashlib.sha256(user_id.encode()).hexdigest()[:12] if user_id else "missing"
+        log_event("message_received", user=user_tag)
         if ALLOWED and user_id not in ALLOWED:
-            print(f"Ignored unauthorized Feishu user: {user_id}", flush=True)
+            log_event("message_ignored", reason="unauthorized", user=user_tag)
             return
         content = json.loads(message.content or "{}")
         message_type = getattr(message, "message_type", "text")
@@ -793,7 +800,7 @@ class Bridge:
                 self.feishu.update_card(card_id, title, content, "green" if yes else "grey")
                 return
             except Exception as exc:
-                print(f"Approval card update failed: {exc}", flush=True)
+                log_event("approval_card_update_failed", error_type=type(exc).__name__)
         self.feishu.card_or_text(chat_id, title, content)
 
     def command(self, user_id: str, chat_id: str, key: str, text: str, source: str = "") -> None:
@@ -908,7 +915,7 @@ def on_card_action(data: Any) -> Any:
                 daemon=True,
             ).start()
     except Exception as exc:
-        print(f"Card action failed: {exc}", flush=True)
+        log_event("card_action_failed", error_type=type(exc).__name__)
     return P2CardActionTriggerResponse({})
 
 
@@ -963,9 +970,9 @@ def patch_lark_card_callback(lark: Any) -> None:
 
 def main() -> None:
     global bridge
-    print(f"Starting Feishu Codex Bridge; cwd={ROOT}", flush=True)
+    log_event("bridge_starting", cwd=str(ROOT))
     bridge = Bridge()
-    print(f"Feishu Codex Bridge ready; cwd={ROOT}", flush=True)
+    log_event("bridge_ready", cwd=str(ROOT))
     import lark_oapi as lark
     patch_lark_card_callback(lark)
     handler = (lark.EventDispatcherHandler.builder("", "")

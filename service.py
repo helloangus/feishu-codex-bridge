@@ -20,6 +20,8 @@ APP_LOCK = APP_LOCK_DIR / (hashlib.sha256(os.environ.get('FEISHU_APP_ID', 'unkno
 
 def redact(text):
     text = re.sub(r'wss?://\S+', '[WebSocket endpoint]', text)
+    text = re.sub(r'(?i)bearer\s+[A-Za-z0-9._-]+', 'Bearer [redacted]', text)
+    text = re.sub(r'\bt-[A-Za-z0-9_-]{12,}\b', '[redacted]', text)
     for name in ('FEISHU_APP_SECRET', 'FEISHU_APP_ID'):
         secret = os.environ.get(name)
         if secret:
@@ -105,7 +107,7 @@ def _run_local(foreground=False):
                 child = subprocess.Popen([sys.executable, '-u', str(BASE / 'bridge.py')],
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True, start_new_session=True)
-                logger.info('Bridge process started: pid=%s', child.pid)
+                logger.info('event=bridge_started pid=%s', child.pid)
                 for line in child.stdout:
                     safe = redact(line.rstrip())
                     logger.info(safe)
