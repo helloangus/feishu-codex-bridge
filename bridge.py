@@ -76,11 +76,14 @@ class Feishu:
                   buttons: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         elements: list[dict[str, Any]] = [{"tag": "markdown", "content": content or "（无内容）"}]
         if buttons:
-            elements.append({"tag": "action", "actions": [
-                {"tag": "button", "text": {"tag": "plain_text", "content": item["text"]},
-                 "type": item.get("type", "default"), "value": item["value"]}
-                for item in buttons
-            ]})
+            # Card JSON 2.0 uses a button element with a callback behavior.
+            # The legacy `action` container is rejected by the current API.
+            elements.extend({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": item["text"]},
+                "type": item.get("type", "default"),
+                "behaviors": [{"type": "callback", "value": item["value"]}],
+            } for item in buttons)
         return {"schema": "2.0", "header": {
             "template": color,
             "title": {"tag": "plain_text", "content": title},
