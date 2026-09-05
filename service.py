@@ -66,14 +66,14 @@ def run(foreground=False):
         handler = RotatingFileHandler(STATE / 'bridge.log', maxBytes=2*1024*1024, backupCount=3, encoding='utf-8')
         handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
         logger.addHandler(handler)
-        child = subprocess.Popen([sys.executable, '-u', str(BASE / 'bridge.py')],
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, start_new_session=True)
         stopping = False
+        child = None
 
         def shutdown(*_):
-            nonlocal stopping
+            nonlocal stopping, child
             stopping = True
+            if child is None:
+                return
             try:
                 os.killpg(child.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -81,13 +81,25 @@ def run(foreground=False):
         signal.signal(signal.SIGTERM, shutdown)
         signal.signal(signal.SIGINT, shutdown)
         try:
-            for line in child.stdout:
-                safe = redact(line.rstrip())
-                logger.info(safe)
-                if foreground:
-                    print(safe, flush=True)
-            code = child.wait()
-            logger.info('Bridge exited: %s; requested=%s', code, stopping)
+            restart_delay = 2
+            while not stopping:
+                child = subprocess.Popen([sys.executable, '-u', str(BASE / 'bridge.py')],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, start_new_session=True)
+                logger.info('Bridge process started: pid=%s', child.pid)
+                for line in child.stdout:
+                    safe = redact(line.rstrip())
+                    logger.info(safe)
+                    if foreground:
+                        print(safe, flush=True)
+                code = child.wait()
+                logger.info('Bridge exited: %s; requested=%s', code, stopping)
+                child = None
+                if stopping or code == 0:
+                    break
+                logger.info('Bridge crashed; restarting in %s seconds', restart_delay)
+                time.sleep(restart_delay)
+                restart_delay = min(restart_delay * 2, 30)
         finally:
             shutdown()
             handler.close()
