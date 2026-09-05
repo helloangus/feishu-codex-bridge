@@ -1,0 +1,31 @@
+# Feishu Codex Bridge
+
+Termux 下通过飞书长连接使用当前目录的 Codex app-server。
+
+## 安装
+
+```sh
+pkg install python
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+在飞书企业自建应用中开启机器人，订阅 `im.message.receive_v1`，订阅方式选择“使用长连接接收事件”，并授予机器人读取/发送消息及上传文件的权限。
+
+确认本机已登录 Codex，且 `codex app-server` 可启动。然后在目标项目目录启动：
+
+```sh
+set -a; . ./.env; set +a
+python /path/to/feishu-codex-bridge/bridge.py
+```
+
+普通文本会进入当前目录的 Codex thread。支持 `/new`、`/resume <thread_id>`、`/model [model]`、`/models`、`/status`、`/approve <id>`、`/deny <id>`。
+
+每轮完成后会回传最终文字，并上传当前目录中本轮新增或修改的文件（最多 10 个，单文件大小由 `CODEX_MAX_ATTACHMENT_BYTES` 控制）。图片暂按文件附件发送。
+
+首次测试建议发送：
+
+```text
+/status
+请只回复：连接测试成功
+```
