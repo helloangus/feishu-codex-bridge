@@ -26,6 +26,7 @@ MAX_ATTACHMENT = int(os.environ.get("CODEX_MAX_ATTACHMENT_BYTES", str(20 * 1024 
 SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-codex-session")))
 APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
 STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
+GENERATED_IMAGES = Path(os.environ.get("CODEX_GENERATED_IMAGES", str(Path.home() / ".codex" / "generated_images")))
 
 
 class Feishu:
@@ -353,6 +354,7 @@ class Bridge:
             self.current_chat["active"] = chat_id
             try:
                 before = self.snapshot()
+                started_at = time.time()
                 self.feishu.text(chat_id, "Codex 开始处理…")
                 extra_inputs: list[dict[str, Any]] = []
                 if resource:
@@ -375,6 +377,8 @@ class Bridge:
                     self.feishu.text(chat_id, "[Codex 进度]\n" + remainder)
                 self.feishu.text(chat_id, self.server.turn_text or "Codex 已完成，但没有返回文字。")
                 for path in self.changed_files(before):
+                    self.feishu.upload_file(chat_id, path)
+                for path in self.generated_files(key, started_at):
                     self.feishu.upload_file(chat_id, path)
             except Exception as exc:
                 if self.server.process.poll() is not None:
@@ -410,6 +414,23 @@ class Bridge:
                 if path.is_relative_to(ROOT) and path.stat().st_size <= MAX_ATTACHMENT:
                     changed.append(path)
         return changed[:10]
+
+    def generated_files(self, key: str, started_at: float) -> list[Path]:
+        thread_id = self.server.threads.get(key)
+        if not thread_id:
+            return []
+        directory = GENERATED_IMAGES / thread_id
+        if not directory.is_dir():
+            return []
+        result: list[Path] = []
+        for path in directory.iterdir():
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+                try:
+                    if path.stat().st_mtime >= started_at - 2:
+                        result.append(path)
+                except OSError:
+                    pass
+        return sorted(result, key=lambda p: p.stat().st_mtime)[:10]
 
     def receive(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         event = data.event
