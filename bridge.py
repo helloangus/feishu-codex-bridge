@@ -94,11 +94,12 @@ class Feishu:
                 "behaviors": [{"type": "callback", "value": item["value"]}],
                 }
                 if item.get("description"):
-                    elements.append({"tag": "column_set", "horizontal_spacing": "8px", "columns": [
-                        {"tag": "column", "width": "weighted", "weight": 3,
-                         "elements": [{"tag": "markdown", "content": item["description"]}]},
-                        {"tag": "column", "width": "weighted", "weight": 1, "elements": [button]},
-                    ]})
+                    # Vertical layout is deliberately used for mobile: a narrow
+                    # side button truncates labels such as a model identifier.
+                    if len(elements) > 1:
+                        elements.append({"tag": "hr"})
+                    elements.append({"tag": "markdown", "content": item["description"]})
+                    elements.append(button)
                 elif item.get("group"):
                     if not elements or elements[-1].get("_group") != item["group"]:
                         elements.append({"tag": "markdown", "content": f"<font color='grey'>{item['group']}</font>"})
@@ -826,10 +827,10 @@ class Bridge:
         if command == "/help":
             card_id = self.feishu.card_or_text(chat_id, "Codex 控制面板", "点击执行操作，也支持输入 /命令。", buttons=[
                 {"text": f"{label} {cmd}", "group": group, "type": "danger" if cmd == "/stop" else "default", "value": {"command": cmd}}
-                for group, label, cmd in [("会话", "恢复会话", "/resume"), ("会话", "新建会话", "/new"),
-                                         ("模型", "当前模型", "/model"), ("模型", "可用模型", "/models"),
-                                         ("任务", "查看状态", "/status"), ("任务", "压缩上下文", "/compact"),
-                                         ("", "停止当前任务", "/stop")]
+                for group, label, cmd in [("会话", "恢复", "/resume"), ("会话", "新建", "/new"),
+                                         ("模型", "当前", "/model"), ("模型", "列表", "/models"),
+                                         ("任务", "状态", "/status"), ("任务", "压缩", "/compact"),
+                                         ("", "停止", "/stop")]
             ])
             if card_id:
                 self.help_cards[card_id] = (chat_id, key)
@@ -871,8 +872,8 @@ class Bridge:
                 available = self.server.models()
                 selected = self.models.get(key, DEFAULT_MODEL)
                 buttons = [{
-                    "text": ("✓ " if model == selected else "") + model,
-                    "description": "当前模型" if model == selected else "",
+                    "text": "当前模型" if model == selected else "使用此模型",
+                    "description": f"**{model}**" + ("\n\n当前使用" if model == selected else ""),
                     "type": "primary" if model == selected else "default",
                     "value": {"command": "/model", "model": model},
                 } for model in available[:12]]
