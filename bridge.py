@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
@@ -417,6 +418,9 @@ class Bridge:
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
         self.active_cards: dict[str, str] = {}
+        self.active_task_tokens: dict[str, str] = {}
+        self.stopping_tasks: set[str] = set()
+        self.task_lock = threading.Lock()
         self.help_cards: dict[str, tuple[str, str]] = {}
         self.approval_cards: dict[int, str] = {}
         self.approval_summaries: dict[int, str] = {}
@@ -445,7 +449,7 @@ class Bridge:
                 content = f"已耗时 {elapsed} 秒\n\n{preview[-5000:]}"
                 try:
                     self.feishu.update_card(state["card"], "Codex 处理中", content, "blue", [
-                        {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
+                        {"text": "停止任务", "type": "danger", "value": {"command": "/stop", "task_id": state["task_id"]}}
                     ])
                 except Exception as exc:
                     log_event("progress_update_failed", error_type=type(exc).__name__)
@@ -626,6 +630,10 @@ class Bridge:
                 self.feishu.card_or_text(chat_id, "任务已取消", "任务仍在等待队列中，已取消执行。", "red")
                 self.jobs.task_done()
                 continue
+            task_id = uuid.uuid4().hex
+            with self.task_lock:
+                self.active_task_tokens[key] = task_id
+                self.stopping_tasks.discard(key)
             self.current_chat["active"] = chat_id
             self.approval_items.clear()
             self.current_chat["key"] = key
@@ -633,11 +641,11 @@ class Bridge:
                 before = self.snapshot()
                 started_at = time.time()
                 card_id = self.feishu.card_or_text(chat_id, "Codex 开始处理", f"目录：`{ROOT}`\n\n正在准备执行…", "blue", [
-                    {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
+                    {"text": "停止任务", "type": "danger", "value": {"command": "/stop", "task_id": task_id}}
                 ])
                 self.active_cards[chat_id] = card_id
                 with self.progress_lock:
-                    self.progress = {"card": card_id, "started": time.monotonic(), "text": "正在准备执行…"}
+                    self.progress = {"card": card_id, "task_id": task_id, "started": time.monotonic(), "text": "正在准备执行…"}
                 self.card_updated_at[chat_id] = time.time()
                 extra_inputs: list[dict[str, Any]] = []
                 if resource:
@@ -696,6 +704,10 @@ class Bridge:
                 self.card_updated_at.pop(chat_id, None)
                 self.current_chat.pop("active", None)
                 self.current_chat.pop("key", None)
+                with self.task_lock:
+                    if self.active_task_tokens.get(key) == task_id:
+                        self.active_task_tokens.pop(key, None)
+                        self.stopping_tasks.discard(key)
                 self.jobs.task_done()
 
     @staticmethod
@@ -924,12 +936,21 @@ class Bridge:
             self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
         elif command == "/stop":
             try:
-                if source and self.help_cards.get(source) != (chat_id, key) and (self.active_cards.get(chat_id) != source or self.current_chat.get("key") != key):
-                    raise ValueError("这张卡片对应的任务已结束，不能停止其他任务")
+                with self.task_lock:
+                    active_task = self.active_task_tokens.get(key, "")
+                    if argument and active_task != argument:
+                        raise ValueError("这张任务卡已失效，不能停止其他任务")
+                    if active_task and key in self.stopping_tasks:
+                        self.feishu.card_or_text(chat_id, "停止请求已提交", "任务正在停止，请等待结果。", "yellow")
+                        return
+                    if active_task:
+                        self.stopping_tasks.add(key)
                 self.generations[key] = self.generations.get(key, 0) + 1
                 interrupted = self.server.interrupt(key)
                 self.feishu.card_or_text(chat_id, "停止请求已提交", "正在停止当前 Codex turn。" if interrupted else "已取消排队任务，并登记停止正在启动的任务。", "yellow")
             except Exception as exc:
+                with self.task_lock:
+                    self.stopping_tasks.discard(key)
                 self.feishu.card_or_text(chat_id, "停止失败", str(exc), "red")
         elif command == "/compact":
             try:
@@ -970,6 +991,8 @@ def on_card_action(data: Any) -> Any:
             command += f" {int(value.get('id'))}"
         elif command == "/resume" and value.get("thread_id"):
             command += f" {value['thread_id']}"
+        elif command == "/stop" and value.get("task_id"):
+            command += f" {value['task_id']}"
         elif command == "/model" and value.get("model"):
             command += f" {value['model']}"
         chat_id = getattr(context, "open_chat_id", "")
