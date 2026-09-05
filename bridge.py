@@ -27,6 +27,7 @@ DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "")
 MAX_ATTACHMENT = int(os.environ.get("CODEX_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
 SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-codex-session")))
 SETTINGS_FILE = Path(os.environ.get("CODEX_SETTINGS_FILE", str(ROOT / ".feishu-codex-settings")))
+SEEN_MESSAGES_FILE = Path(os.environ.get("CODEX_SEEN_MESSAGES_FILE", str(ROOT / ".feishu-codex-seen-messages")))
 APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
 STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
 GENERATED_IMAGES = Path(os.environ.get("CODEX_GENERATED_IMAGES", str(Path.home() / ".codex" / "generated_images")))
@@ -434,6 +435,8 @@ class Bridge:
         self.generations: dict[str, int] = {}
         self.seen_messages: deque[str] = deque(maxlen=1000)
         self.seen_message_set: set[str] = set()
+        self.seen_lock = threading.Lock()
+        self.load_seen_messages()
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.approval_reaper, daemon=True).start()
         threading.Thread(target=self.progress_worker, daemon=True).start()
@@ -522,14 +525,42 @@ class Bridge:
         except json.JSONDecodeError:
             SESSION_FILE.unlink(missing_ok=True)
 
+    def load_seen_messages(self) -> None:
+        """Restore a bounded event-id journal so reconnects cannot replay work."""
+        try:
+            parsed = json.loads(SEEN_MESSAGES_FILE.read_text(encoding="utf-8"))
+            if not isinstance(parsed, list):
+                return
+            for message_id in parsed[-self.seen_messages.maxlen:]:
+                message_id = str(message_id)
+                if message_id and message_id not in self.seen_message_set:
+                    self.seen_messages.append(message_id)
+                    self.seen_message_set.add(message_id)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return
+
+    def save_seen_messages(self) -> None:
+        temporary = SEEN_MESSAGES_FILE.with_name(SEEN_MESSAGES_FILE.name + ".tmp")
+        try:
+            temporary.write_text(json.dumps(list(self.seen_messages), ensure_ascii=False) + "\n", encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, SEEN_MESSAGES_FILE)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            log_event("message_dedup_save_failed", error_type=type(exc).__name__)
+
     def remember_message(self, message_id: str) -> bool:
-        if not message_id or message_id in self.seen_message_set:
+        if not message_id:
             return False
-        if len(self.seen_messages) == self.seen_messages.maxlen:
-            self.seen_message_set.discard(self.seen_messages[0])
-        self.seen_messages.append(message_id)
-        self.seen_message_set.add(message_id)
-        return True
+        with self.seen_lock:
+            if message_id in self.seen_message_set:
+                return False
+            if len(self.seen_messages) == self.seen_messages.maxlen:
+                self.seen_message_set.discard(self.seen_messages[0])
+            self.seen_messages.append(message_id)
+            self.seen_message_set.add(message_id)
+            self.save_seen_messages()
+            return True
 
     def approval_summary(self, request: dict[str, Any]) -> str:
         params = request.get("params", {})
@@ -816,12 +847,15 @@ class Bridge:
     def receive(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         event = data.event
         message = event.message
-        if not self.remember_message(getattr(message, "message_id", "")):
+        message_id = getattr(message, "message_id", "")
+        message_tag = hashlib.sha256(message_id.encode()).hexdigest()[:12] if message_id else "missing"
+        if not self.remember_message(message_id):
+            log_event("message_ignored", reason="duplicate", message=message_tag)
             return
         sender = getattr(getattr(event, "sender", None), "sender_id", None)
         user_id = getattr(sender, "open_id", "")
         user_tag = hashlib.sha256(user_id.encode()).hexdigest()[:12] if user_id else "missing"
-        log_event("message_received", user=user_tag)
+        log_event("message_received", user=user_tag, message=message_tag)
         if ALLOWED and user_id not in ALLOWED:
             log_event("message_ignored", reason="unauthorized", user=user_tag)
             return

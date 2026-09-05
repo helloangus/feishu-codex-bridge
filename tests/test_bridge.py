@@ -61,6 +61,29 @@ class BridgeTests(unittest.TestCase):
             finally:
                 bridge.SESSION_FILE, bridge.SETTINGS_FILE = original_session, original_settings
 
+    def test_message_deduplication_survives_a_bridge_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = bridge.SEEN_MESSAGES_FILE
+            try:
+                bridge.SEEN_MESSAGES_FILE = Path(directory) / "seen.json"
+                first = bridge.Bridge.__new__(bridge.Bridge)
+                first.seen_messages = bridge.deque(maxlen=1000)
+                first.seen_message_set = set()
+                first.seen_lock = threading.Lock()
+                first.load_seen_messages()
+                self.assertTrue(first.remember_message("message-1"))
+                self.assertFalse(first.remember_message("message-1"))
+
+                restarted = bridge.Bridge.__new__(bridge.Bridge)
+                restarted.seen_messages = bridge.deque(maxlen=1000)
+                restarted.seen_message_set = set()
+                restarted.seen_lock = threading.Lock()
+                restarted.load_seen_messages()
+                self.assertFalse(restarted.remember_message("message-1"))
+                self.assertTrue(restarted.remember_message("message-2"))
+            finally:
+                bridge.SEEN_MESSAGES_FILE = original
+
     def test_status_reports_idle_and_active_task(self):
         item = bridge.Bridge.__new__(bridge.Bridge)
         item.server = SimpleNamespace(threads={})

@@ -52,6 +52,8 @@ python /path/to/feishu-codex-bridge/bridge.py
 
 普通文本会进入当前目录的 Codex thread。会话 ID 自动保存到 `.feishu-codex-session`，模型偏好保存到 `.feishu-codex-settings`，并按飞书用户和工作目录隔离；重启后首次提问会自动恢复。`/models` 会发送模型选择卡片。`/status` 会显示任务状态、队列、会话、模型和桥接运行时长。支持 `/new`、`/resume [thread_id]`、`/model [model]`、`/models`、`/status`、`/stop`、`/compact`、`/approve <id>`、`/deny <id>`。
 
+最近处理过的飞书消息 ID 会保存到 `.feishu-codex-seen-messages`（权限 `600`，最多 1,000 条），因此服务重启或飞书重投旧事件时不会重复执行或重复回复。日志仅记录消息 ID 的短哈希，便于排查，不记录聊天内容。
+
 机器人会使用交互式卡片展示状态、进度、最终回复、审批和常用命令；处理中卡片可直接点击“停止任务”，审批卡片可直接点击“允许/拒绝”，`/stop`、`/approve` 等文本命令仍然兼容。每轮完成后会回传最终 Markdown，并上传当前目录中本轮新增或修改的文件（最多 10 个，单文件大小由 `CODEX_MAX_ATTACHMENT_BYTES` 控制）。飞书图片/文件会下载到 `feishu-inbox` 后交给 Codex 读取；该目录不会被当成交付物再次上传。审批请求超过 `CODEX_APPROVAL_TIMEOUT_SECONDS` 秒会自动拒绝。
 
 首次测试建议发送：
