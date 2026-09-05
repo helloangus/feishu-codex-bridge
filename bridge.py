@@ -78,12 +78,16 @@ class Feishu:
         if buttons:
             # Card JSON 2.0 uses a button element with a callback behavior.
             # The legacy `action` container is rejected by the current API.
-            elements.extend({
+            for item in buttons:
+                if item.get("description"):
+                    elements.append({"tag": "hr"})
+                    elements.append({"tag": "markdown", "content": item["description"]})
+                elements.append({
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": item["text"]},
                 "type": item.get("type", "default"),
                 "behaviors": [{"type": "callback", "value": item["value"]}],
-            } for item in buttons)
+                })
         return {"schema": "2.0", "header": {
             "template": color,
             "title": {"tag": "plain_text", "content": title},
@@ -354,6 +358,8 @@ class Bridge:
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
         self.active_cards: dict[str, str] = {}
+        self.approval_cards: dict[int, str] = {}
+        self.approval_lock = threading.Lock()
         self.card_updated_at: dict[str, float] = {}
         self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None, int]] = queue.Queue()
         self.generations: dict[str, int] = {}
@@ -418,7 +424,7 @@ class Bridge:
             self.server.approval_created[request_id] = time.time()
             chat_id = self.server.approvals[request_id]
             if chat_id:
-                self.feishu.card_or_text(chat_id, "需要审批", f"Codex 请求执行一项需要确认的操作。\n\n审批编号：`{request_id}`", "yellow", [
+                self.approval_cards[request_id] = self.feishu.card_or_text(chat_id, "需要审批", f"Codex 请求执行一项需要确认的操作。\n\n审批编号：`{request_id}`", "yellow", [
                     {"text": "允许", "type": "primary", "value": {"command": "/approve", "id": request_id}},
                     {"text": "拒绝", "type": "danger", "value": {"command": "/deny", "id": request_id}},
                 ])
@@ -432,9 +438,7 @@ class Bridge:
                     continue
                 chat_id = self.server.approvals.get(request_id, "")
                 try:
-                    self.server.approve(request_id, False)
-                    if chat_id:
-                        self.feishu.card_or_text(chat_id, "审批已超时", f"审批编号：`{request_id}`\n\n已自动拒绝。", "red")
+                    self.resolve_approval(request_id, chat_id, False, expired=True)
                 except Exception:
                     self.server.approval_created.pop(request_id, None)
 
@@ -446,6 +450,7 @@ class Bridge:
                 self.jobs.task_done()
                 continue
             self.current_chat["active"] = chat_id
+            self.current_chat["key"] = key
             try:
                 before = self.snapshot()
                 started_at = time.time()
@@ -491,6 +496,7 @@ class Bridge:
                 self.active_cards.pop(chat_id, None)
                 self.card_updated_at.pop(chat_id, None)
                 self.current_chat.pop("active", None)
+                self.current_chat.pop("key", None)
                 self.jobs.task_done()
 
     def finish_card(self, chat_id: str, title: str, content: str, color: str) -> None:
@@ -582,7 +588,26 @@ class Bridge:
             generation = self.generations.get(key, 0)
             self.jobs.put((key, message.chat_id, text, resource, generation))
 
-    def command(self, user_id: str, chat_id: str, key: str, text: str) -> None:
+    def resolve_approval(self, request_id: int, chat_id: str, yes: bool,
+                         expired: bool = False, source: str = "") -> None:
+        with self.approval_lock:
+            if self.server.approvals.get(request_id) != chat_id:
+                raise ValueError("审批已处理、已过期或不属于当前聊天")
+            if source and self.approval_cards.get(request_id) != source:
+                raise ValueError("旧审批卡片已失效")
+            self.server.approve(request_id, yes)
+            card_id = self.approval_cards.pop(request_id, "")
+        title = "审批已超时" if expired else ("已允许" if yes else "已拒绝")
+        content = f"审批编号：`{request_id}`\n\n" + ("已自动拒绝。" if expired else "审批决定已提交。")
+        if card_id:
+            try:
+                self.feishu.update_card(card_id, title, content, "green" if yes else "grey")
+                return
+            except Exception as exc:
+                print(f"Approval card update failed: {exc}", flush=True)
+        self.feishu.card_or_text(chat_id, title, content)
+
+    def command(self, user_id: str, chat_id: str, key: str, text: str, source: str = "") -> None:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
         if command == "/help":
@@ -606,9 +631,9 @@ class Bridge:
             try:
                 threads = self.server.list_threads()
                 shown = threads[:8]
-                content = "\n".join(f"- `{item.get('id')}`　{item.get('title') or '未命名'}" for item in shown) or "没有找到会话"
-                buttons = [{"text": "恢复", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
-                           for item in shown if item.get("id")]
+                content = "选择下方会话继续对话。" if shown else "没有找到会话"
+                buttons = [{"text": f"恢复会话 {index}", "description": f"**{index}. {item.get('title') or '未命名'}**\n`{item.get('id')}`", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
+                           for index, item in enumerate(shown, 1) if item.get("id")]
                 # A resume button carries the same command semantics as text.
                 for button in buttons:
                     button["value"]["command"] = "/resume"
@@ -628,6 +653,8 @@ class Bridge:
             self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
         elif command == "/stop":
             try:
+                if source and (self.active_cards.get(chat_id) != source or self.current_chat.get("key") != key):
+                    raise ValueError("这张卡片对应的任务已结束，不能停止其他任务")
                 self.generations[key] = self.generations.get(key, 0) + 1
                 interrupted = self.server.interrupt(key)
                 self.feishu.card_or_text(chat_id, "停止请求已提交", "正在停止当前 Codex turn。" if interrupted else "已取消排队任务，并登记停止正在启动的任务。", "yellow")
@@ -641,8 +668,7 @@ class Bridge:
                 self.feishu.card_or_text(chat_id, "压缩失败", str(exc), "red")
         elif command in ("/approve", "/deny") and argument.isdigit():
             try:
-                self.server.approve(int(argument), command == "/approve")
-                self.feishu.card_or_text(chat_id, "审批结果已提交", "Codex 已收到你的审批决定。", "green")
+                self.resolve_approval(int(argument), chat_id, command == "/approve", source=source)
             except Exception as exc:
                 self.feishu.card_or_text(chat_id, f"审批失败：{argument}", str(exc), "red")
         else:
@@ -679,7 +705,8 @@ def on_card_action(data: Any) -> Any:
                 return P2CardActionTriggerResponse({})
             threading.Thread(
                 target=bridge.command,
-                args=(user_id, chat_id, bridge.session_key(user_id), command),
+                args=(user_id, chat_id, bridge.session_key(user_id), command,
+                      getattr(context, "open_message_id", "")),
                 daemon=True,
             ).start()
     except Exception as exc:
