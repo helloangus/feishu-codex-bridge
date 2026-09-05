@@ -9,7 +9,31 @@
 
 Termux 下通过飞书长连接使用当前目录的 Codex app-server。
 
-## 安装
+## 在另一台 Termux 上部署
+
+推荐使用引导脚本。将仓库复制或 `git clone` 到新设备后，在**希望 Codex 操作的项目目录**执行：
+
+```sh
+/path/to/feishu-codex-bridge/setup.sh
+```
+
+脚本会自动安装 Python（仅 Termux 缺少时）、安装 Python 依赖、检查 Codex CLI、交互式生成权限为 `600` 的 `.env`，然后启动服务。已有 `.env` 不会被覆盖。只检查环境而不修改内容可执行：
+
+```sh
+/path/to/feishu-codex-bridge/setup.sh --check
+```
+
+以下事项无法由程序代替，首次部署时按提示完成即可：
+
+1. 在目标设备安装并登录 Codex CLI，确认 `codex --version` 可用。
+2. 在飞书开放平台创建企业自建应用并启用机器人；复制 App ID 与 App Secret 给引导脚本。
+3. 在“事件与回调”配置事件订阅 `im.message.receive_v1`，在“回调配置”配置卡片回传 `card.action.trigger`；两项均选择“使用长连接接收”。
+4. 为机器人授予读取/发送消息、发送/更新消息卡片及上传文件权限，并发布应用版本。
+5. 建议填写自己的飞书 `open_id` 作为白名单；不知道时可暂留空进行私聊测试，但这会允许任何能私聊机器人的人使用它。
+
+运行结束后，在飞书私聊机器人发送 `/help`。迁移到新设备不会迁移旧设备的 Codex 登录态、飞书凭据或会话记录；如需延续旧会话，请安全地手工迁移工作目录内的 `.feishu-codex-session` 与 `.feishu-codex-settings`。
+
+## 手动安装（排障用）
 
 ```sh
 pkg install python
