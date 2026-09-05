@@ -18,4 +18,4 @@ if [ -z "${CODEX_BRIDGE_CWD:-}" ]; then
   export CODEX_BRIDGE_CWD="$(pwd)"
 fi
 
-exec python "$BRIDGE_DIR/bridge.py"
+exec python "$BRIDGE_DIR/service.py" "${@:-start}"

@@ -1,5 +1,11 @@
 # Feishu Codex Bridge
 
+后台管理：`./start.sh start`（默认）、`./start.sh stop`、`./start.sh restart`、
+`./start.sh status`、`./start.sh logs`。前台排查使用 `./start.sh foreground`。
+请统一用此入口启动，进程锁防止同一项目重复启动。
+日志在 `.runtime/bridge.log`，每份 2 MiB，保留 3 份备份；认证参数自动过滤。
+运行目录不作为交付物上传。尚未配置开机启动或崩溃自动重启。
+
 Termux 下通过飞书长连接使用当前目录的 Codex app-server。
 
 ## 安装

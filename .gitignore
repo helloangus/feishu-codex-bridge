@@ -2,3 +2,4 @@
 .feishu-codex-session
 __pycache__/
 *.pyc
+.runtime/

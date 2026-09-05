@@ -631,7 +631,7 @@ class Bridge:
     def snapshot(self) -> dict[str, tuple[int, int]]:
         result: dict[str, tuple[int, int]] = {}
         for path in ROOT.rglob("*"):
-            if (not path.is_file() or ".git" in path.parts or
+            if (not path.is_file() or ".git" in path.parts or ".runtime" in path.parts or
                     "feishu-inbox" in path.parts or path.name.startswith(".feishu-codex")):
                 continue
             try:
