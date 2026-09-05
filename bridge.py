@@ -71,6 +71,52 @@ class Feishu:
                 "content": json.dumps({"text": value[offset:offset + 3500]}, ensure_ascii=False),
             })
 
+    @staticmethod
+    def make_card(title: str, content: str, color: str = "blue",
+                  buttons: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        elements: list[dict[str, Any]] = [{"tag": "markdown", "content": content or "（无内容）"}]
+        if buttons:
+            elements.append({"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": item["text"]},
+                 "type": item.get("type", "default"), "value": item["value"]}
+                for item in buttons
+            ]})
+        return {"schema": "2.0", "header": {
+            "template": color,
+            "title": {"tag": "plain_text", "content": title},
+        }, "body": {"elements": elements}}
+
+    def card(self, chat_id: str, title: str, content: str, color: str = "blue",
+             buttons: list[dict[str, Any]] | None = None) -> str:
+        result = self.api("/im/v1/messages?receive_id_type=chat_id", {
+            "receive_id": chat_id, "msg_type": "interactive",
+            "content": json.dumps(self.make_card(title, content, color, buttons), ensure_ascii=False),
+        })
+        return str(result.get("data", {}).get("message_id", ""))
+
+    def update_card(self, message_id: str, title: str, content: str, color: str = "blue",
+                    buttons: list[dict[str, Any]] | None = None) -> None:
+        if not message_id:
+            return
+        response = self.http.patch(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {self.token()}"},
+            json={"msg_type": "interactive",
+                  "content": json.dumps(self.make_card(title, content, color, buttons), ensure_ascii=False)},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("code", 0) != 0:
+            raise RuntimeError(data)
+
+    def card_or_text(self, chat_id: str, title: str, content: str, color: str = "blue",
+                     buttons: list[dict[str, Any]] | None = None) -> str:
+        try:
+            return self.card(chat_id, title, content, color, buttons)
+        except Exception:
+            self.text(chat_id, f"{title}\n{content}")
+            return ""
+
     def upload_file(self, chat_id: str, path: Path) -> None:
         if path.stat().st_size > MAX_ATTACHMENT:
             self.text(chat_id, f"交付物过大，未上传：{path.name}（{path.stat().st_size} bytes）")
@@ -303,6 +349,8 @@ class Bridge:
         self.models: dict[str, str] = {}
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
+        self.active_cards: dict[str, str] = {}
+        self.card_updated_at: dict[str, float] = {}
         self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None, int]] = queue.Queue()
         self.generations: dict[str, int] = {}
         self.seen_messages: deque[str] = deque(maxlen=1000)
@@ -347,16 +395,29 @@ class Bridge:
                 return
             buffer = self.stream_buffers.get(chat_id, "") + str(value)
             while len(buffer) >= STREAM_CHUNK:
-                self.feishu.text(chat_id, "[Codex 进度]\n" + buffer[:STREAM_CHUNK])
                 buffer = buffer[STREAM_CHUNK:]
             self.stream_buffers[chat_id] = buffer
+            card_id = self.active_cards.get(chat_id, "")
+            now = time.time()
+            if card_id and now - self.card_updated_at.get(chat_id, 0) >= 2:
+                preview = self.server.turn_text[-5000:] or "正在生成回复…"
+                try:
+                    self.feishu.update_card(card_id, "Codex 处理中", preview, "blue", [
+                        {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
+                    ])
+                    self.card_updated_at[chat_id] = now
+                except Exception:
+                    pass
         elif kind == "approval":
             request_id = int(value["id"])
             self.server.approvals[request_id] = self.current_chat.get("active", "")
             self.server.approval_created[request_id] = time.time()
             chat_id = self.server.approvals[request_id]
             if chat_id:
-                self.feishu.text(chat_id, f"Codex 请求审批（{request_id}）。回复 /approve {request_id} 或 /deny {request_id}")
+                self.feishu.card_or_text(chat_id, "需要审批", f"Codex 请求执行一项需要确认的操作。\n\n审批编号：`{request_id}`", "yellow", [
+                    {"text": "允许", "type": "primary", "value": {"command": "/approve", "id": request_id}},
+                    {"text": "拒绝", "type": "danger", "value": {"command": "/deny", "id": request_id}},
+                ])
 
     def approval_reaper(self) -> None:
         while True:
@@ -369,7 +430,7 @@ class Bridge:
                 try:
                     self.server.approve(request_id, False)
                     if chat_id:
-                        self.feishu.text(chat_id, f"审批 {request_id} 已超时，已自动拒绝。")
+                        self.feishu.card_or_text(chat_id, "审批已超时", f"审批编号：`{request_id}`\n\n已自动拒绝。", "red")
                 except Exception:
                     self.server.approval_created.pop(request_id, None)
 
@@ -377,14 +438,18 @@ class Bridge:
         while True:
             key, chat_id, prompt, resource, generation = self.jobs.get()
             if generation != self.generations.get(key, 0):
-                self.feishu.text(chat_id, "任务已取消（仍在等待队列中）。")
+                self.feishu.card_or_text(chat_id, "任务已取消", "任务仍在等待队列中，已取消执行。", "red")
                 self.jobs.task_done()
                 continue
             self.current_chat["active"] = chat_id
             try:
                 before = self.snapshot()
                 started_at = time.time()
-                self.feishu.text(chat_id, "Codex 开始处理…")
+                card_id = self.feishu.card_or_text(chat_id, "Codex 开始处理", f"目录：`{ROOT}`\n\n正在准备执行…", "blue", [
+                    {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
+                ])
+                self.active_cards[chat_id] = card_id
+                self.card_updated_at[chat_id] = time.time()
                 extra_inputs: list[dict[str, Any]] = []
                 if resource:
                     local_path = self.feishu.download_resource(
@@ -401,13 +466,11 @@ class Bridge:
                     self.server.resume(key, stored)
                 self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL), extra_inputs)
                 self.save_session(self.server.threads[key])
-                remainder = self.stream_buffers.pop(chat_id, "")
-                if remainder:
-                    self.feishu.text(chat_id, "[Codex 进度]\n" + remainder)
+                self.stream_buffers.pop(chat_id, "")
                 if self.server.last_turn_status == "interrupted":
-                    self.feishu.text(chat_id, "Codex turn 已停止。")
+                    self.finish_card(chat_id, "任务已停止", "Codex turn 已停止。", "red")
                 else:
-                    self.feishu.text(chat_id, self.server.turn_text or "Codex 已完成，但没有返回文字。")
+                    self.finish_card(chat_id, "Codex 已完成", self.server.turn_text or "Codex 已完成，但没有返回文字。", "green")
                 for path in self.changed_files(before):
                     self.feishu.upload_file(chat_id, path)
                 for path in self.generated_files(key, started_at):
@@ -416,13 +479,25 @@ class Bridge:
                 if self.server.process.poll() is not None:
                     try:
                         self.server.restart()
-                        self.feishu.text(chat_id, "Codex 进程已退出，已自动重启；下一条消息会自动恢复会话。")
+                        self.feishu.card_or_text(chat_id, "Codex 进程已重启", "下一条消息会自动恢复会话。", "yellow")
                     except Exception as restart_error:
-                        self.feishu.text(chat_id, f"Codex 自动重启失败：{restart_error}")
-                self.feishu.text(chat_id, f"Codex 执行失败：{exc}")
+                        self.feishu.card_or_text(chat_id, "Codex 自动重启失败", str(restart_error), "red")
+                self.finish_card(chat_id, "Codex 执行失败", str(exc), "red")
             finally:
+                self.active_cards.pop(chat_id, None)
+                self.card_updated_at.pop(chat_id, None)
                 self.current_chat.pop("active", None)
                 self.jobs.task_done()
+
+    def finish_card(self, chat_id: str, title: str, content: str, color: str) -> None:
+        card_id = self.active_cards.get(chat_id, "")
+        if card_id:
+            try:
+                self.feishu.update_card(card_id, title, content, color)
+                return
+            except Exception:
+                pass
+        self.feishu.card_or_text(chat_id, title, content, color)
 
     def snapshot(self) -> dict[str, tuple[int, int]]:
         result: dict[str, tuple[int, int]] = {}
@@ -502,54 +577,64 @@ class Bridge:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
         if command == "/help":
-            self.feishu.text(chat_id, "/new  /resume [thread_id]  /model [model]  /models  /status  /stop  /compact  /approve <id>  /deny <id>")
+            self.feishu.card_or_text(chat_id, "命令帮助", """`/new`　新建会话  ·  `/resume`　恢复会话
+`/model [模型]`　查看或切换模型
+`/models`　列出可用模型  ·  `/status`　查看状态
+`/stop`　停止任务  ·  `/compact`　压缩上下文
+`/approve <编号>` / `/deny <编号>`　处理审批""")
         elif command == "/new":
             self.server.threads.pop(key, None)
             self.clear_session()
-            self.feishu.text(chat_id, "已切换到新会话，下次提问时创建。")
+            self.feishu.card_or_text(chat_id, "新会话", "已切换到新会话，下次提问时自动创建。", "green")
         elif command == "/resume" and argument:
             self.server.resume(key, argument)
             self.save_session(argument)
-            self.feishu.text(chat_id, f"已恢复会话：{argument}")
+            self.feishu.card_or_text(chat_id, "会话已恢复", f"会话 ID：`{argument}`", "green")
         elif command == "/resume":
             try:
                 threads = self.server.list_threads()
-                lines = [f"{item.get('id')}  {item.get('title') or '未命名'}" for item in threads]
-                self.feishu.text(chat_id, "可恢复会话：\n" + ("\n".join(lines) or "没有找到会话"))
+                shown = threads[:8]
+                content = "\n".join(f"- `{item.get('id')}`　{item.get('title') or '未命名'}" for item in shown) or "没有找到会话"
+                buttons = [{"text": "恢复", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
+                           for item in shown if item.get("id")]
+                # A resume button carries the same command semantics as text.
+                for button in buttons:
+                    button["value"]["command"] = "/resume"
+                self.feishu.card_or_text(chat_id, "可恢复会话", content, "blue", buttons)
             except Exception as exc:
-                self.feishu.text(chat_id, f"读取会话列表失败：{exc}")
+                self.feishu.card_or_text(chat_id, "读取会话列表失败", str(exc), "red")
         elif command == "/model":
             if argument:
                 self.models[key] = argument
-                self.feishu.text(chat_id, f"后续请求使用模型：{argument}")
+                self.feishu.card_or_text(chat_id, "模型已切换", f"后续请求使用：`{argument}`", "green")
             else:
-                self.feishu.text(chat_id, f"当前模型：{self.models.get(key, DEFAULT_MODEL) or 'Codex 默认'}")
+                self.feishu.card_or_text(chat_id, "当前模型", f"`{self.models.get(key, DEFAULT_MODEL) or 'Codex 默认'}`")
         elif command == "/models":
-            self.feishu.text(chat_id, "可用模型：\n" + "\n".join(self.server.models()))
+            self.feishu.card_or_text(chat_id, "可用模型", "\n".join(f"- `{item}`" for item in self.server.models()) or "暂无模型")
         elif command == "/status":
             thread_id = self.server.threads.get(key) or self.load_session()
-            self.feishu.text(chat_id, f"目录：{ROOT}\n会话：{thread_id or '尚未创建'}\n模型：{self.models.get(key, DEFAULT_MODEL) or '默认'}")
+            self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
         elif command == "/stop":
             try:
                 self.generations[key] = self.generations.get(key, 0) + 1
                 interrupted = self.server.interrupt(key)
-                self.feishu.text(chat_id, "已请求停止当前 Codex turn。" if interrupted else "已取消排队任务，并登记停止正在启动的任务。")
+                self.feishu.card_or_text(chat_id, "停止请求已提交", "正在停止当前 Codex turn。" if interrupted else "已取消排队任务，并登记停止正在启动的任务。", "yellow")
             except Exception as exc:
-                self.feishu.text(chat_id, f"停止失败：{exc}")
+                self.feishu.card_or_text(chat_id, "停止失败", str(exc), "red")
         elif command == "/compact":
             try:
                 self.server.compact(key)
-                self.feishu.text(chat_id, "已请求压缩当前会话上下文。")
+                self.feishu.card_or_text(chat_id, "上下文压缩", "已请求压缩当前会话上下文。", "green")
             except Exception as exc:
-                self.feishu.text(chat_id, f"压缩失败：{exc}")
+                self.feishu.card_or_text(chat_id, "压缩失败", str(exc), "red")
         elif command in ("/approve", "/deny") and argument.isdigit():
             try:
                 self.server.approve(int(argument), command == "/approve")
-                self.feishu.text(chat_id, "审批结果已提交。")
+                self.feishu.card_or_text(chat_id, "审批结果已提交", "Codex 已收到你的审批决定。", "green")
             except Exception as exc:
-                self.feishu.text(chat_id, f"审批失败：{exc}")
+                self.feishu.card_or_text(chat_id, f"审批失败：{argument}", str(exc), "red")
         else:
-            self.feishu.text(chat_id, "未知命令，请发送 /help。")
+            self.feishu.card_or_text(chat_id, "未知命令", "请发送 `/help` 查看可用命令。", "yellow")
 
 
 bridge: Bridge | None = None
@@ -560,13 +645,40 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
     bridge.receive(data)
 
 
+def on_card_action(data: Any) -> Any:
+    """Handle buttons from interactive cards over the same WebSocket."""
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+
+    try:
+        event = data.event
+        operator = event.operator
+        action = event.action
+        context = event.context
+        user_id = getattr(operator, "open_id", "")
+        value = getattr(action, "value", {}) or {}
+        command = str(value.get("command", ""))
+        if command in ("/approve", "/deny"):
+            command += f" {int(value.get('id'))}"
+        elif command == "/resume" and value.get("thread_id"):
+            command += f" {value['thread_id']}"
+        chat_id = getattr(context, "open_chat_id", "")
+        if bridge and chat_id and command.startswith("/"):
+            bridge.command(user_id, chat_id, bridge.session_key(user_id), command)
+    except Exception as exc:
+        print(f"Card action failed: {exc}", flush=True)
+    return P2CardActionTriggerResponse({})
+
+
 def main() -> None:
     global bridge
     print(f"Starting Feishu Codex Bridge; cwd={ROOT}", flush=True)
     bridge = Bridge()
     print(f"Feishu Codex Bridge ready; cwd={ROOT}", flush=True)
     import lark_oapi as lark
-    handler = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message).build()
+    handler = (lark.EventDispatcherHandler.builder("", "")
+               .register_p2_im_message_receive_v1(on_message)
+               .register_p2_card_action_trigger(on_card_action)
+               .build())
     lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO).start()
 
 
