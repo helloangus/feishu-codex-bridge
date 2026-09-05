@@ -1,72 +1,163 @@
 # Feishu Codex Bridge
 
-后台管理：`./start.sh start`（默认）、`./start.sh stop`、`./start.sh restart`、
-`./start.sh status`、`./start.sh logs`。`status` 会区分桥接启动中、已初始化、已连上飞书及自动重启中；前台排查使用 `./start.sh foreground`。
-请统一用此入口启动，进程锁防止同一项目重复启动。
-日志在 `.runtime/bridge.log`，每份 2 MiB，保留 3 份备份；认证参数自动过滤。
-运行目录不作为交付物上传。监督器会在桥接异常退出后自动退避重启；未配置设备开机自启。
-同一机器人在不同项目目录中也只能运行一个实例，避免重复回复。
+把运行在 Termux（或兼容 Linux 环境）中的 [Codex app-server](https://developers.openai.com/) 接入飞书机器人。你可以在飞书私聊机器人，让 Codex 在指定工作目录中完成任务、审批操作、接收图片/文件，并把文本、卡片和交付物发回飞书。
 
-Termux 下通过飞书长连接使用当前目录的 Codex app-server。
+这个项目偏向个人或小团队的“手机上的远程 Codex 终端”：服务驻留在你的设备上，代码、会话状态和 Codex 登录态都留在本机。
 
-## 在另一台 Termux 上部署
+> 当前实现为单进程、单任务 worker。会话和模型设置按用户隔离，但多个任务会排队执行；它不是多租户的远程代码执行平台。
 
-推荐使用引导脚本。将仓库复制或 `git clone` 到新设备后，在**希望 Codex 操作的项目目录**执行：
+## 功能
+
+- 飞书私聊文本 → 当前目录的 Codex thread；最终 Markdown 回复以飞书卡片展示。
+- `/new`、`/resume`、`/compact` 管理 Codex 会话；服务重启后自动恢复已保存会话。
+- `/models` 卡片选择模型，模型偏好按飞书用户与工作目录保存。
+- `/help` 提供移动端友好的控制面板；支持文本命令和卡片按钮。
+- Codex 进度卡片、任务耗时、长回复安全分段、单任务停止按钮。
+- 将 Codex 的审批请求渲染为说明卡片，可直接允许或拒绝；原审批卡片会更新为最终结果。
+- 飞书图片/文件下载后作为本地输入交给 Codex；本轮修改的文件和生成图片会回传飞书。
+- 服务管理、日志轮转、异常退避重启、飞书连接健康状态和跨重启消息去重。
+
+## 快速开始
+
+### 1. 准备飞书应用
+
+在飞书开放平台创建企业自建应用，并完成以下配置：
+
+1. 启用机器人。
+2. 在“事件与回调 → 事件订阅”添加 `im.message.receive_v1`，选择“使用长连接接收”。
+3. 在“事件与回调 → 回调配置”添加卡片回传 `card.action.trigger`，同样选择“使用长连接接收”。
+4. 授予机器人读取/发送消息、发送/更新消息卡片及上传文件所需权限，并发布应用版本。
+5. 记录 App ID、App Secret，建议同时记录自己的 `open_id` 用于白名单。
+
+详细排障与迁移说明见 [部署指南](docs/deployment.md)。
+
+### 2. 准备 Codex CLI
+
+确保本机已经安装并登录 Codex CLI，且以下命令可用：
+
+```sh
+codex --version
+```
+
+本桥接通过 `codex app-server` 与本地 CLI 通信；它不会替你安装或登录 Codex，也不会额外实现项目文件上传通道。Codex CLI 本身的数据处理遵循你所使用的 Codex 产品与账户配置。
+
+### 3. 运行引导脚本
+
+将仓库克隆到设备后，切换到**希望 Codex 操作的工作目录**，运行：
 
 ```sh
 /path/to/feishu-codex-bridge/setup.sh
 ```
 
-脚本会自动安装 Python（仅 Termux 缺少时）、安装 Python 依赖、检查 Codex CLI、交互式生成权限为 `600` 的 `.env`，然后启动服务。已有 `.env` 不会被覆盖。只检查环境而不修改内容可执行：
+脚本会自动安装缺失的 Termux Python、安装 Python 依赖、检查 Codex CLI、以交互方式创建权限为 `600` 的 `.env`，并启动服务。已有 `.env` 不会被覆盖。
+
+只诊断、不修改环境：
 
 ```sh
 /path/to/feishu-codex-bridge/setup.sh --check
 ```
 
-以下事项无法由程序代替，首次部署时按提示完成即可：
+配置成功后，在飞书私聊机器人发送 `/help`。
 
-1. 在目标设备安装并登录 Codex CLI，确认 `codex --version` 可用。
-2. 在飞书开放平台创建企业自建应用并启用机器人；复制 App ID 与 App Secret 给引导脚本。
-3. 在“事件与回调”配置事件订阅 `im.message.receive_v1`，在“回调配置”配置卡片回传 `card.action.trigger`；两项均选择“使用长连接接收”。
-4. 为机器人授予读取/发送消息、发送/更新消息卡片及上传文件权限，并发布应用版本。
-5. 建议填写自己的飞书 `open_id` 作为白名单；不知道时可暂留空进行私聊测试，但这会允许任何能私聊机器人的人使用它。
+## 使用方式
 
-运行结束后，在飞书私聊机器人发送 `/help`。迁移到新设备不会迁移旧设备的 Codex 登录态、飞书凭据或会话记录；如需延续旧会话，请安全地手工迁移工作目录内的 `.feishu-codex-session` 与 `.feishu-codex-settings`。
-
-## 手动安装（排障用）
-
-```sh
-pkg install python
-python -m pip install -r requirements.txt
-cp .env.example .env
-```
-
-在飞书企业自建应用中开启机器人，在“事件与回调”中分别配置：事件订阅 `im.message.receive_v1`，以及“回调配置”中的卡片回传交互 `card.action.trigger`；两者都选择“使用长连接接收”。并授予机器人读取/发送消息、发送/更新消息卡片及上传文件的权限。
-
-确认本机已登录 Codex，且 `codex app-server` 可启动。然后在目标项目目录启动：
-
-```sh
-set -a; . ./.env; set +a
-python /path/to/feishu-codex-bridge/bridge.py
-```
-
-普通文本会进入当前目录的 Codex thread。会话 ID 自动保存到 `.feishu-codex-session`，模型偏好保存到 `.feishu-codex-settings`，并按飞书用户和工作目录隔离；重启后首次提问会自动恢复。`/models` 会发送模型选择卡片。`/status` 会显示任务状态、队列、会话、模型和桥接运行时长。支持 `/new`、`/resume [thread_id]`、`/model [model]`、`/models`、`/status`、`/stop`、`/compact`、`/approve <id>`、`/deny <id>`。
-
-最近处理过的飞书消息 ID 会保存到 `.feishu-codex-seen-messages`（权限 `600`，最多 1,000 条），因此服务重启或飞书重投旧事件时不会重复执行或重复回复。日志仅记录消息 ID 的短哈希，便于排查，不记录聊天内容。
-
-机器人会使用交互式卡片展示状态、进度、最终回复、审批和常用命令；处理中卡片可直接点击“停止任务”，审批卡片可直接点击“允许/拒绝”，`/stop`、`/approve` 等文本命令仍然兼容。每轮完成后会回传最终 Markdown，并上传当前目录中本轮新增或修改的文件（最多 10 个，单文件大小由 `CODEX_MAX_ATTACHMENT_BYTES` 控制）。飞书图片/文件会下载到 `feishu-inbox` 后交给 Codex 读取；该目录不会被当成交付物再次上传。审批请求超过 `CODEX_APPROVAL_TIMEOUT_SECONDS` 秒会自动拒绝。
-
-首次测试建议发送：
+普通文本会加入任务队列并交给 Codex。例如：
 
 ```text
-/status
-请只回复：连接测试成功
+检查当前目录的测试失败原因，修复后运行测试，并把修改的文件发给我。
 ```
 
-## 回归测试
+常用命令如下。`/help` 会发送等价的可点击控制面板。
 
-不需要飞书凭据或网络访问：
+| 命令 | 作用 |
+| --- | --- |
+| `/help` | 显示控制面板。 |
+| `/status` | 显示任务状态、队列、目录、会话、模型和桥接运行时长。 |
+| `/new` | 清除当前用户在当前目录的会话绑定；下次提问创建新会话。 |
+| `/resume` / `/resume <thread_id>` | 列出最近会话，或恢复指定 Codex thread。 |
+| `/model` / `/models` / `/model <model>` | 查看、选择或设置模型。 |
+| `/compact` | 请求 Codex 压缩当前 thread 上下文。 |
+| `/stop` | 中断当前任务，或取消等待队列中的任务。 |
+| `/approve <id>` / `/deny <id>` | 用文本处理审批；通常直接点审批卡片即可。 |
+
+### 附件与交付物
+
+- 图片下载到 `<cwd>/feishu-inbox/` 并作为 app-server `localImage` 输入交给 Codex。
+- 文件下载后，以本地路径附加到提示词。
+- 每轮任务最多回传 10 个新增或修改的文件；默认单文件上限为 20 MiB。
+- `feishu-inbox/`、`.runtime/`、`.git/` 和 `.feishu-codex*` 状态文件不会作为交付物上传。
+
+## 运维
+
+统一通过 `start.sh` 管理服务：
+
+```sh
+./start.sh start       # 后台启动（默认）
+./start.sh stop        # 安全停止监督器和桥接子进程
+./start.sh restart     # 重启
+./start.sh status      # 服务与飞书连接健康状态
+./start.sh logs        # 最近 60 行脱敏日志
+./start.sh foreground  # 前台运行，适合排障
+```
+
+监督器在桥接异常退出时以 2、4、8…30 秒的退避间隔重启。日志保存于 `.runtime/bridge.log`，单文件最多 2 MiB，保留 3 个历史副本。详见[运行手册](docs/operations.md)。
+
+## 配置
+
+复制 `.env.example` 为 `.env`，或使用 `setup.sh` 生成。`.env` 不会提交到 Git。
+
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 是 | 飞书企业自建应用凭据。 |
+| `FEISHU_ALLOWED_OPEN_IDS` | 建议 | 逗号分隔的允许用户 `open_id`；留空表示不做白名单限制。 |
+| `CODEX_BRIDGE_CWD` | 是 | Codex 工作目录；会话、模型和收件目录默认在此目录。 |
+| `CODEX_MODEL` | 否 | 默认模型；也可以用 `/models` 按用户设置。 |
+| `CODEX_APP_SERVER` | 否 | app-server 启动命令，默认 `codex app-server`。 |
+| `CODEX_MAX_ATTACHMENT_BYTES` | 否 | 回传文件上限，默认 `20971520`。 |
+| `CODEX_APPROVAL_TIMEOUT_SECONDS` | 否 | 审批超时自动拒绝时间，默认 `600` 秒。 |
+| `CODEX_SESSION_FILE` / `CODEX_SETTINGS_FILE` / `CODEX_SEEN_MESSAGES_FILE` | 否 | 覆盖状态文件默认位置。 |
+
+## 安全边界
+
+- **务必设置 `FEISHU_ALLOWED_OPEN_IDS`。** 留空时，任何能私聊机器人的用户都可向本机 Codex 发起任务。
+- `.env` 和状态文件以 `600` 权限写入；不要将它们提交、截图或发到聊天中。
+- 日志不记录聊天全文、审批命令内容、文件内容、token、WebSocket 认证参数或明文用户 ID；事件以短哈希关联。
+- bridge 会在你设置的工作目录下载附件、运行 Codex 并扫描交付物；请使用明确且受信任的项目目录。
+- 飞书审批卡片只是 Codex 请求授权的入口，不能替代对命令、路径和文件改动本身的审查。
+
+## 架构与后续开发
+
+- [架构与数据流](docs/architecture.md)：组件边界、线程模型、状态、协议和故障恢复。
+- [设计决策](docs/design.md)：为什么使用单 worker、卡片 JSON 2.0、持久化去重和 SDK 兼容补丁。
+- [开发指南](docs/development.md)：调试、测试、增加命令/卡片、修改 app-server 适配层。
+- [部署指南](docs/deployment.md)：新设备部署、飞书后台配置、迁移和排障。
+- [运行手册](docs/operations.md)：日志、状态机、故障定位和安全操作。
+
+## 测试
+
+测试不需要飞书凭据或网络：
 
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+当前回归测试覆盖会话/模型持久化、跨重启消息去重、移动端卡片布局、长代码块分段、状态卡和服务健康状态。
+
+## 项目结构
+
+```text
+.
+├── bridge.py              # 飞书 ↔ Codex app-server 主桥接
+├── service.py             # 锁、日志轮转、健康状态、异常重启监督器
+├── start.sh               # 统一服务入口，加载 .env
+├── setup.sh               # 新设备交互式部署引导
+├── .env.example           # 配置模板
+├── docs/                  # 架构、设计、开发、部署与运维文档
+└── tests/                 # 无网络单元/回归测试
+```
+
+## 许可与贡献
+
+当前仓库尚未声明开源许可证；在公开复用或接受外部贡献前，请先补充 `LICENSE` 并明确贡献规则。
+
+提交改动前请运行测试，并同步更新相关 `docs/` 与 `PLAN.md`。涉及飞书卡片、WebSocket 回调或 Codex app-server 协议的改动，除单测外还应完成真实飞书端验收。
