@@ -358,6 +358,7 @@ class Bridge:
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
         self.active_cards: dict[str, str] = {}
+        self.help_cards: dict[str, tuple[str, str]] = {}
         self.approval_cards: dict[int, str] = {}
         self.approval_summaries: dict[int, str] = {}
         self.approval_items: dict[str, dict[str, Any]] = {}
@@ -714,11 +715,23 @@ class Bridge:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
         if command == "/help":
-            self.feishu.card_or_text(chat_id, "命令帮助", """`/new`　新建会话  ·  `/resume`　恢复会话
+            card_id = self.feishu.card_or_text(chat_id, "命令帮助", """点击按钮即可执行对应命令。
+
+`/new`　新建会话  ·  `/resume`　恢复会话
 `/model [模型]`　查看或切换模型
 `/models`　列出可用模型  ·  `/status`　查看状态
 `/stop`　停止任务  ·  `/compact`　压缩上下文
-`/approve <编号>` / `/deny <编号>`　处理审批""")
+`/approve <编号>` / `/deny <编号>`　处理审批（使用审批卡片上的按钮）""", buttons=[
+                {"text": label, "value": {"command": cmd}}
+                for label, cmd in [("查看状态", "/status"), ("恢复会话", "/resume"),
+                                   ("新建会话", "/new"), ("当前模型", "/model"),
+                                   ("可用模型", "/models"), ("压缩上下文", "/compact"),
+                                   ("停止任务", "/stop")]
+            ])
+            if card_id:
+                self.help_cards[card_id] = (chat_id, key)
+                if len(self.help_cards) > 100:
+                    self.help_cards.pop(next(iter(self.help_cards)))
         elif command == "/new":
             self.server.threads.pop(key, None)
             self.clear_session()
@@ -756,7 +769,7 @@ class Bridge:
             self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
         elif command == "/stop":
             try:
-                if source and (self.active_cards.get(chat_id) != source or self.current_chat.get("key") != key):
+                if source and self.help_cards.get(source) != (chat_id, key) and (self.active_cards.get(chat_id) != source or self.current_chat.get("key") != key):
                     raise ValueError("这张卡片对应的任务已结束，不能停止其他任务")
                 self.generations[key] = self.generations.get(key, 0) + 1
                 interrupted = self.server.interrupt(key)
