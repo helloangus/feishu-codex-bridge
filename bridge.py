@@ -137,6 +137,7 @@ class CodexServer:
         self.approvals: dict[int, str] = {}
         self.approval_created: dict[int, float] = {}
         self.turn_text = ""
+        self.last_turn_status = ""
         self.active_turn: dict[str, str] = {}
         self.starting_turns: set[str] = set()
         self.pending_interrupt: set[str] = set()
@@ -202,6 +203,9 @@ class CodexServer:
             self.turn_text += delta
             self.event("delta", delta)
         elif method == "turn/completed":
+            turn = params.get("turn", {})
+            if isinstance(turn, dict):
+                self.last_turn_status = str(turn.get("status", ""))
             self.event("completed", params)
         elif method.startswith("item/"):
             self.event("item", params)
@@ -209,6 +213,7 @@ class CodexServer:
     def turn(self, key: str, prompt: str, model: str,
              extra_inputs: list[dict[str, Any]] | None = None) -> None:
         self.turn_text = ""
+        self.last_turn_status = ""
         thread_id = self.threads.get(key)
         if not thread_id:
             result = self.request("thread/start", {"cwd": str(ROOT)})
@@ -399,7 +404,10 @@ class Bridge:
                 remainder = self.stream_buffers.pop(chat_id, "")
                 if remainder:
                     self.feishu.text(chat_id, "[Codex 进度]\n" + remainder)
-                self.feishu.text(chat_id, self.server.turn_text or "Codex 已完成，但没有返回文字。")
+                if self.server.last_turn_status == "interrupted":
+                    self.feishu.text(chat_id, "Codex turn 已停止。")
+                else:
+                    self.feishu.text(chat_id, self.server.turn_text or "Codex 已完成，但没有返回文字。")
                 for path in self.changed_files(before):
                     self.feishu.upload_file(chat_id, path)
                 for path in self.generated_files(key, started_at):
