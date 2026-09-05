@@ -36,3 +36,11 @@ python /path/to/feishu-codex-bridge/bridge.py
 /status
 请只回复：连接测试成功
 ```
+
+## 回归测试
+
+不需要飞书凭据或网络访问：
+
+```sh
+python -m unittest discover -s tests -v
+```
