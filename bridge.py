@@ -96,9 +96,14 @@ class Feishu:
             headers={"Authorization": f"Bearer {self.token()}"},
         )
         response.raise_for_status()
-        inbox = ROOT / ".feishu-inbox"
+        inbox = ROOT / "feishu-inbox"
         inbox.mkdir(mode=0o700, exist_ok=True)
-        safe_name = Path(filename).name if filename else f"{resource_key}.{resource_type}"
+        safe_name = Path(filename).name if filename else resource_key
+        if "." not in safe_name:
+            mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            extensions = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+                          "image/webp": ".webp", "application/pdf": ".pdf"}
+            safe_name += extensions.get(mime, "")
         destination = inbox / f"{message_id}-{safe_name}"
         destination.write_bytes(response.content)
         return destination
@@ -322,7 +327,7 @@ class Bridge:
                         resource["message_id"], resource["resource_key"],
                         resource["resource_type"], resource.get("filename", ""),
                     )
-                    prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}"
+                    prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}。如果是图片，请使用图片查看工具打开该绝对路径。"
                 stored = self.load_session()
                 if stored and key not in self.server.threads:
                     self.server.resume(key, stored)
@@ -344,7 +349,7 @@ class Bridge:
         result: dict[str, tuple[int, int]] = {}
         for path in ROOT.rglob("*"):
             if (not path.is_file() or ".git" in path.parts or
-                    ".feishu-inbox" in path.parts or path.name.startswith(".feishu-codex")):
+                    "feishu-inbox" in path.parts or path.name.startswith(".feishu-codex")):
                 continue
             try:
                 stat = path.stat()
