@@ -438,6 +438,29 @@ class Bridge:
             if value is None or value == "":
                 continue
             found = True
+            if label == "文件改动" and isinstance(value, list):
+                for change in value:
+                    if not isinstance(change, dict):
+                        parts.append("文件改动格式无法识别，请确认完整操作后再审批。")
+                        continue
+                    kind = change.get("kind", {})
+                    operation = kind.get("type", "") if isinstance(kind, dict) else kind
+                    operation = {"add": "新增", "delete": "删除", "update": "修改"}.get(operation, operation or "未提供")
+                    path = str(change.get("path") or "未提供").replace("```", "` ` `")
+                    parts.append(f"**文件路径**\n```\n{path}\n```\n**改动类型：{operation}**")
+                    if isinstance(kind, dict) and kind.get("movePath"):
+                        target = str(kind["movePath"]).replace("```", "` ` `")
+                        parts.append(f"**移动目标**\n```\n{target}\n```")
+                    detail = change.get("diff")
+                    if detail is None:
+                        parts.append("具体内容未提供。")
+                    else:
+                        detail = str(detail)
+                        if len(detail) > 2400:
+                            detail = detail[:2400] + "\n…（内容已截断，请确认完整操作后再审批）"
+                        detail = detail.replace("```", "` ` `")
+                        parts.append(f"**具体内容**\n```\n{detail}\n```")
+                continue
             detail = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
             if len(detail) > 2400:
                 detail = detail[:2400] + "\n…（内容已截断，请确认完整操作后再审批）"
