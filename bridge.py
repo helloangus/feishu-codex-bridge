@@ -79,15 +79,28 @@ class Feishu:
             # Card JSON 2.0 uses a button element with a callback behavior.
             # The legacy `action` container is rejected by the current API.
             for item in buttons:
-                if item.get("description"):
-                    elements.append({"tag": "hr"})
-                    elements.append({"tag": "markdown", "content": item["description"]})
-                elements.append({
+                button = {
                 "tag": "button",
+                "width": "fill",
                 "text": {"tag": "plain_text", "content": item["text"]},
                 "type": item.get("type", "default"),
                 "behaviors": [{"type": "callback", "value": item["value"]}],
-                })
+                }
+                if item.get("description"):
+                    elements.append({"tag": "column_set", "horizontal_spacing": "8px", "columns": [
+                        {"tag": "column", "width": "weighted", "weight": 3,
+                         "elements": [{"tag": "markdown", "content": item["description"]}]},
+                        {"tag": "column", "width": "weighted", "weight": 1, "elements": [button]},
+                    ]})
+                elif item.get("group"):
+                    if not elements or elements[-1].get("_group") != item["group"]:
+                        elements.append({"tag": "markdown", "content": f"<font color='grey'>{item['group']}</font>"})
+                        elements.append({"tag": "column_set", "horizontal_spacing": "8px", "columns": [], "_group": item["group"]})
+                    elements[-1]["columns"].append({"tag": "column", "width": "weighted", "weight": 1, "elements": [button]})
+                else:
+                    elements.append(button)
+            for element in elements:
+                element.pop("_group", None)
         return {"schema": "2.0", "header": {
             "template": color,
             "title": {"tag": "plain_text", "content": title},
@@ -715,18 +728,12 @@ class Bridge:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
         if command == "/help":
-            card_id = self.feishu.card_or_text(chat_id, "命令帮助", """点击按钮即可执行对应命令。
-
-`/new`　新建会话  ·  `/resume`　恢复会话
-`/model [模型]`　查看或切换模型
-`/models`　列出可用模型  ·  `/status`　查看状态
-`/stop`　停止任务  ·  `/compact`　压缩上下文
-`/approve <编号>` / `/deny <编号>`　处理审批（使用审批卡片上的按钮）""", buttons=[
-                {"text": label, "value": {"command": cmd}}
-                for label, cmd in [("查看状态", "/status"), ("恢复会话", "/resume"),
-                                   ("新建会话", "/new"), ("当前模型", "/model"),
-                                   ("可用模型", "/models"), ("压缩上下文", "/compact"),
-                                   ("停止任务", "/stop")]
+            card_id = self.feishu.card_or_text(chat_id, "Codex 控制面板", "点击执行操作，也支持输入 /命令。", buttons=[
+                {"text": f"{label} {cmd}", "group": group, "type": "danger" if cmd == "/stop" else "default", "value": {"command": cmd}}
+                for group, label, cmd in [("会话", "恢复会话", "/resume"), ("会话", "新建会话", "/new"),
+                                         ("模型", "当前模型", "/model"), ("模型", "可用模型", "/models"),
+                                         ("任务", "查看状态", "/status"), ("任务", "压缩上下文", "/compact"),
+                                         ("", "停止当前任务", "/stop")]
             ])
             if card_id:
                 self.help_cards[card_id] = (chat_id, key)
@@ -748,7 +755,7 @@ class Bridge:
                 threads = self.server.list_threads()
                 shown = threads[:8]
                 content = "选择下方会话继续对话。" if shown else "没有找到会话"
-                buttons = [{"text": f"恢复会话 {index}", "description": f"**{index}. {item.get('title') or '未命名'}**\n`{item.get('id')}`", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
+                buttons = [{"text": "恢复", "description": f"**{index}. {(item.get('title') or '未命名')[:60]}**\n`{str(item.get('id'))[:8]}…`", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
                            for index, item in enumerate(shown, 1) if item.get("id")]
                 # A resume button carries the same command semantics as text.
                 for button in buttons:
