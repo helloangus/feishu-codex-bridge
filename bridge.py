@@ -663,7 +663,13 @@ def on_card_action(data: Any) -> Any:
             command += f" {value['thread_id']}"
         chat_id = getattr(context, "open_chat_id", "")
         if bridge and chat_id and command.startswith("/"):
-            bridge.command(user_id, chat_id, bridge.session_key(user_id), command)
+            if ALLOWED and user_id not in ALLOWED:
+                return P2CardActionTriggerResponse({})
+            threading.Thread(
+                target=bridge.command,
+                args=(user_id, chat_id, bridge.session_key(user_id), command),
+                daemon=True,
+            ).start()
     except Exception as exc:
         print(f"Card action failed: {exc}", flush=True)
     return P2CardActionTriggerResponse({})
