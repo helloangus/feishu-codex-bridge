@@ -172,7 +172,8 @@ class CodexServer:
         elif method.startswith("item/"):
             self.event("item", params)
 
-    def turn(self, key: str, prompt: str, model: str) -> None:
+    def turn(self, key: str, prompt: str, model: str,
+             extra_inputs: list[dict[str, Any]] | None = None) -> None:
         self.turn_text = ""
         thread_id = self.threads.get(key)
         if not thread_id:
@@ -182,7 +183,7 @@ class CodexServer:
             self.threads[key] = thread_id
         params: dict[str, Any] = {
             "threadId": thread_id,
-            "input": [{"type": "text", "text": prompt}],
+            "input": [{"type": "text", "text": prompt}] + (extra_inputs or []),
         }
         if model:
             params["model"] = model
@@ -322,16 +323,21 @@ class Bridge:
             try:
                 before = self.snapshot()
                 self.feishu.text(chat_id, "Codex 开始处理…")
+                extra_inputs: list[dict[str, Any]] = []
                 if resource:
                     local_path = self.feishu.download_resource(
                         resource["message_id"], resource["resource_key"],
                         resource["resource_type"], resource.get("filename", ""),
                     )
-                    prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}。如果是图片，请使用图片查看工具打开该绝对路径。"
+                    if resource["resource_type"] == "image":
+                        extra_inputs.append({"type": "localImage", "path": str(local_path), "detail": "auto"})
+                        prompt += "\n\n用户附加了一张图片，请直接分析图片内容。"
+                    else:
+                        prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}。"
                 stored = self.load_session()
                 if stored and key not in self.server.threads:
                     self.server.resume(key, stored)
-                self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL))
+                self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL), extra_inputs)
                 self.save_session(self.server.threads[key])
                 remainder = self.stream_buffers.pop(chat_id, "")
                 if remainder:
