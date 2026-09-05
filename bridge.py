@@ -21,6 +21,8 @@ import httpx
 
 
 ROOT = Path(os.environ.get("CODEX_BRIDGE_CWD", os.getcwd())).resolve()
+WORKSPACE_ROOT_RAW = os.environ.get("CODEX_WORKSPACE_ROOT", "")
+WORKSPACE_ROOT = Path(WORKSPACE_ROOT_RAW).expanduser().resolve() if WORKSPACE_ROOT_RAW else None
 APP_ID = os.environ["FEISHU_APP_ID"]
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 CONFIGURED_ALLOWED = {x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",") if x.strip()}
@@ -187,14 +189,14 @@ class Feishu:
         })
 
     def download_resource(self, message_id: str, resource_key: str, resource_type: str,
-                          filename: str = "") -> Path:
+                          directory: Path, filename: str = "") -> Path:
         response = self.http.get(
             f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{resource_key}",
             params={"type": resource_type},
             headers={"Authorization": f"Bearer {self.token()}"},
         )
         response.raise_for_status()
-        inbox = ROOT / "feishu-inbox"
+        inbox = directory / "feishu-inbox"
         inbox.mkdir(mode=0o700, exist_ok=True)
         safe_name = Path(filename).name if filename else resource_key
         if "." not in safe_name:
@@ -328,13 +330,13 @@ class CodexServer:
         elif method.startswith("item/"):
             self.event("item", params)
 
-    def turn(self, key: str, prompt: str, model: str,
+    def turn(self, key: str, directory: Path, prompt: str, model: str,
              extra_inputs: list[dict[str, Any]] | None = None) -> None:
         self.turn_text = ""
         self.last_turn_status = ""
         thread_id = self.threads.get(key)
         if not thread_id:
-            result = self.request("thread/start", {"cwd": str(ROOT)})
+            result = self.request("thread/start", {"cwd": str(directory)})
             thread = result.get("thread", result)
             thread_id = thread["id"]
             self.threads[key] = thread_id
@@ -364,8 +366,8 @@ class CodexServer:
                 self.active_turn.pop(key, None)
                 return
 
-    def resume(self, key: str, thread_id: str) -> None:
-        self.request("thread/resume", {"threadId": thread_id, "cwd": str(ROOT)})
+    def resume(self, key: str, thread_id: str, directory: Path) -> None:
+        self.request("thread/resume", {"threadId": thread_id, "cwd": str(directory)})
         self.threads[key] = thread_id
 
     def _send_interrupt(self, key: str) -> None:
@@ -394,8 +396,8 @@ class CodexServer:
             raise RuntimeError("当前还没有 Codex 会话")
         self.request("thread/compact/start", {"threadId": thread_id})
 
-    def list_threads(self) -> list[dict[str, Any]]:
-        result = self.request("thread/list", {"cwd": [str(ROOT)], "limit": 20,
+    def list_threads(self, directory: Path) -> list[dict[str, Any]]:
+        result = self.request("thread/list", {"cwd": [str(directory)], "limit": 20,
                                                 "sortKey": "updated_at", "sortDirection": "desc"})
         return result.get("data", [])
 
@@ -419,7 +421,7 @@ class Bridge:
         self.started_at = time.monotonic()
         self.feishu = Feishu()
         self.server = CodexServer(self.codex_event)
-        self.models = self.load_model_settings()
+        self.models, self.directories = self.load_settings()
         self.allowed_lock = threading.Lock()
         self.allowed_open_ids = CONFIGURED_ALLOWED | self.load_allowed_open_ids()
         self.current_chat: dict[str, str] = {}
@@ -436,7 +438,9 @@ class Bridge:
         self.card_updated_at: dict[str, float] = {}
         self.progress_lock = threading.Lock()
         self.progress: dict[str, Any] = {}
-        self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None, int]] = queue.Queue()
+        self.jobs: queue.Queue[tuple[str, str, Path, str, str, dict[str, str] | None, int]] = queue.Queue()
+        self.user_job_counts: dict[str, int] = {}
+        self.pending_directories: dict[str, tuple[str, str, Path, float]] = {}
         self.generations: dict[str, int] = {}
         self.seen_messages: deque[str] = deque(maxlen=1000)
         self.seen_message_set: set[str] = set()
@@ -463,8 +467,52 @@ class Bridge:
                 except Exception as exc:
                     log_event("progress_update_failed", error_type=type(exc).__name__)
 
-    def session_key(self, user_id: str) -> str:
-        return f"{user_id}:{ROOT}"
+    def session_key(self, user_id: str, directory: Path | None = None) -> str:
+        return f"{user_id}:{directory or self.current_directory(user_id)}"
+
+    @staticmethod
+    def directory_is_allowed(directory: Path) -> bool:
+        return WORKSPACE_ROOT is not None and directory.is_relative_to(WORKSPACE_ROOT)
+
+    def current_directory(self, user_id: str) -> Path:
+        stored = getattr(self, "directories", {}).get(user_id, str(ROOT))
+        try:
+            directory = Path(stored).expanduser().resolve()
+        except OSError:
+            directory = ROOT
+        if not directory.is_dir() or not self.directory_is_allowed(directory):
+            getattr(self, "directories", {}).pop(user_id, None)
+            return ROOT
+        return directory
+
+    def resolve_directory(self, current: Path, value: str) -> Path:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = current / candidate
+        candidate = candidate.resolve()
+        if not self.directory_is_allowed(candidate):
+            raise ValueError("目录必须位于已配置的工作区根目录内")
+        return candidate
+
+    def set_directory(self, user_id: str, directory: Path) -> None:
+        self.directories[user_id] = str(directory)
+        self.save_model_settings()
+
+    def directory_buttons(self, directory: Path) -> list[dict[str, Any]]:
+        buttons: list[dict[str, Any]] = []
+        if WORKSPACE_ROOT is not None and directory != WORKSPACE_ROOT:
+            buttons.append({"text": "进入上级目录", "description": f"`{directory.parent}`",
+                            "value": {"command": "/cd", "path": str(directory.parent)}})
+        try:
+            children = sorted((path for path in directory.iterdir()
+                               if path.is_dir() and self.directory_is_allowed(path.resolve())),
+                              key=lambda path: path.name.lower())
+        except OSError:
+            children = []
+        for child in children[:12]:
+            buttons.append({"text": "进入目录", "description": f"**{child.name}**\n`{child}`",
+                            "value": {"command": "/cd", "path": str(child)}})
+        return buttons
 
     def load_allowed_open_ids(self) -> set[str]:
         """Load self-paired users without ever logging their identifiers."""
@@ -499,16 +547,24 @@ class Bridge:
             self.allowed_open_ids = set(updated)
         return True
 
-    def load_model_settings(self) -> dict[str, str]:
+    def load_settings(self) -> tuple[dict[str, str], dict[str, str]]:
         try:
             parsed = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            return {str(key): str(value) for key, value in parsed.get("models", {}).items()}
+            models = {str(key): str(value) for key, value in parsed.get("models", {}).items()}
+            directories = {str(key): str(value) for key, value in parsed.get("directories", {}).items()}
+            return models, directories
         except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
-            return {}
+            return {}, {}
+
+    def load_model_settings(self) -> dict[str, str]:
+        """Compatibility helper retained for tests and callers."""
+        return self.load_settings()[0]
 
     def save_model_settings(self) -> None:
         temporary = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
-        temporary.write_text(json.dumps({"models": self.models}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.write_text(json.dumps({"models": self.models,
+                                         "directories": getattr(self, "directories", {})},
+                                        ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.chmod(0o600)
         os.replace(temporary, SETTINGS_FILE)
 
@@ -695,9 +751,11 @@ class Bridge:
 
     def worker(self) -> None:
         while True:
-            key, chat_id, prompt, resource, generation = self.jobs.get()
+            user_id, key, directory, chat_id, prompt, resource, generation = self.jobs.get()
             if generation != self.generations.get(key, 0):
                 self.feishu.card_or_text(chat_id, "任务已取消", "任务仍在等待队列中，已取消执行。", "red")
+                with self.task_lock:
+                    self.user_job_counts[user_id] = max(0, self.user_job_counts.get(user_id, 1) - 1)
                 self.jobs.task_done()
                 continue
             task_id = uuid.uuid4().hex
@@ -708,9 +766,9 @@ class Bridge:
             self.approval_items.clear()
             self.current_chat["key"] = key
             try:
-                before = self.snapshot()
+                before = self.snapshot(directory)
                 started_at = time.time()
-                card_id = self.feishu.card_or_text(chat_id, "Codex 开始处理", f"目录：`{ROOT}`\n\n正在准备执行…", "blue", [
+                card_id = self.feishu.card_or_text(chat_id, "Codex 开始处理", f"目录：`{directory}`\n\n正在准备执行…", "blue", [
                     {"text": "停止任务", "type": "danger", "value": {"command": "/stop", "task_id": task_id}}
                 ])
                 self.active_cards[chat_id] = card_id
@@ -721,7 +779,7 @@ class Bridge:
                 if resource:
                     local_path = self.feishu.download_resource(
                         resource["message_id"], resource["resource_key"],
-                        resource["resource_type"], resource.get("filename", ""),
+                        resource["resource_type"], directory, resource.get("filename", ""),
                     )
                     if resource["resource_type"] == "image":
                         extra_inputs.append({"type": "localImage", "path": str(local_path), "detail": "auto"})
@@ -730,8 +788,8 @@ class Bridge:
                         prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}。"
                 stored = self.load_session(key)
                 if stored and key not in self.server.threads:
-                    self.server.resume(key, stored)
-                self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL), extra_inputs)
+                    self.server.resume(key, stored, directory)
+                self.server.turn(key, directory, prompt, self.models.get(key, DEFAULT_MODEL), extra_inputs)
                 self.save_session(self.server.threads[key], key)
                 with self.progress_lock:
                     self.progress = {}
@@ -744,7 +802,7 @@ class Bridge:
                     self.finish_card(chat_id, "Codex 执行失败" if status == "failed" else "Codex 已完成",
                                      f"耗时 {elapsed} 秒\n\n" + (self.server.turn_text or "没有返回文字。"),
                                      "red" if status == "failed" else "green")
-                paths = list(dict.fromkeys(self.changed_files(before) + self.generated_files(key, started_at)))
+                paths = list(dict.fromkeys(self.changed_files(directory, before) + self.generated_files(key, started_at)))
                 deliveries = []
                 for path in paths:
                     try:
@@ -778,6 +836,7 @@ class Bridge:
                     if self.active_task_tokens.get(key) == task_id:
                         self.active_task_tokens.pop(key, None)
                         self.stopping_tasks.discard(key)
+                    self.user_job_counts[user_id] = max(0, self.user_job_counts.get(user_id, 1) - 1)
                 self.jobs.task_done()
 
     @staticmethod
@@ -842,9 +901,9 @@ class Bridge:
         for index, chunk in enumerate(chunks, 2):
             self.feishu.card_or_text(chat_id, f"{title}（续 {index}）", chunk, color)
 
-    def snapshot(self) -> dict[str, tuple[int, int]]:
+    def snapshot(self, directory: Path) -> dict[str, tuple[int, int]]:
         result: dict[str, tuple[int, int]] = {}
-        for path in ROOT.rglob("*"):
+        for path in directory.rglob("*"):
             if (not path.is_file() or ".git" in path.parts or ".runtime" in path.parts or
                     "feishu-inbox" in path.parts or path.name.startswith(".feishu-codex")):
                 continue
@@ -855,13 +914,13 @@ class Bridge:
                 pass
         return result
 
-    def changed_files(self, before: dict[str, tuple[int, int]]) -> list[Path]:
-        after = self.snapshot()
+    def changed_files(self, directory: Path, before: dict[str, tuple[int, int]]) -> list[Path]:
+        after = self.snapshot(directory)
         changed: list[Path] = []
         for name, metadata in after.items():
             if before.get(name) != metadata:
                 path = Path(name)
-                if path.is_relative_to(ROOT) and path.stat().st_size <= MAX_ATTACHMENT:
+                if path.is_relative_to(directory) and path.stat().st_size <= MAX_ATTACHMENT:
                     changed.append(path)
         return changed[:10]
 
@@ -917,14 +976,17 @@ class Bridge:
                 text = "用户发送了一个无法读取的附件。"
         else:
             text = content.get("text", "").strip()
-        key = self.session_key(user_id)
+        directory = self.current_directory(user_id)
+        key = self.session_key(user_id, directory)
         if text.startswith("/"):
             # Commands such as /resume or /models may take long enough to
             # starve the Feishu WebSocket heartbeat. Run them off the callback.
             threading.Thread(target=self.command, args=(user_id, message.chat_id, key, text), daemon=True).start()
         else:
             generation = self.generations.get(key, 0)
-            self.jobs.put((key, message.chat_id, text, resource, generation))
+            with self.task_lock:
+                self.user_job_counts[user_id] = self.user_job_counts.get(user_id, 0) + 1
+            self.jobs.put((user_id, key, directory, message.chat_id, text, resource, generation))
 
     def resolve_approval(self, request_id: int, chat_id: str, yes: bool,
                          expired: bool = False, source: str = "") -> None:
@@ -952,6 +1014,54 @@ class Bridge:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
         log_event("command_received", command=command, via="card" if source else "text")
+        directory = self.current_directory(user_id)
+        if command == "/cd-confirm":
+            pending = self.pending_directories.pop(argument, None)
+            if not pending or pending[0] != user_id or pending[1] != chat_id or time.time() - pending[3] > 600:
+                self.feishu.card_or_text(chat_id, "创建目录失败", "确认已失效，请重新发送 `/cd <路径>`。", "yellow")
+                return
+            target = pending[2]
+            try:
+                if not self.directory_is_allowed(target):
+                    raise ValueError("目录必须位于已配置的工作区根目录内")
+                target.mkdir(parents=True, exist_ok=True)
+                self.set_directory(user_id, target.resolve())
+                self.feishu.card_or_text(chat_id, "目录已创建并切换", f"当前目录：`{target.resolve()}`", "green")
+            except Exception as exc:
+                self.feishu.card_or_text(chat_id, "创建目录失败", str(exc), "red")
+            return
+        if command == "/cd-cancel":
+            self.pending_directories.pop(argument, None)
+            self.feishu.card_or_text(chat_id, "已取消创建目录", f"当前目录保持为：`{directory}`", "grey")
+            return
+        if command == "/cd":
+            with self.task_lock:
+                busy = getattr(self, "user_job_counts", {}).get(user_id, 0) > 0
+            if busy:
+                self.feishu.card_or_text(chat_id, "任务执行中", "请等待你的任务完成，或先用 `/stop` 停止后再切换目录。", "yellow")
+                return
+            if not argument:
+                buttons = self.directory_buttons(directory)
+                content = f"当前目录：`{directory}`\n\n选择子目录，或直接发送 `/cd <路径>`。"
+                self.feishu.card_or_text(chat_id, "切换工作目录", content, "blue", buttons)
+                return
+            try:
+                target = self.resolve_directory(directory, argument)
+                if target.is_dir():
+                    self.set_directory(user_id, target)
+                    self.feishu.card_or_text(chat_id, "工作目录已切换", f"当前目录：`{target}`", "green")
+                elif target.exists():
+                    self.feishu.card_or_text(chat_id, "切换目录失败", f"目标不是目录：`{target}`\n\n当前目录保持为：`{directory}`", "red")
+                else:
+                    request_id = uuid.uuid4().hex
+                    self.pending_directories[request_id] = (user_id, chat_id, target, time.time())
+                    self.feishu.card_or_text(chat_id, "目录不存在", f"目标：`{target}`\n\n是否创建并进入该目录？", "yellow", [
+                        {"text": "创建并进入", "type": "primary", "value": {"command": "/cd-confirm", "directory_id": request_id}},
+                        {"text": "取消", "type": "default", "value": {"command": "/cd-cancel", "directory_id": request_id}},
+                    ])
+            except Exception as exc:
+                self.feishu.card_or_text(chat_id, "切换目录失败", f"{exc}\n\n当前目录保持为：`{directory}`", "red")
+            return
         if self.current_chat.get("active") and (command in ("/new", "/compact") or (command == "/resume" and argument)):
             self.feishu.card_or_text(chat_id, "任务执行中", "请等待当前任务结束或先停止任务，再切换会话或压缩上下文。", "yellow")
             return
@@ -960,6 +1070,7 @@ class Bridge:
                 {"text": f"{label} {cmd}", "group": group, "type": "danger" if cmd == "/stop" else "default", "value": {"command": cmd}}
                 for group, label, cmd in [("会话", "恢复", "/resume"), ("会话", "新建", "/new"),
                                          ("模型", "当前", "/model"), ("模型", "列表", "/models"),
+                                         ("目录", "切换", "/cd"),
                                          ("任务", "状态", "/status"), ("任务", "压缩", "/compact"),
                                          ("", "停止", "/stop")]
             ])
@@ -975,14 +1086,14 @@ class Bridge:
             self.feishu.card_or_text(chat_id, "新会话", "已切换到新会话，下次提问时自动创建。", "green")
         elif command == "/resume" and argument:
             try:
-                self.server.resume(key, argument)
+                self.server.resume(key, argument, directory)
                 self.save_session(argument, key)
                 self.feishu.card_or_text(chat_id, "会话已恢复", f"会话 ID：`{argument}`", "green")
             except Exception as exc:
                 self.feishu.card_or_text(chat_id, "恢复会话失败", str(exc), "red")
         elif command == "/resume":
             try:
-                threads = self.server.list_threads()
+                threads = self.server.list_threads(directory)
                 shown = threads[:8]
                 content = "选择下方会话继续对话。" if shown else "没有找到会话"
                 buttons = [{"text": "恢复", "description": f"**{index}. {(item.get('title') or '未命名')[:60]}**\n`{str(item.get('id'))[:8]}…`", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
@@ -1028,7 +1139,7 @@ class Bridge:
                 task_state = "空闲"
             uptime = int(time.monotonic() - self.started_at)
             uptime_text = f"{uptime // 3600} 小时 {(uptime % 3600) // 60} 分 {uptime % 60} 秒"
-            self.feishu.card_or_text(chat_id, "Codex 状态", f"**任务**\n{task_state}\n\n**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`\n\n**桥接运行时长**\n{uptime_text}")
+            self.feishu.card_or_text(chat_id, "Codex 状态", f"**任务**\n{task_state}\n\n**目录**\n`{directory}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`\n\n**桥接运行时长**\n{uptime_text}")
         elif command == "/stop":
             try:
                 with self.task_lock:
@@ -1090,6 +1201,10 @@ def on_card_action(data: Any) -> Any:
             command += f" {value['task_id']}"
         elif command == "/model" and value.get("model"):
             command += f" {value['model']}"
+        elif command == "/cd" and value.get("path"):
+            command += f" {value['path']}"
+        elif command in ("/cd-confirm", "/cd-cancel") and value.get("directory_id"):
+            command += f" {value['directory_id']}"
         chat_id = getattr(context, "open_chat_id", "")
         if bridge and chat_id and command.startswith("/"):
             if not bridge.is_allowed(user_id):
@@ -1157,6 +1272,12 @@ def patch_lark_card_callback(lark: Any) -> None:
 
 def main() -> None:
     global bridge
+    if WORKSPACE_ROOT is None:
+        raise RuntimeError("缺少 CODEX_WORKSPACE_ROOT；请在 .env 中设置允许切换的工作区根目录")
+    if not WORKSPACE_ROOT.is_dir():
+        raise RuntimeError("CODEX_WORKSPACE_ROOT 不存在或不是目录")
+    if not ROOT.is_dir() or not ROOT.is_relative_to(WORKSPACE_ROOT):
+        raise RuntimeError("CODEX_BRIDGE_CWD 必须位于 CODEX_WORKSPACE_ROOT 内")
     log_event("bridge_starting", cwd=str(ROOT))
     bridge = Bridge()
     log_event("bridge_ready", cwd=str(ROOT))

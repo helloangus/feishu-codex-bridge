@@ -63,7 +63,7 @@ Bridge.receive
         └── 普通消息 ──▶ jobs FIFO ──▶ 单 worker ──▶ CodexServer.turn
 ```
 
-附件下载到 `<cwd>/feishu-inbox/`；图片以 `localImage` 输入传入 app-server，其他文件以本地路径附加到提示词。普通任务会创建一次性 `task_id` 和进度卡，记录工作目录快照，按需恢复会话，等待匹配的 `turn/completed`，保存 thread ID，更新最终卡并上传交付物。
+附件下载到任务目录的 `<cwd>/feishu-inbox/`；图片以 `localImage` 输入传入 app-server，其他文件以本地路径附加到提示词。普通任务会创建一次性 `task_id` 和进度卡，记录工作目录快照，按需恢复会话，等待匹配的 `turn/completed`，保存 thread ID，更新最终卡并上传交付物。
 
 ## 卡片、审批与交付物
 
@@ -82,11 +82,13 @@ Bridge.receive
 | 文件 | 内容 | 隔离键 |
 | --- | --- | --- |
 | `.feishu-codex-session` | `{user:cwd: thread_id}` | 用户 + 目录 |
-| `.feishu-codex-settings` | `{models: {user:cwd: model}}` | 用户 + 目录 |
+| `.feishu-codex-settings` | `{models: {user:cwd: model}, directories: {user: cwd}}` | 用户 + 目录 / 用户 |
 | `.feishu-codex-seen-messages` | 最近最多 1,000 个消息 ID | 全桥接 |
 | `.runtime/health.json` | 服务阶段、PID、更新时间 | 服务实例 |
 
 消息 journal 使飞书重投、断线重连和服务重启后不会重复执行同一消息。它偏向“至多一次”：若在记录 ID 后异常退出，该消息可能不会重试；这比重复执行可能改文件或运行命令的任务更安全。
+
+`/cd` 只接受 `CODEX_WORKSPACE_ROOT` 内的目录；解析符号链接后仍须在该根目录内。每位用户的目录会持久保存，且入队任务会固定提交时的目录，避免后续切换影响运行中的工作。
 
 ## 服务监督与 SDK 兼容
 

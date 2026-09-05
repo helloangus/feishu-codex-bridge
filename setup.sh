@@ -61,11 +61,11 @@ config_present() {
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
-  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${CODEX_BRIDGE_CWD:-}" ]]
+  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${CODEX_BRIDGE_CWD:-}" && -n "${CODEX_WORKSPACE_ROOT:-}" ]]
 }
 
 write_config() {
-  local app_id app_secret allowed cwd
+  local app_id app_secret allowed cwd workspace_root
   say "首次配置飞书机器人"
   printf '飞书 App ID（例如 cli_xxx）：'
   read -r app_id
@@ -81,6 +81,12 @@ write_config() {
   cwd="${cwd:-$(pwd -P)}"
   [[ -d "$cwd" ]] || fail "工作目录不存在：$cwd"
   cwd="$(CDPATH= cd -- "$cwd" && pwd -P)"
+  printf '允许切换的工作区根目录 [%s]：' "$(dirname -- "$cwd")"
+  read -r workspace_root
+  workspace_root="${workspace_root:-$(dirname -- "$cwd")}"
+  [[ -d "$workspace_root" ]] || fail "工作区根目录不存在：$workspace_root"
+  workspace_root="$(CDPATH= cd -- "$workspace_root" && pwd -P)"
+  [[ "$cwd" == "$workspace_root" || "$cwd" == "$workspace_root"/* ]] || fail "Codex 工作目录必须位于工作区根目录内"
 
   umask 077
   {
@@ -89,6 +95,7 @@ write_config() {
     printf 'FEISHU_APP_SECRET=%q\n' "$app_secret"
     printf 'FEISHU_ALLOWED_OPEN_IDS=%q\n' "$allowed"
     printf 'CODEX_BRIDGE_CWD=%q\n' "$cwd"
+    printf 'CODEX_WORKSPACE_ROOT=%q\n' "$workspace_root"
     printf 'CODEX_MODEL=\n'
     printf 'CODEX_APP_SERVER=%q\n' 'codex app-server'
     printf 'CODEX_MAX_ATTACHMENT_BYTES=20971520\n'
@@ -109,7 +116,7 @@ if [[ "$MODE" == "--check" ]]; then
   # the user whether setup installed both required distributions.
   python -c 'from importlib.metadata import version; version("httpx"); version("lark-oapi")' \
     || fail "缺少 Python 依赖；请执行 ./setup.sh"
-  config_present || fail "配置不完整；请执行 ./setup.sh"
+  config_present || fail "配置不完整；已有部署请在 .env 中补充 CODEX_WORKSPACE_ROOT，再重新检查"
   say "配置：已找到 .env（不会显示凭据）"
   "$BRIDGE_DIR/start.sh" status
   exit 0
@@ -121,7 +128,7 @@ python -m pip install -r "$BRIDGE_DIR/requirements.txt"
 if [[ ! -f "$ENV_FILE" ]]; then
   write_config
 elif ! config_present; then
-  fail ".env 已存在但配置不完整；请修正它，或手动删除后重新执行 ./setup.sh"
+  fail ".env 已存在但配置不完整；请补充 CODEX_WORKSPACE_ROOT（且须包含 CODEX_BRIDGE_CWD），或手动删除后重新执行 ./setup.sh"
 else
   say "检测到已有 .env，保留现有配置"
 fi

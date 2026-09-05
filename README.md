@@ -10,6 +10,7 @@
 
 - 飞书私聊文本 → 当前目录的 Codex thread；最终 Markdown 回复以飞书卡片展示。
 - `/new`、`/resume`、`/compact` 管理 Codex 会话；服务重启后自动恢复已保存会话。
+- `/cd` 可在受限工作区内按用户切换目录，支持移动端快捷目录卡。
 - `/models` 卡片选择模型，模型偏好按飞书用户与工作目录保存。
 - `/help` 提供移动端友好的控制面板；支持文本命令和卡片按钮。
 - Codex 进度卡片、任务耗时、长回复安全分段、单任务停止按钮。
@@ -73,6 +74,7 @@ codex --version
 | --- | --- |
 | `/help` | 显示控制面板。 |
 | `/status` | 显示任务状态、队列、目录、会话、模型和桥接运行时长。 |
+| `/cd` / `/cd <路径>` | 显示当前目录的子目录，或切换到工作区内的绝对/相对路径；不存在的目录会先请求确认创建。 |
 | `/new` | 清除当前用户在当前目录的会话绑定；下次提问创建新会话。 |
 | `/resume` / `/resume <thread_id>` | 列出最近会话，或恢复指定 Codex thread。 |
 | `/model` / `/models` / `/model <model>` | 查看、选择或设置模型。 |
@@ -83,7 +85,7 @@ codex --version
 
 ### 附件与交付物
 
-- 图片下载到 `<cwd>/feishu-inbox/` 并作为 app-server `localImage` 输入交给 Codex。
+- 图片下载到当前 `<cwd>/feishu-inbox/` 并作为 app-server `localImage` 输入交给 Codex。
 - 文件下载后，以本地路径附加到提示词。
 - 每轮任务最多回传 10 个新增或修改的文件；默认单文件上限为 20 MiB。
 - `feishu-inbox/`、`.runtime/`、`.git/` 和 `.feishu-codex*` 状态文件不会作为交付物上传。
@@ -112,7 +114,8 @@ codex --version
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 是 | 飞书企业自建应用凭据。 |
 | `FEISHU_ALLOWED_OPEN_IDS` | 建议 | 逗号分隔的允许用户 `open_id`；未设置配对码时留空表示不做白名单限制。 |
 | `FEISHU_PAIRING_CODE` | 否 | 设置后可用 `/pair <配对码>` 安全地自助加入白名单；配对完成后删除该项并重启。 |
-| `CODEX_BRIDGE_CWD` | 是 | Codex 工作目录；会话、模型和收件目录默认在此目录。 |
+| `CODEX_BRIDGE_CWD` | 是 | 初始 Codex 工作目录，以及 bridge 会话、设置、去重等状态文件的位置。必须在工作区根内。 |
+| `CODEX_WORKSPACE_ROOT` | 是 | `/cd` 可访问的工作区根目录；目录及其符号链接解析后的目标都不得越出该范围。 |
 | `CODEX_MODEL` | 否 | 默认模型；也可以用 `/models` 按用户设置。 |
 | `CODEX_APP_SERVER` | 否 | app-server 启动命令，默认 `codex app-server`。 |
 | `CODEX_MAX_ATTACHMENT_BYTES` | 否 | 回传文件上限，默认 `20971520`。 |

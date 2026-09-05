@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 BASE = Path(__file__).resolve().parent
@@ -115,10 +116,12 @@ def _run_local(foreground=False):
         logger.addHandler(handler)
         stopping = False
         child = None
+        stop_event = threading.Event()
 
         def shutdown(*_):
             nonlocal stopping, child
             stopping = True
+            stop_event.set()
             if child is None:
                 return
             try:
@@ -151,7 +154,10 @@ def _run_local(foreground=False):
                 if stopping or code == 0:
                     break
                 logger.info('event=bridge_crash restart_in=%s', restart_delay)
-                time.sleep(restart_delay)
+                # A plain sleep makes `restart` wait for the full backoff
+                # interval after a crash. Wake immediately when SIGTERM asks
+                # the supervisor to stop.
+                stop_event.wait(restart_delay)
                 restart_delay = min(restart_delay * 2, 30)
         finally:
             shutdown()

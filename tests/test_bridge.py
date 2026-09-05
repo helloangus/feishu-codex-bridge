@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("FEISHU_APP_ID", "test-app")
 os.environ.setdefault("FEISHU_APP_SECRET", "test-secret")
+os.environ.setdefault("CODEX_WORKSPACE_ROOT", "/tmp")
 
 import bridge
 
@@ -128,6 +129,67 @@ class BridgeTests(unittest.TestCase):
             self.assertIn("执行中", item.feishu.calls[-1][0][2])
         finally:
             bridge.log_event = original_log_event
+
+    def test_cd_is_scoped_persisted_and_offers_creation_confirmation(self):
+        item = bridge.Bridge.__new__(bridge.Bridge)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = root / "project"
+            child = current / "child"
+            current.mkdir()
+            child.mkdir()
+            original_root, original_settings = bridge.WORKSPACE_ROOT, bridge.SETTINGS_FILE
+            try:
+                bridge.WORKSPACE_ROOT = root
+                bridge.SETTINGS_FILE = root / "settings.json"
+                item.models = {}
+                item.directories = {"user": str(root)}
+                item.feishu = Outbox()
+                item.task_lock = threading.Lock()
+                item.user_job_counts = {}
+                item.pending_directories = {}
+                item.current_chat = {}
+
+                item.command("user", "chat", "unused", "/cd project")
+                self.assertEqual(item.current_directory("user"), current)
+                self.assertIn("工作目录已切换", item.feishu.calls[-1][0][1])
+                self.assertEqual(item.load_settings()[1]["user"], str(current))
+
+                item.command("user", "chat", "unused", "/cd ../../outside")
+                self.assertEqual(item.current_directory("user"), current)
+                self.assertIn("切换目录失败", item.feishu.calls[-1][0][1])
+
+                (current / "outside-link").symlink_to(root.parent, target_is_directory=True)
+                item.command("user", "chat", "unused", "/cd outside-link")
+                self.assertEqual(item.current_directory("user"), current)
+                self.assertIn("切换目录失败", item.feishu.calls[-1][0][1])
+
+                item.command("user", "chat", "unused", "/cd new-project")
+                buttons = item.feishu.calls[-1][0][4]
+                confirmation = buttons[0]["value"]["directory_id"]
+                item.command("user", "chat", "unused", f"/cd-confirm {confirmation}")
+                self.assertTrue((current / "new-project").is_dir())
+                self.assertEqual(item.current_directory("user"), current / "new-project")
+            finally:
+                bridge.WORKSPACE_ROOT, bridge.SETTINGS_FILE = original_root, original_settings
+
+    def test_cd_rejects_switching_while_user_has_work(self):
+        item = bridge.Bridge.__new__(bridge.Bridge)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "project").mkdir()
+            original_root = bridge.WORKSPACE_ROOT
+            try:
+                bridge.WORKSPACE_ROOT = root
+                item.directories = {"user": str(root)}
+                item.feishu = Outbox()
+                item.task_lock = threading.Lock()
+                item.user_job_counts = {"user": 1}
+                item.command("user", "chat", "unused", "/cd project")
+                self.assertIn("任务执行中", item.feishu.calls[-1][0][1])
+                self.assertEqual(item.current_directory("user"), root)
+            finally:
+                bridge.WORKSPACE_ROOT = original_root
 
 
 if __name__ == "__main__":

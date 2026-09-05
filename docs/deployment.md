@@ -8,7 +8,7 @@
 /path/to/feishu-codex-bridge/setup.sh
 ```
 
-脚本询问 App ID、App Secret、`open_id` 白名单和工作目录，并自动安装 Python 依赖、生成私有 `.env`、启动服务。前提是已经安装并登录 Codex CLI。
+脚本询问 App ID、App Secret、`open_id` 白名单、初始工作目录和允许切换的工作区根目录，并自动安装 Python 依赖、生成私有 `.env`、启动服务。工作区根目录必须包含初始目录；前提是已经安装并登录 Codex CLI。
 
 ## 飞书后台核对表
 
