@@ -1,5 +1,6 @@
 .env
 .feishu-codex-session
+.feishu-codex-settings
 __pycache__/
 *.pyc
 .runtime/

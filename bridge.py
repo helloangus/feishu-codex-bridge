@@ -25,6 +25,7 @@ ALLOWED = {x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").spli
 DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "")
 MAX_ATTACHMENT = int(os.environ.get("CODEX_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
 SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-codex-session")))
+SETTINGS_FILE = Path(os.environ.get("CODEX_SETTINGS_FILE", str(ROOT / ".feishu-codex-settings")))
 APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
 STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
 GENERATED_IMAGES = Path(os.environ.get("CODEX_GENERATED_IMAGES", str(Path.home() / ".codex" / "generated_images")))
@@ -411,7 +412,7 @@ class Bridge:
     def __init__(self) -> None:
         self.feishu = Feishu()
         self.server = CodexServer(self.codex_event)
-        self.models: dict[str, str] = {}
+        self.models = self.load_model_settings()
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
         self.active_cards: dict[str, str] = {}
@@ -450,6 +451,19 @@ class Bridge:
 
     def session_key(self, user_id: str) -> str:
         return f"{user_id}:{ROOT}"
+
+    def load_model_settings(self) -> dict[str, str]:
+        try:
+            parsed = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            return {str(key): str(value) for key, value in parsed.get("models", {}).items()}
+        except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+            return {}
+
+    def save_model_settings(self) -> None:
+        temporary = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+        temporary.write_text(json.dumps({"models": self.models}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        os.replace(temporary, SETTINGS_FILE)
 
     def load_session(self, key: str = "") -> str:
         try:
@@ -848,11 +862,23 @@ class Bridge:
         elif command == "/model":
             if argument:
                 self.models[key] = argument
+                self.save_model_settings()
                 self.feishu.card_or_text(chat_id, "模型已切换", f"后续请求使用：`{argument}`", "green")
             else:
                 self.feishu.card_or_text(chat_id, "当前模型", f"`{self.models.get(key, DEFAULT_MODEL) or 'Codex 默认'}`")
         elif command == "/models":
-            self.feishu.card_or_text(chat_id, "可用模型", "\n".join(f"- `{item}`" for item in self.server.models()) or "暂无模型")
+            try:
+                available = self.server.models()
+                selected = self.models.get(key, DEFAULT_MODEL)
+                buttons = [{
+                    "text": ("✓ " if model == selected else "") + model,
+                    "description": "当前模型" if model == selected else "",
+                    "type": "primary" if model == selected else "default",
+                    "value": {"command": "/model", "model": model},
+                } for model in available[:12]]
+                self.feishu.card_or_text(chat_id, "选择模型", "点击模型后，后续请求会使用该模型。" if buttons else "暂无模型", "blue", buttons)
+            except Exception as exc:
+                self.feishu.card_or_text(chat_id, "读取模型失败", str(exc), "red")
         elif command == "/status":
             thread_id = self.server.threads.get(key) or self.load_session(key)
             self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
@@ -904,6 +930,8 @@ def on_card_action(data: Any) -> Any:
             command += f" {int(value.get('id'))}"
         elif command == "/resume" and value.get("thread_id"):
             command += f" {value['thread_id']}"
+        elif command == "/model" and value.get("model"):
+            command += f" {value['model']}"
         chat_id = getattr(context, "open_chat_id", "")
         if bridge and chat_id and command.startswith("/"):
             if ALLOWED and user_id not in ALLOWED:
