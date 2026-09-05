@@ -412,6 +412,7 @@ class CodexServer:
 
 class Bridge:
     def __init__(self) -> None:
+        self.started_at = time.monotonic()
         self.feishu = Feishu()
         self.server = CodexServer(self.codex_event)
         self.models = self.load_model_settings()
@@ -934,7 +935,20 @@ class Bridge:
                 self.feishu.card_or_text(chat_id, "读取模型失败", str(exc), "red")
         elif command == "/status":
             thread_id = self.server.threads.get(key) or self.load_session(key)
-            self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
+            with self.task_lock:
+                active_task = self.active_task_tokens.get(key)
+                stopping = key in self.stopping_tasks
+            if stopping:
+                task_state = "正在停止"
+            elif active_task:
+                task_state = "执行中"
+            elif self.jobs.qsize():
+                task_state = f"等待队列中（共 {self.jobs.qsize()} 项）"
+            else:
+                task_state = "空闲"
+            uptime = int(time.monotonic() - self.started_at)
+            uptime_text = f"{uptime // 3600} 小时 {(uptime % 3600) // 60} 分 {uptime % 60} 秒"
+            self.feishu.card_or_text(chat_id, "Codex 状态", f"**任务**\n{task_state}\n\n**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`\n\n**桥接运行时长**\n{uptime_text}")
         elif command == "/stop":
             try:
                 with self.task_lock:
