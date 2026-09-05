@@ -33,19 +33,20 @@
 
 ### `CodexServer`
 
-启动 `CODEX_APP_SERVER`（默认 `codex app-server`），通过 stdin/stdout 使用 JSON-RPC，维护 `key → thread_id`、活动 turn、审批请求和等待响应表。
+启动 `CODEX_APP_SERVER`（默认 `codex app-server --enable collaboration_modes`），通过 stdin/stdout 使用 JSON-RPC，维护 `key → thread_id`、活动 turn、审批请求和等待响应表。每个 turn 显式使用 Codex `on-request`（Ask for approval）审批策略与 `workspaceWrite` sandbox；可写根目录仅为该 turn 已固定的工作目录，网络默认关闭，越出 sandbox 的请求仍通过飞书审批卡处理。
 
 **一个 reader 原则**：stdout 只能由 `_receive_rpc` 读取。该线程将响应按 JSON-RPC `id` 分发给 `pending` 队列，将通知转交给 `notifications`；`_dispatch_events` 再处理通知，并把 `turn/completed` 放入 `completions`。新增 RPC 方法必须调用 `request()` 或 `send()`，绝不能直接读取 `process.stdout`。
 
 ### `Bridge`
 
-`Bridge` 把飞书事件转化为命令或任务，并维护用户状态、进度卡、审批卡、交付物和去重日志。它创建三个后台线程：
+`Bridge` 把飞书事件转化为命令或任务，并维护用户状态、进度卡、审批卡、选择题、Plan 模式、交付物和去重日志。它创建四个后台线程：
 
 | 线程 | 职责 |
 | --- | --- |
 | `worker` | 从 FIFO `jobs` 队列取一个普通消息，执行完整 Codex turn。 |
 | `approval_reaper` | 每 5 秒扫描审批，超时后自动拒绝。 |
 | `progress_worker` | 每 2 秒更新当前任务的飞书进度卡。 |
+| `question_reaper` | 处理超时未回答的 Codex 选择题。 |
 
 飞书回调会快速返回；耗时命令（如 `/resume`、`/models`）会放到独立线程，避免阻塞 WebSocket 心跳。
 
@@ -71,9 +72,13 @@ Bridge.receive
 
 运行中的任务更新同一张卡。最终内容超过实用卡片长度时，`split_card_content()` 约按 5,600 字符拆分，并在跨卡时闭合、重开 Markdown 代码围栏。
 
-审批通知会展示操作类型、原因、命令、目录、文件变动和有限长度 diff。审批 ID 与聊天、原卡片绑定；旧卡、重复操作和超时审批都会安全拒绝。超时默认 600 秒。
+审批通知会展示操作类型、原因、命令、目录、文件变动和有限长度 diff，并显示 10 分钟处理时限；超时后原卡会更新为自动拒绝。审批 ID 与聊天、原卡片绑定；旧卡、重复操作和超时审批都会安全拒绝。Codex 选择题卡同样显示剩余时限，超时更新原卡并回传空答案。计划完成卡的三项后续操作也有时限，超时后原卡更新为失效状态。
 
-任务前后扫描工作目录文件元数据，排除 `.git`、`.runtime`、收件目录和 `.feishu-codex*`；最多上传 10 个变更文件。生成图片额外从 Codex thread 的图片目录收集。
+`/plan on` 为当前用户和目录开启 Codex Plan 模式。`/help` 的 Plan 按钮是状态型开关，使用显式开启/关闭动作并在原控制面板卡片更新，旧卡重复点击也是幂等的。计划完成时先更新原进度卡，再发送完整 Markdown“计划详情”卡（优先结构化 plan item，缺失时明确标记为最终文本降级展示），最后发送置底的“计划下一步”卡，其中包含“实现此计划”“清空上下文后实现”“留在 Plan 模式”三项操作。两种实施路径都会保留计划文本，前者保留当前 thread。Codex 发出 `item/tool/requestUserInput` 时，bridge 逐题渲染选项卡并以 JSON-RPC 原请求 ID 回写选择；“其他”回答由用户下一条普通文本提供，超时返回空答案。
+
+bridge 启动时读取 app-server 的模型列表并缓存标记为默认的模型。进入或退出协作模式时优先使用用户已选模型，否则使用这个实际可用的默认值；不会猜测模型 ID。失败的 turn 会把 app-server 提供的错误摘要回传到最终卡片。
+
+任务前后扫描工作目录文件元数据和受限数量、大小的 UTF-8 文本快照，排除 `.git`、`.runtime`、收件目录和 `.feishu-codex*`；对本轮新增、修改、删除的文本文件另发每文件一张 unified diff 卡，长内容按卡片规则拆分并截断。二进制、过大或无法读取的文件只说明无法生成文本差异；最多上传 10 个仍存在的变更文件，上传清单不重复 diff。生成图片额外从 Codex thread 的图片目录收集。
 
 ## 状态与去重
 
@@ -82,7 +87,7 @@ Bridge.receive
 | 文件 | 内容 | 隔离键 |
 | --- | --- | --- |
 | `.feishu-codex-session` | `{user:cwd: thread_id}` | 用户 + 目录 |
-| `.feishu-codex-settings` | `{models: {user:cwd: model}, directories: {user: cwd}}` | 用户 + 目录 / 用户 |
+| `.feishu-codex-settings` | `{models, directories, plan_modes: {user:cwd: true}}` | 用户 + 目录 / 用户 |
 | `.feishu-codex-seen-messages` | 最近最多 1,000 个消息 ID | 全桥接 |
 | `.runtime/health.json` | 服务阶段、PID、更新时间 | 服务实例 |
 

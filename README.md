@@ -78,6 +78,7 @@ codex --version
 | `/new` | 清除当前用户在当前目录的会话绑定；下次提问创建新会话。 |
 | `/resume` / `/resume <thread_id>` | 列出最近会话，或恢复指定 Codex thread。 |
 | `/model` / `/models` / `/model <model>` | 查看、选择或设置模型。 |
+| `/plan` / `/plan on` / `/plan off` | 查看、开启或关闭 Plan 模式；控制面板会显示状态型“开启 Plan”或“关闭 Plan”按钮，并原地更新。开启后普通消息只产出计划。 |
 | `/compact` | 请求 Codex 压缩当前 thread 上下文。 |
 | `/stop` | 中断当前任务，或取消等待队列中的任务。 |
 | `/approve <id>` / `/deny <id>` | 用文本处理审批；通常直接点审批卡片即可。 |
@@ -87,7 +88,7 @@ codex --version
 
 - 图片下载到当前 `<cwd>/feishu-inbox/` 并作为 app-server `localImage` 输入交给 Codex。
 - 文件下载后，以本地路径附加到提示词。
-- 每轮任务最多回传 10 个新增或修改的文件；默认单文件上限为 20 MiB。
+- 每轮任务最多回传 10 个新增或修改的文件；默认单文件上限为 20 MiB。文本新增、修改和删除会另以 unified diff 卡片显示，仅涵盖本轮快照后的变化；二进制、无法读取或过大的文件只标注无法生成文本差异。
 - `feishu-inbox/`、`.runtime/`、`.git/` 和 `.feishu-codex*` 状态文件不会作为交付物上传。
 
 ## 运维
@@ -117,9 +118,11 @@ codex --version
 | `CODEX_BRIDGE_CWD` | 是 | 初始 Codex 工作目录，以及 bridge 会话、设置、去重等状态文件的位置。必须在工作区根内。 |
 | `CODEX_WORKSPACE_ROOT` | 是 | `/cd` 可访问的工作区根目录；目录及其符号链接解析后的目标都不得越出该范围。 |
 | `CODEX_MODEL` | 否 | 默认模型；也可以用 `/models` 按用户设置。 |
-| `CODEX_APP_SERVER` | 否 | app-server 启动命令，默认 `codex app-server`。 |
+| `CODEX_APP_SERVER` | 否 | app-server 启动命令，默认启用 `collaboration_modes` 实验特性。 |
+| （内置策略） | — | 每个 turn 使用 Codex `Ask for approval`（`on-request`）和仅限当前工作目录的 `workspaceWrite` sandbox；离开该范围或需要额外权限时会显示飞书审批卡。 |
 | `CODEX_MAX_ATTACHMENT_BYTES` | 否 | 回传文件上限，默认 `20971520`。 |
 | `CODEX_APPROVAL_TIMEOUT_SECONDS` | 否 | 审批超时自动拒绝时间，默认 `600` 秒。 |
+| `CODEX_QUESTION_TIMEOUT_SECONDS` | 否 | Codex 选择题等待回答时间，默认 `600` 秒。 |
 | `CODEX_SESSION_FILE` / `CODEX_SETTINGS_FILE` / `CODEX_SEEN_MESSAGES_FILE` / `CODEX_ALLOWED_OPEN_IDS_FILE` | 否 | 覆盖状态文件默认位置。 |
 
 ## 安全边界
