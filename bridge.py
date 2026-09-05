@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import queue
 import shlex
@@ -73,6 +74,22 @@ class Feishu:
         if path.stat().st_size > MAX_ATTACHMENT:
             self.text(chat_id, f"交付物过大，未上传：{path.name}（{path.stat().st_size} bytes）")
             return
+        mime, _ = mimetypes.guess_type(path.name)
+        if mime and mime.startswith("image/"):
+            with path.open("rb") as stream:
+                response = self.http.post(
+                    "https://open.feishu.cn/open-apis/im/v1/images",
+                    headers={"Authorization": f"Bearer {self.token()}"},
+                    data={"image_type": "message"},
+                    files={"image": (path.name, stream, mime)},
+                )
+            response.raise_for_status()
+            image_key = response.json()["data"]["image_key"]
+            self.api("/im/v1/messages?receive_id_type=chat_id", {
+                "receive_id": chat_id, "msg_type": "image",
+                "content": json.dumps({"image_key": image_key}),
+            })
+            return
         with path.open("rb") as stream:
             response = self.http.post(
                 "https://open.feishu.cn/open-apis/im/v1/files",
@@ -111,12 +128,7 @@ class Feishu:
 
 class CodexServer:
     def __init__(self, event: Callable[[str, Any], None]) -> None:
-        command = shlex.split(os.environ.get("CODEX_APP_SERVER", "codex app-server"))
-        self.process = subprocess.Popen(
-            command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            # stdout is a JSON-RPC stream; diagnostics must never be merged into it.
-            stderr=subprocess.DEVNULL, text=True, bufsize=1,
-        )
+        self.command = shlex.split(os.environ.get("CODEX_APP_SERVER", "codex app-server"))
         self.event = event
         self.write_lock = threading.Lock()
         self.rpc_id = 0
@@ -125,7 +137,26 @@ class CodexServer:
         self.approval_created: dict[int, float] = {}
         self.turn_text = ""
         self.active_turn: dict[str, str] = {}
+        self._spawn()
+
+    def _spawn(self) -> None:
+        self.process = subprocess.Popen(
+            self.command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            # stdout is a JSON-RPC stream; diagnostics must never be merged into it.
+            stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
         self._initialize()
+
+    def restart(self) -> None:
+        old = self.process
+        if old.poll() is None:
+            old.kill()
+            old.wait(timeout=5)
+        self.rpc_id = 0
+        self.approvals.clear()
+        self.approval_created.clear()
+        self.active_turn.clear()
+        self._spawn()
 
     def send(self, message: dict[str, Any]) -> None:
         assert self.process.stdin is not None
@@ -346,6 +377,12 @@ class Bridge:
                 for path in self.changed_files(before):
                     self.feishu.upload_file(chat_id, path)
             except Exception as exc:
+                if self.server.process.poll() is not None:
+                    try:
+                        self.server.restart()
+                        self.feishu.text(chat_id, "Codex 进程已退出，已自动重启；下一条消息会自动恢复会话。")
+                    except Exception as restart_error:
+                        self.feishu.text(chat_id, f"Codex 自动重启失败：{restart_error}")
                 self.feishu.text(chat_id, f"Codex 执行失败：{exc}")
             finally:
                 self.current_chat.pop("active", None)
