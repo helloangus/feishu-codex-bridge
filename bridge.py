@@ -359,6 +359,8 @@ class Bridge:
         self.stream_buffers: dict[str, str] = {}
         self.active_cards: dict[str, str] = {}
         self.approval_cards: dict[int, str] = {}
+        self.approval_summaries: dict[int, str] = {}
+        self.approval_items: dict[str, dict[str, Any]] = {}
         self.approval_lock = threading.Lock()
         self.card_updated_at: dict[str, float] = {}
         self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None, int]] = queue.Queue()
@@ -398,8 +400,40 @@ class Bridge:
         self.seen_message_set.add(message_id)
         return True
 
+    def approval_summary(self, request: dict[str, Any]) -> str:
+        params = request.get("params", {})
+        item = self.approval_items.get(params.get("itemId", ""), {})
+        method = request.get("method", "")
+        category = "文件修改" if "fileChange" in method else "命令执行" if "commandExecution" in method else "权限请求"
+        parts = [f"**操作类型：{category}**"]
+        fields = [("申请原因", params.get("reason")),
+                  ("执行命令", params.get("command") or item.get("command")),
+                  ("工作目录", params.get("cwd") or item.get("cwd")),
+                  ("文件改动", item.get("changes") or params.get("changes")),
+                  ("申请写入目录", params.get("grantRoot")),
+                  ("额外权限", params.get("additionalPermissions") or params.get("permissions")),
+                  ("网络访问", params.get("networkApprovalContext"))]
+        found = False
+        for label, value in fields:
+            if value is None or value == "":
+                continue
+            found = True
+            detail = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+            if len(detail) > 2400:
+                detail = detail[:2400] + "\n…（内容已截断，请确认完整操作后再审批）"
+            detail = detail.replace("```", "` ` `")
+            parts.append(f"**{label}**\n```\n{detail}\n```")
+        if not found:
+            parts.append("请求未提供操作详情，暂时无法判断具体改动；建议拒绝并让 Codex 补充说明。")
+        parts.append(f"审批编号：`{request['id']}`")
+        return "\n\n".join(parts)
+
     def codex_event(self, kind: str, value: Any) -> None:
-        if kind == "delta":
+        if kind == "item":
+            item = value.get("item", {})
+            if item.get("id"):
+                self.approval_items[item["id"]] = item
+        elif kind == "delta":
             chat_id = self.current_chat.get("active", "")
             if not chat_id:
                 return
@@ -424,7 +458,9 @@ class Bridge:
             self.server.approval_created[request_id] = time.time()
             chat_id = self.server.approvals[request_id]
             if chat_id:
-                self.approval_cards[request_id] = self.feishu.card_or_text(chat_id, "需要审批", f"Codex 请求执行一项需要确认的操作。\n\n审批编号：`{request_id}`", "yellow", [
+                summary = self.approval_summary(value)
+                self.approval_summaries[request_id] = summary
+                self.approval_cards[request_id] = self.feishu.card_or_text(chat_id, "需要审批", summary, "yellow", [
                     {"text": "允许", "type": "primary", "value": {"command": "/approve", "id": request_id}},
                     {"text": "拒绝", "type": "danger", "value": {"command": "/deny", "id": request_id}},
                 ])
@@ -450,6 +486,7 @@ class Bridge:
                 self.jobs.task_done()
                 continue
             self.current_chat["active"] = chat_id
+            self.approval_items.clear()
             self.current_chat["key"] = key
             try:
                 before = self.snapshot()
@@ -597,8 +634,11 @@ class Bridge:
                 raise ValueError("旧审批卡片已失效")
             self.server.approve(request_id, yes)
             card_id = self.approval_cards.pop(request_id, "")
+            summary = self.approval_summaries.pop(request_id, "")
         title = "审批已超时" if expired else ("已允许" if yes else "已拒绝")
         content = f"审批编号：`{request_id}`\n\n" + ("已自动拒绝。" if expired else "审批决定已提交。")
+        if summary:
+            content = summary + "\n\n" + ("已超时，自动拒绝。" if expired else "审批决定已提交。")
         if card_id:
             try:
                 self.feishu.update_card(card_id, title, content, "green" if yes else "grey")
