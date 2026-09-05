@@ -363,12 +363,32 @@ class Bridge:
         self.approval_items: dict[str, dict[str, Any]] = {}
         self.approval_lock = threading.Lock()
         self.card_updated_at: dict[str, float] = {}
+        self.progress_lock = threading.Lock()
+        self.progress: dict[str, Any] = {}
         self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None, int]] = queue.Queue()
         self.generations: dict[str, int] = {}
         self.seen_messages: deque[str] = deque(maxlen=1000)
         self.seen_message_set: set[str] = set()
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.approval_reaper, daemon=True).start()
+        threading.Thread(target=self.progress_worker, daemon=True).start()
+
+    def progress_worker(self) -> None:
+        while True:
+            time.sleep(2)
+            with self.progress_lock:
+                state = self.progress
+                if not state or not state.get("card"):
+                    continue
+                elapsed = int(time.monotonic() - state["started"])
+                preview = state.get("text") or "任务仍在运行，暂未收到新的输出。"
+                content = f"已耗时 {elapsed} 秒\n\n{preview[-5000:]}"
+                try:
+                    self.feishu.update_card(state["card"], "Codex 处理中", content, "blue", [
+                        {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
+                    ])
+                except Exception as exc:
+                    print(f"Progress update failed: {type(exc).__name__}", flush=True)
 
     def session_key(self, user_id: str) -> str:
         return f"{user_id}:{ROOT}"
@@ -441,17 +461,9 @@ class Bridge:
             while len(buffer) >= STREAM_CHUNK:
                 buffer = buffer[STREAM_CHUNK:]
             self.stream_buffers[chat_id] = buffer
-            card_id = self.active_cards.get(chat_id, "")
-            now = time.time()
-            if card_id and now - self.card_updated_at.get(chat_id, 0) >= 2:
-                preview = self.server.turn_text[-5000:] or "正在生成回复…"
-                try:
-                    self.feishu.update_card(card_id, "Codex 处理中", preview, "blue", [
-                        {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
-                    ])
-                    self.card_updated_at[chat_id] = now
-                except Exception:
-                    pass
+            with self.progress_lock:
+                if self.progress:
+                    self.progress["text"] = self.server.turn_text
         elif kind == "approval":
             request_id = int(value["id"])
             self.server.approvals[request_id] = self.current_chat.get("active", "")
@@ -495,6 +507,8 @@ class Bridge:
                     {"text": "停止任务", "type": "danger", "value": {"command": "/stop"}}
                 ])
                 self.active_cards[chat_id] = card_id
+                with self.progress_lock:
+                    self.progress = {"card": card_id, "started": time.monotonic(), "text": "正在准备执行…"}
                 self.card_updated_at[chat_id] = time.time()
                 extra_inputs: list[dict[str, Any]] = []
                 if resource:
@@ -512,15 +526,31 @@ class Bridge:
                     self.server.resume(key, stored)
                 self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL), extra_inputs)
                 self.save_session(self.server.threads[key])
+                with self.progress_lock:
+                    self.progress = {}
                 self.stream_buffers.pop(chat_id, "")
+                elapsed = int(time.time() - started_at)
                 if self.server.last_turn_status == "interrupted":
                     self.finish_card(chat_id, "任务已停止", "Codex turn 已停止。", "red")
                 else:
-                    self.finish_card(chat_id, "Codex 已完成", self.server.turn_text or "Codex 已完成，但没有返回文字。", "green")
-                for path in self.changed_files(before):
-                    self.feishu.upload_file(chat_id, path)
-                for path in self.generated_files(key, started_at):
-                    self.feishu.upload_file(chat_id, path)
+                    status = self.server.last_turn_status
+                    self.finish_card(chat_id, "Codex 执行失败" if status == "failed" else "Codex 已完成",
+                                     f"耗时 {elapsed} 秒\n\n" + (self.server.turn_text or "没有返回文字。"),
+                                     "red" if status == "failed" else "green")
+                paths = list(dict.fromkeys(self.changed_files(before) + self.generated_files(key, started_at)))
+                deliveries = []
+                for path in paths:
+                    try:
+                        size = path.stat().st_size
+                        if size > MAX_ATTACHMENT:
+                            deliveries.append(f"- {path.name}：超过上传大小限制，未上传")
+                            continue
+                        self.feishu.upload_file(chat_id, path)
+                        deliveries.append(f"- {path.name} · {size:,} bytes · 已发送")
+                    except Exception as exc:
+                        deliveries.append(f"- {path.name} · 上传失败（{type(exc).__name__}）")
+                if deliveries:
+                    self.feishu.card_or_text(chat_id, "交付物", "\n".join(deliveries))
             except Exception as exc:
                 if self.server.process.poll() is not None:
                     try:
@@ -530,6 +560,8 @@ class Bridge:
                         self.feishu.card_or_text(chat_id, "Codex 自动重启失败", str(restart_error), "red")
                 self.finish_card(chat_id, "Codex 执行失败", str(exc), "red")
             finally:
+                with self.progress_lock:
+                    self.progress = {}
                 self.active_cards.pop(chat_id, None)
                 self.card_updated_at.pop(chat_id, None)
                 self.current_chat.pop("active", None)
@@ -537,19 +569,27 @@ class Bridge:
                 self.jobs.task_done()
 
     def finish_card(self, chat_id: str, title: str, content: str, color: str) -> None:
+        with self.progress_lock:
+            self.progress = {}
         card_id = self.active_cards.get(chat_id, "")
+        chunks = []
+        remaining = content
+        while len(remaining) > 6000:
+            boundary = remaining.rfind("\n\n", 3000, 6000)
+            cut = boundary + 2 if boundary >= 0 else 6000
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:]
+        chunks.append(remaining)
         if card_id:
             try:
                 # Keep the primary card within Feishu's practical card size;
                 # continuation cards preserve the complete long response.
-                first, rest = content[:6000], content[6000:]
-                self.feishu.update_card(card_id, title, first, color)
-                for offset in range(0, len(rest), 6000):
-                    self.feishu.card_or_text(chat_id, f"{title}（续）", rest[offset:offset + 6000], color)
-                return
+                self.feishu.update_card(card_id, title, chunks[0], color)
+                chunks = chunks[1:]
             except Exception as exc:
                 print(f"Feishu card update failed ({title}): {exc}", flush=True)
-        self.feishu.card_or_text(chat_id, title, content, color)
+        for chunk in chunks:
+            self.feishu.card_or_text(chat_id, title, chunk, color)
 
     def snapshot(self) -> dict[str, tuple[int, int]]:
         result: dict[str, tuple[int, int]] = {}
