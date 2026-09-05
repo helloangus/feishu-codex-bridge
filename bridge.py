@@ -138,6 +138,8 @@ class CodexServer:
         self.approval_created: dict[int, float] = {}
         self.turn_text = ""
         self.active_turn: dict[str, str] = {}
+        self.starting_turns: set[str] = set()
+        self.pending_interrupt: set[str] = set()
         self._spawn()
 
     def _spawn(self) -> None:
@@ -219,10 +221,16 @@ class CodexServer:
         }
         if model:
             params["model"] = model
-        result = self.request("turn/start", params)
-        turn = result.get("turn", result)
-        if turn.get("id"):
-            self.active_turn[key] = turn["id"]
+        self.starting_turns.add(key)
+        try:
+            result = self.request("turn/start", params)
+            turn = result.get("turn", result)
+            if turn.get("id"):
+                self.active_turn[key] = turn["id"]
+                if key in self.pending_interrupt:
+                    self._send_interrupt(key)
+        finally:
+            self.starting_turns.discard(key)
         while True:
             message = self._read()
             self.handle_event(message)
@@ -234,17 +242,28 @@ class CodexServer:
         self.request("thread/resume", {"threadId": thread_id, "cwd": str(ROOT)})
         self.threads[key] = thread_id
 
-    def interrupt(self, key: str) -> None:
+    def _send_interrupt(self, key: str) -> None:
         thread_id = self.threads.get(key)
         turn_id = self.active_turn.get(key)
         if not thread_id or not turn_id:
-            raise RuntimeError("当前没有正在执行的 Codex turn")
+            return
         # Do not synchronously read the RPC response here: the worker is already
         # consuming the app-server stream for the active turn.
         self.send({"jsonrpc": "2.0", "id": self.rpc_id + 1,
                    "method": "turn/interrupt",
                    "params": {"threadId": thread_id, "turnId": turn_id}})
         self.rpc_id += 1
+        self.pending_interrupt.discard(key)
+
+    def interrupt(self, key: str) -> bool:
+        if not self.active_turn.get(key) and key not in self.starting_turns:
+            self.pending_interrupt.discard(key)
+            return False
+        if not self.active_turn.get(key):
+            self.pending_interrupt.add(key)
+            return False
+        self._send_interrupt(key)
+        return True
 
     def compact(self, key: str) -> None:
         thread_id = self.threads.get(key)
@@ -279,7 +298,8 @@ class Bridge:
         self.models: dict[str, str] = {}
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
-        self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None]] = queue.Queue()
+        self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None, int]] = queue.Queue()
+        self.generations: dict[str, int] = {}
         self.seen_messages: deque[str] = deque(maxlen=1000)
         self.seen_message_set: set[str] = set()
         threading.Thread(target=self.worker, daemon=True).start()
@@ -350,7 +370,11 @@ class Bridge:
 
     def worker(self) -> None:
         while True:
-            key, chat_id, prompt, resource = self.jobs.get()
+            key, chat_id, prompt, resource, generation = self.jobs.get()
+            if generation != self.generations.get(key, 0):
+                self.feishu.text(chat_id, "任务已取消（仍在等待队列中）。")
+                self.jobs.task_done()
+                continue
             self.current_chat["active"] = chat_id
             try:
                 before = self.snapshot()
@@ -463,7 +487,8 @@ class Bridge:
             # starve the Feishu WebSocket heartbeat. Run them off the callback.
             threading.Thread(target=self.command, args=(user_id, message.chat_id, key, text), daemon=True).start()
         else:
-            self.jobs.put((key, message.chat_id, text, resource))
+            generation = self.generations.get(key, 0)
+            self.jobs.put((key, message.chat_id, text, resource, generation))
 
     def command(self, user_id: str, chat_id: str, key: str, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -498,8 +523,9 @@ class Bridge:
             self.feishu.text(chat_id, f"目录：{ROOT}\n会话：{thread_id or '尚未创建'}\n模型：{self.models.get(key, DEFAULT_MODEL) or '默认'}")
         elif command == "/stop":
             try:
-                self.server.interrupt(key)
-                self.feishu.text(chat_id, "已请求停止当前 Codex turn。")
+                self.generations[key] = self.generations.get(key, 0) + 1
+                interrupted = self.server.interrupt(key)
+                self.feishu.text(chat_id, "已请求停止当前 Codex turn。" if interrupted else "已取消排队任务，并登记停止正在启动的任务。")
             except Exception as exc:
                 self.feishu.text(chat_id, f"停止失败：{exc}")
         elif command == "/compact":
