@@ -627,6 +627,7 @@ class Bridge:
                 if deliveries:
                     self.feishu.card_or_text(chat_id, "交付物", "\n".join(deliveries))
             except Exception as exc:
+                print(f"event=worker_error key={key} type={type(exc).__name__} message={exc}", flush=True)
                 if self.server.process.poll() is not None:
                     try:
                         self.server.restart()

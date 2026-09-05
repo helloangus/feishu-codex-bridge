@@ -1,5 +1,6 @@
 """Termux service supervisor with flock ownership and rotating sanitized logs."""
 import fcntl
+import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -13,6 +14,8 @@ import time
 BASE = Path(__file__).resolve().parent
 STATE = BASE / '.runtime'
 LOCK = STATE / 'service.lock'
+APP_LOCK_DIR = Path(os.environ.get('CODEX_SERVICE_GLOBAL_STATE', str(Path.home() / '.feishu-codex-bridge')))
+APP_LOCK = APP_LOCK_DIR / (hashlib.sha256(os.environ.get('FEISHU_APP_ID', 'unknown').encode()).hexdigest()[:24] + '.lock')
 
 
 def redact(text):
@@ -51,6 +54,22 @@ def stop():
 
 
 def run(foreground=False):
+    APP_LOCK_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    app_stream = APP_LOCK.open('a+')
+    try:
+        fcntl.flock(app_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        app_stream.close()
+        print('同一个飞书机器人已有其他项目实例运行')
+        return
+    try:
+        return _run_local(foreground)
+    finally:
+        fcntl.flock(app_stream, fcntl.LOCK_UN)
+        app_stream.close()
+
+
+def _run_local(foreground=False):
     with LOCK.open('a+') as stream:
         try:
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -93,11 +112,11 @@ def run(foreground=False):
                     if foreground:
                         print(safe, flush=True)
                 code = child.wait()
-                logger.info('Bridge exited: %s; requested=%s', code, stopping)
+                logger.info('event=bridge_exit code=%s requested=%s', code, stopping)
                 child = None
                 if stopping or code == 0:
                     break
-                logger.info('Bridge crashed; restarting in %s seconds', restart_delay)
+                logger.info('event=bridge_crash restart_in=%s', restart_delay)
                 time.sleep(restart_delay)
                 restart_delay = min(restart_delay * 2, 30)
         finally:
