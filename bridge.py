@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +22,8 @@ APP_SECRET = os.environ["FEISHU_APP_SECRET"]
 ALLOWED = {x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",") if x.strip()}
 DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "")
 MAX_ATTACHMENT = int(os.environ.get("CODEX_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
+SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-codex-session")))
+APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
 
 
 class Feishu:
@@ -98,7 +101,9 @@ class CodexServer:
         self.rpc_id = 0
         self.threads: dict[str, str] = {}
         self.approvals: dict[int, str] = {}
+        self.approval_created: dict[int, float] = {}
         self.turn_text = ""
+        self.active_turn: dict[str, str] = {}
         self._initialize()
 
     def send(self, message: dict[str, Any]) -> None:
@@ -160,16 +165,38 @@ class CodexServer:
         }
         if model:
             params["model"] = model
-        self.request("turn/start", params)
+        result = self.request("turn/start", params)
+        turn = result.get("turn", result)
+        if turn.get("id"):
+            self.active_turn[key] = turn["id"]
         while True:
             message = self._read()
             self.handle_event(message)
             if message.get("method") == "turn/completed":
+                self.active_turn.pop(key, None)
                 return
 
     def resume(self, key: str, thread_id: str) -> None:
         self.request("thread/resume", {"threadId": thread_id, "cwd": str(ROOT)})
         self.threads[key] = thread_id
+
+    def interrupt(self, key: str) -> None:
+        thread_id = self.threads.get(key)
+        turn_id = self.active_turn.get(key)
+        if not thread_id or not turn_id:
+            raise RuntimeError("当前没有正在执行的 Codex turn")
+        # Do not synchronously read the RPC response here: the worker is already
+        # consuming the app-server stream for the active turn.
+        self.send({"jsonrpc": "2.0", "id": self.rpc_id + 1,
+                   "method": "turn/interrupt",
+                   "params": {"threadId": thread_id, "turnId": turn_id}})
+        self.rpc_id += 1
+
+    def compact(self, key: str) -> None:
+        thread_id = self.threads.get(key)
+        if not thread_id:
+            raise RuntimeError("当前还没有 Codex 会话")
+        self.request("thread/compact/start", {"threadId": thread_id})
 
     def models(self) -> list[str]:
         result = self.request("model/list", {})
@@ -183,6 +210,7 @@ class CodexServer:
             "decision": "accept" if yes else "decline"
         }})
         del self.approvals[request_id]
+        self.approval_created.pop(request_id, None)
 
 
 class Bridge:
@@ -192,15 +220,64 @@ class Bridge:
         self.models: dict[str, str] = {}
         self.current_chat: dict[str, str] = {}
         self.jobs: queue.Queue[tuple[str, str, str]] = queue.Queue()
+        self.seen_messages: deque[str] = deque(maxlen=1000)
+        self.seen_message_set: set[str] = set()
         threading.Thread(target=self.worker, daemon=True).start()
+        threading.Thread(target=self.approval_reaper, daemon=True).start()
+
+    def session_key(self, user_id: str) -> str:
+        return f"{user_id}:{ROOT}"
+
+    def load_session(self) -> str:
+        try:
+            value = SESSION_FILE.read_text(encoding="utf-8").strip()
+            return value if value else ""
+        except FileNotFoundError:
+            return ""
+
+    def save_session(self, thread_id: str) -> None:
+        temporary = SESSION_FILE.with_name(SESSION_FILE.name + ".tmp")
+        temporary.write_text(thread_id + "\n", encoding="utf-8")
+        os.replace(temporary, SESSION_FILE)
+
+    def clear_session(self) -> None:
+        try:
+            SESSION_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+    def remember_message(self, message_id: str) -> bool:
+        if not message_id or message_id in self.seen_message_set:
+            return False
+        if len(self.seen_messages) == self.seen_messages.maxlen:
+            self.seen_message_set.discard(self.seen_messages[0])
+        self.seen_messages.append(message_id)
+        self.seen_message_set.add(message_id)
+        return True
 
     def codex_event(self, kind: str, value: Any) -> None:
         if kind == "approval":
             request_id = int(value["id"])
             self.server.approvals[request_id] = self.current_chat.get("active", "")
+            self.server.approval_created[request_id] = time.time()
             chat_id = self.server.approvals[request_id]
             if chat_id:
                 self.feishu.text(chat_id, f"Codex 请求审批（{request_id}）。回复 /approve {request_id} 或 /deny {request_id}")
+
+    def approval_reaper(self) -> None:
+        while True:
+            time.sleep(5)
+            now = time.time()
+            for request_id, created in list(self.server.approval_created.items()):
+                if now - created < APPROVAL_TIMEOUT:
+                    continue
+                chat_id = self.server.approvals.get(request_id, "")
+                try:
+                    self.server.approve(request_id, False)
+                    if chat_id:
+                        self.feishu.text(chat_id, f"审批 {request_id} 已超时，已自动拒绝。")
+                except Exception:
+                    self.server.approval_created.pop(request_id, None)
 
     def worker(self) -> None:
         while True:
@@ -209,7 +286,11 @@ class Bridge:
             try:
                 before = self.snapshot()
                 self.feishu.text(chat_id, "Codex 开始处理…")
+                stored = self.load_session()
+                if stored and key not in self.server.threads:
+                    self.server.resume(key, stored)
                 self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL))
+                self.save_session(self.server.threads[key])
                 self.feishu.text(chat_id, self.server.turn_text or "Codex 已完成，但没有返回文字。")
                 for path in self.changed_files(before):
                     self.feishu.upload_file(chat_id, path)
@@ -243,17 +324,21 @@ class Bridge:
 
     def receive(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         event = data.event
+        message = event.message
+        if not self.remember_message(getattr(message, "message_id", "")):
+            return
         sender = getattr(getattr(event, "sender", None), "sender_id", None)
         user_id = getattr(sender, "open_id", "")
         print(f"Received Feishu message: open_id={user_id or '<missing>'}", flush=True)
         if ALLOWED and user_id not in ALLOWED:
             print(f"Ignored unauthorized Feishu user: {user_id}", flush=True)
             return
-        message = event.message
         text = json.loads(message.content or "{}").get("text", "").strip()
-        key = f"{user_id}:{ROOT}"
+        key = self.session_key(user_id)
         if text.startswith("/"):
-            self.command(user_id, message.chat_id, key, text)
+            # Commands such as /resume or /models may take long enough to
+            # starve the Feishu WebSocket heartbeat. Run them off the callback.
+            threading.Thread(target=self.command, args=(user_id, message.chat_id, key, text), daemon=True).start()
         else:
             self.jobs.put((key, message.chat_id, text))
 
@@ -261,13 +346,18 @@ class Bridge:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
         if command == "/help":
-            self.feishu.text(chat_id, "/new  /resume <thread_id>  /model [model]  /models  /status  /approve <id>  /deny <id>")
+            self.feishu.text(chat_id, "/new  /resume [thread_id]  /model [model]  /models  /status  /stop  /compact  /approve <id>  /deny <id>")
         elif command == "/new":
             self.server.threads.pop(key, None)
+            self.clear_session()
             self.feishu.text(chat_id, "已切换到新会话，下次提问时创建。")
         elif command == "/resume" and argument:
             self.server.resume(key, argument)
+            self.save_session(argument)
             self.feishu.text(chat_id, f"已恢复会话：{argument}")
+        elif command == "/resume":
+            thread_id = self.load_session()
+            self.feishu.text(chat_id, f"当前会话：{thread_id or '尚未创建'}\n用法：/resume <thread_id>")
         elif command == "/model":
             if argument:
                 self.models[key] = argument
@@ -277,7 +367,20 @@ class Bridge:
         elif command == "/models":
             self.feishu.text(chat_id, "可用模型：\n" + "\n".join(self.server.models()))
         elif command == "/status":
-            self.feishu.text(chat_id, f"目录：{ROOT}\n会话：{self.server.threads.get(key, '尚未创建')}\n模型：{self.models.get(key, DEFAULT_MODEL) or '默认'}")
+            thread_id = self.server.threads.get(key) or self.load_session()
+            self.feishu.text(chat_id, f"目录：{ROOT}\n会话：{thread_id or '尚未创建'}\n模型：{self.models.get(key, DEFAULT_MODEL) or '默认'}")
+        elif command == "/stop":
+            try:
+                self.server.interrupt(key)
+                self.feishu.text(chat_id, "已请求停止当前 Codex turn。")
+            except Exception as exc:
+                self.feishu.text(chat_id, f"停止失败：{exc}")
+        elif command == "/compact":
+            try:
+                self.server.compact(key)
+                self.feishu.text(chat_id, "已请求压缩当前会话上下文。")
+            except Exception as exc:
+                self.feishu.text(chat_id, f"压缩失败：{exc}")
         elif command in ("/approve", "/deny") and argument.isdigit():
             try:
                 self.server.approve(int(argument), command == "/approve")

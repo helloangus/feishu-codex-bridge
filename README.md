@@ -19,9 +19,9 @@ set -a; . ./.env; set +a
 python /path/to/feishu-codex-bridge/bridge.py
 ```
 
-普通文本会进入当前目录的 Codex thread。支持 `/new`、`/resume <thread_id>`、`/model [model]`、`/models`、`/status`、`/approve <id>`、`/deny <id>`。
+普通文本会进入当前目录的 Codex thread。会话 ID 自动保存到 `.feishu-codex-session`，重启后第一次提问会自动恢复。支持 `/new`、`/resume [thread_id]`、`/model [model]`、`/models`、`/status`、`/stop`、`/compact`、`/approve <id>`、`/deny <id>`。
 
-每轮完成后会回传最终文字，并上传当前目录中本轮新增或修改的文件（最多 10 个，单文件大小由 `CODEX_MAX_ATTACHMENT_BYTES` 控制）。图片暂按文件附件发送。
+每轮完成后会回传最终文字，并上传当前目录中本轮新增或修改的文件（最多 10 个，单文件大小由 `CODEX_MAX_ATTACHMENT_BYTES` 控制）。图片暂按文件附件发送。审批请求超过 `CODEX_APPROVAL_TIMEOUT_SECONDS` 秒会自动拒绝。
 
 首次测试建议发送：
 
