@@ -24,6 +24,7 @@ DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "")
 MAX_ATTACHMENT = int(os.environ.get("CODEX_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
 SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-codex-session")))
 APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
+STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
 
 
 class Feishu:
@@ -198,6 +199,11 @@ class CodexServer:
             raise RuntimeError("当前还没有 Codex 会话")
         self.request("thread/compact/start", {"threadId": thread_id})
 
+    def list_threads(self) -> list[dict[str, Any]]:
+        result = self.request("thread/list", {"cwd": [str(ROOT)], "limit": 20,
+                                                "sortKey": "updated_at", "sortDirection": "desc"})
+        return result.get("data", [])
+
     def models(self) -> list[str]:
         result = self.request("model/list", {})
         values = result.get("data", result.get("models", []))
@@ -219,6 +225,7 @@ class Bridge:
         self.server = CodexServer(self.codex_event)
         self.models: dict[str, str] = {}
         self.current_chat: dict[str, str] = {}
+        self.stream_buffers: dict[str, str] = {}
         self.jobs: queue.Queue[tuple[str, str, str]] = queue.Queue()
         self.seen_messages: deque[str] = deque(maxlen=1000)
         self.seen_message_set: set[str] = set()
@@ -256,7 +263,16 @@ class Bridge:
         return True
 
     def codex_event(self, kind: str, value: Any) -> None:
-        if kind == "approval":
+        if kind == "delta":
+            chat_id = self.current_chat.get("active", "")
+            if not chat_id:
+                return
+            buffer = self.stream_buffers.get(chat_id, "") + str(value)
+            while len(buffer) >= STREAM_CHUNK:
+                self.feishu.text(chat_id, "[Codex 进度]\n" + buffer[:STREAM_CHUNK])
+                buffer = buffer[STREAM_CHUNK:]
+            self.stream_buffers[chat_id] = buffer
+        elif kind == "approval":
             request_id = int(value["id"])
             self.server.approvals[request_id] = self.current_chat.get("active", "")
             self.server.approval_created[request_id] = time.time()
@@ -291,6 +307,9 @@ class Bridge:
                     self.server.resume(key, stored)
                 self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL))
                 self.save_session(self.server.threads[key])
+                remainder = self.stream_buffers.pop(chat_id, "")
+                if remainder:
+                    self.feishu.text(chat_id, "[Codex 进度]\n" + remainder)
                 self.feishu.text(chat_id, self.server.turn_text or "Codex 已完成，但没有返回文字。")
                 for path in self.changed_files(before):
                     self.feishu.upload_file(chat_id, path)
@@ -356,8 +375,12 @@ class Bridge:
             self.save_session(argument)
             self.feishu.text(chat_id, f"已恢复会话：{argument}")
         elif command == "/resume":
-            thread_id = self.load_session()
-            self.feishu.text(chat_id, f"当前会话：{thread_id or '尚未创建'}\n用法：/resume <thread_id>")
+            try:
+                threads = self.server.list_threads()
+                lines = [f"{item.get('id')}  {item.get('title') or '未命名'}" for item in threads]
+                self.feishu.text(chat_id, "可恢复会话：\n" + ("\n".join(lines) or "没有找到会话"))
+            except Exception as exc:
+                self.feishu.text(chat_id, f"读取会话列表失败：{exc}")
         elif command == "/model":
             if argument:
                 self.models[key] = argument
