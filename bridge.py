@@ -675,12 +675,62 @@ def on_card_action(data: Any) -> Any:
     return P2CardActionTriggerResponse({})
 
 
+def patch_lark_card_callback(lark: Any) -> None:
+    """Work around lark-oapi 1.7.x dropping CARD frames in WebSocket mode."""
+    import inspect
+    from lark_oapi.core.json import JSON
+    from lark_oapi.ws.client import _get_by_key
+    from lark_oapi.ws.const import HEADER_BIZ_RT, HEADER_MESSAGE_ID, HEADER_SEQ, HEADER_SUM, HEADER_TRACE_ID, HEADER_TYPE
+    from lark_oapi.ws.enum import MessageType
+    from lark_oapi.ws.model import Response
+    import http
+    import time as _time
+
+    client_class = lark.ws.Client
+    source = inspect.getsource(client_class._handle_data_frame)
+    if "message_type == MessageType.CARD" not in source:
+        return
+
+    async def handle_data_frame(self: Any, frame: Any) -> None:
+        hs = frame.headers
+        msg_id = _get_by_key(hs, HEADER_MESSAGE_ID)
+        trace_id = _get_by_key(hs, HEADER_TRACE_ID)
+        sum_ = _get_by_key(hs, HEADER_SUM)
+        seq = _get_by_key(hs, HEADER_SEQ)
+        type_ = _get_by_key(hs, HEADER_TYPE)
+        payload = frame.payload
+        if int(sum_) > 1:
+            payload = self._combine(msg_id, int(sum_), int(seq), payload)
+            if payload is None:
+                return
+        message_type = MessageType(type_)
+        if message_type not in (MessageType.EVENT, MessageType.CARD):
+            return
+        response = Response(code=http.HTTPStatus.OK)
+        try:
+            started = int(round(_time.time() * 1000))
+            result = self._event_handler._do_without_validation(payload)
+            header = hs.add()
+            header.key = HEADER_BIZ_RT
+            header.value = str(int(round(_time.time() * 1000)) - started)
+            if result is not None:
+                response.data = base64.b64encode(JSON.marshal(result).encode("utf-8"))
+        except Exception:
+            response = Response(code=http.HTTPStatus.INTERNAL_SERVER_ERROR)
+        frame.payload = JSON.marshal(response).encode("utf-8")
+        await self._write_message(frame.SerializeToString())
+
+    import base64
+    client_class._handle_data_frame = handle_data_frame
+
+
 def main() -> None:
     global bridge
     print(f"Starting Feishu Codex Bridge; cwd={ROOT}", flush=True)
     bridge = Bridge()
     print(f"Feishu Codex Bridge ready; cwd={ROOT}", flush=True)
     import lark_oapi as lark
+    patch_lark_card_callback(lark)
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(on_message)
                .register_p2_card_action_trigger(on_card_action)

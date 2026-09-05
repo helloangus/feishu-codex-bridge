@@ -10,7 +10,7 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-在飞书企业自建应用中开启机器人，订阅 `im.message.receive_v1` 和 `card.action.trigger`，订阅方式选择“使用长连接接收事件”，并授予机器人读取/发送消息、发送/更新消息卡片及上传文件的权限。
+在飞书企业自建应用中开启机器人，在“事件与回调”中分别配置：事件订阅 `im.message.receive_v1`，以及“回调配置”中的卡片回传交互 `card.action.trigger`；两者都选择“使用长连接接收”。并授予机器人读取/发送消息、发送/更新消息卡片及上传文件的权限。
 
 确认本机已登录 Codex，且 `codex app-server` 可启动。然后在目标项目目录启动：
 
