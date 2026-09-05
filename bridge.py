@@ -445,23 +445,56 @@ class Bridge:
     def session_key(self, user_id: str) -> str:
         return f"{user_id}:{ROOT}"
 
-    def load_session(self) -> str:
+    def load_session(self, key: str = "") -> str:
         try:
-            value = SESSION_FILE.read_text(encoding="utf-8").strip()
-            return value if value else ""
+            raw = SESSION_FILE.read_text(encoding="utf-8").strip()
+            if not raw:
+                return ""
+            try:
+                sessions = json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
+            return str(sessions.get(key, "")) if isinstance(sessions, dict) else ""
         except FileNotFoundError:
             return ""
 
-    def save_session(self, thread_id: str) -> None:
+    def save_session(self, thread_id: str, key: str = "") -> None:
+        sessions: dict[str, str] = {}
+        if SESSION_FILE.exists():
+            try:
+                raw = SESSION_FILE.read_text(encoding="utf-8").strip()
+                parsed = json.loads(raw) if raw else {}
+                if isinstance(parsed, dict):
+                    sessions = {str(k): str(v) for k, v in parsed.items()}
+                elif raw and key:
+                    sessions[key] = raw
+            except (OSError, json.JSONDecodeError):
+                pass
+        sessions[key] = thread_id
         temporary = SESSION_FILE.with_name(SESSION_FILE.name + ".tmp")
-        temporary.write_text(thread_id + "\n", encoding="utf-8")
+        temporary.write_text(json.dumps(sessions, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
         os.replace(temporary, SESSION_FILE)
 
-    def clear_session(self) -> None:
+    def clear_session(self, key: str = "") -> None:
         try:
-            SESSION_FILE.unlink()
+            raw = SESSION_FILE.read_text(encoding="utf-8").strip()
+            parsed = json.loads(raw) if raw else {}
+            if not isinstance(parsed, dict) or not key:
+                SESSION_FILE.unlink()
+                return
+            parsed.pop(key, None)
+            if parsed:
+                temporary = SESSION_FILE.with_name(SESSION_FILE.name + ".tmp")
+                temporary.write_text(json.dumps(parsed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                temporary.chmod(0o600)
+                os.replace(temporary, SESSION_FILE)
+            else:
+                SESSION_FILE.unlink()
         except FileNotFoundError:
             pass
+        except json.JSONDecodeError:
+            SESSION_FILE.unlink(missing_ok=True)
 
     def remember_message(self, message_id: str) -> bool:
         if not message_id or message_id in self.seen_message_set:
@@ -596,11 +629,11 @@ class Bridge:
                         prompt += "\n\n用户附加了一张图片，请直接分析图片内容。"
                     else:
                         prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}。"
-                stored = self.load_session()
+                stored = self.load_session(key)
                 if stored and key not in self.server.threads:
                     self.server.resume(key, stored)
                 self.server.turn(key, prompt, self.models.get(key, DEFAULT_MODEL), extra_inputs)
-                self.save_session(self.server.threads[key])
+                self.save_session(self.server.threads[key], key)
                 with self.progress_lock:
                     self.progress = {}
                 self.stream_buffers.pop(chat_id, "")
@@ -783,12 +816,12 @@ class Bridge:
                     self.help_cards.pop(next(iter(self.help_cards)))
         elif command == "/new":
             self.server.threads.pop(key, None)
-            self.clear_session()
+            self.clear_session(key)
             self.feishu.card_or_text(chat_id, "新会话", "已切换到新会话，下次提问时自动创建。", "green")
         elif command == "/resume" and argument:
             try:
                 self.server.resume(key, argument)
-                self.save_session(argument)
+                self.save_session(argument, key)
                 self.feishu.card_or_text(chat_id, "会话已恢复", f"会话 ID：`{argument}`", "green")
             except Exception as exc:
                 self.feishu.card_or_text(chat_id, "恢复会话失败", str(exc), "red")
@@ -814,7 +847,7 @@ class Bridge:
         elif command == "/models":
             self.feishu.card_or_text(chat_id, "可用模型", "\n".join(f"- `{item}`" for item in self.server.models()) or "暂无模型")
         elif command == "/status":
-            thread_id = self.server.threads.get(key) or self.load_session()
+            thread_id = self.server.threads.get(key) or self.load_session(key)
             self.feishu.card_or_text(chat_id, "Codex 状态", f"**目录**\n`{ROOT}`\n\n**会话**\n`{thread_id or '尚未创建'}`\n\n**模型**\n`{self.models.get(key, DEFAULT_MODEL) or '默认'}`")
         elif command == "/stop":
             try:
