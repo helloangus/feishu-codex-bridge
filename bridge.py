@@ -872,6 +872,7 @@ class Bridge:
     def command(self, user_id: str, chat_id: str, key: str, text: str, source: str = "") -> None:
         parts = text.split(maxsplit=1)
         command, argument = parts[0].lower(), parts[1].strip() if len(parts) == 2 else ""
+        log_event("command_received", command=command, via="card" if source else "text")
         if self.current_chat.get("active") and (command in ("/new", "/compact") or (command == "/resume" and argument)):
             self.feishu.card_or_text(chat_id, "任务执行中", "请等待当前任务结束或先停止任务，再切换会话或压缩上下文。", "yellow")
             return
@@ -999,6 +1000,7 @@ def on_card_action(data: Any) -> Any:
         if bridge and chat_id and command.startswith("/"):
             if ALLOWED and user_id not in ALLOWED:
                 return P2CardActionTriggerResponse({})
+            log_event("card_action_received", command=command.split(maxsplit=1)[0])
             threading.Thread(
                 target=bridge.command,
                 args=(user_id, chat_id, bridge.session_key(user_id), command,
