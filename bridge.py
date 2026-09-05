@@ -88,6 +88,21 @@ class Feishu:
             "content": json.dumps({"file_key": file_key}),
         })
 
+    def download_resource(self, message_id: str, resource_key: str, resource_type: str,
+                          filename: str = "") -> Path:
+        response = self.http.get(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{resource_key}",
+            params={"type": resource_type},
+            headers={"Authorization": f"Bearer {self.token()}"},
+        )
+        response.raise_for_status()
+        inbox = ROOT / ".feishu-inbox"
+        inbox.mkdir(mode=0o700, exist_ok=True)
+        safe_name = Path(filename).name if filename else f"{resource_key}.{resource_type}"
+        destination = inbox / f"{message_id}-{safe_name}"
+        destination.write_bytes(response.content)
+        return destination
+
 
 class CodexServer:
     def __init__(self, event: Callable[[str, Any], None]) -> None:
@@ -226,7 +241,7 @@ class Bridge:
         self.models: dict[str, str] = {}
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
-        self.jobs: queue.Queue[tuple[str, str, str]] = queue.Queue()
+        self.jobs: queue.Queue[tuple[str, str, str, dict[str, str] | None]] = queue.Queue()
         self.seen_messages: deque[str] = deque(maxlen=1000)
         self.seen_message_set: set[str] = set()
         threading.Thread(target=self.worker, daemon=True).start()
@@ -297,11 +312,17 @@ class Bridge:
 
     def worker(self) -> None:
         while True:
-            key, chat_id, prompt = self.jobs.get()
+            key, chat_id, prompt, resource = self.jobs.get()
             self.current_chat["active"] = chat_id
             try:
                 before = self.snapshot()
                 self.feishu.text(chat_id, "Codex 开始处理…")
+                if resource:
+                    local_path = self.feishu.download_resource(
+                        resource["message_id"], resource["resource_key"],
+                        resource["resource_type"], resource.get("filename", ""),
+                    )
+                    prompt += f"\n\n用户附加了一个文件，请读取它：{local_path}"
                 stored = self.load_session()
                 if stored and key not in self.server.threads:
                     self.server.resume(key, stored)
@@ -322,7 +343,8 @@ class Bridge:
     def snapshot(self) -> dict[str, tuple[int, int]]:
         result: dict[str, tuple[int, int]] = {}
         for path in ROOT.rglob("*"):
-            if not path.is_file() or ".git" in path.parts or path.name.startswith(".feishu-codex"):
+            if (not path.is_file() or ".git" in path.parts or
+                    ".feishu-inbox" in path.parts or path.name.startswith(".feishu-codex")):
                 continue
             try:
                 stat = path.stat()
@@ -352,14 +374,27 @@ class Bridge:
         if ALLOWED and user_id not in ALLOWED:
             print(f"Ignored unauthorized Feishu user: {user_id}", flush=True)
             return
-        text = json.loads(message.content or "{}").get("text", "").strip()
+        content = json.loads(message.content or "{}")
+        message_type = getattr(message, "message_type", "text")
+        resource: dict[str, str] | None = None
+        if message_type in ("image", "file", "media", "audio", "video"):
+            resource_key = content.get("image_key") or content.get("file_key") or content.get("media_key")
+            if resource_key:
+                resource = {"message_id": message.message_id, "resource_key": resource_key,
+                            "resource_type": "image" if message_type == "image" else "file",
+                            "filename": content.get("file_name", "")}
+                text = f"用户发送了一个{message_type}，请查看附件内容。"
+            else:
+                text = "用户发送了一个无法读取的附件。"
+        else:
+            text = content.get("text", "").strip()
         key = self.session_key(user_id)
         if text.startswith("/"):
             # Commands such as /resume or /models may take long enough to
             # starve the Feishu WebSocket heartbeat. Run them off the callback.
             threading.Thread(target=self.command, args=(user_id, message.chat_id, key, text), daemon=True).start()
         else:
-            self.jobs.put((key, message.chat_id, text))
+            self.jobs.put((key, message.chat_id, text, resource))
 
     def command(self, user_id: str, chat_id: str, key: str, text: str) -> None:
         parts = text.split(maxsplit=1)
