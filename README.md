@@ -1,7 +1,7 @@
 # Feishu Codex Bridge
 
 后台管理：`./start.sh start`（默认）、`./start.sh stop`、`./start.sh restart`、
-`./start.sh status`、`./start.sh logs`。前台排查使用 `./start.sh foreground`。
+`./start.sh status`、`./start.sh logs`。`status` 会区分桥接启动中、已初始化、已连上飞书及自动重启中；前台排查使用 `./start.sh foreground`。
 请统一用此入口启动，进程锁防止同一项目重复启动。
 日志在 `.runtime/bridge.log`，每份 2 MiB，保留 3 份备份；认证参数自动过滤。
 运行目录不作为交付物上传。监督器会在桥接异常退出后自动退避重启；未配置设备开机自启。

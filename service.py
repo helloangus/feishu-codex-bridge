@@ -1,6 +1,7 @@
 """Termux service supervisor with flock ownership and rotating sanitized logs."""
 import fcntl
 import hashlib
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -14,6 +15,7 @@ import time
 BASE = Path(__file__).resolve().parent
 STATE = BASE / '.runtime'
 LOCK = STATE / 'service.lock'
+HEALTH = STATE / 'health.json'
 APP_LOCK_DIR = Path(os.environ.get('CODEX_SERVICE_GLOBAL_STATE', str(Path.home() / '.feishu-codex-bridge')))
 APP_LOCK = APP_LOCK_DIR / (hashlib.sha256(os.environ.get('FEISHU_APP_ID', 'unknown').encode()).hexdigest()[:24] + '.lock')
 
@@ -36,6 +38,30 @@ def running():
             return False
         except BlockingIOError:
             return True
+
+
+def write_health(phase, **fields):
+    """Persist a small, credential-free status record for `status`."""
+    payload = {'phase': phase, 'updated_at': time.time(), **fields}
+    temporary = HEALTH.with_suffix('.tmp')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+    os.replace(temporary, HEALTH)
+
+
+def read_health():
+    try:
+        return json.loads(HEALTH.read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def age_text(timestamp):
+    seconds = max(0, int(time.time() - float(timestamp)))
+    if seconds < 60:
+        return f'{seconds} 秒前'
+    if seconds < 3600:
+        return f'{seconds // 60} 分 {seconds % 60} 秒前'
+    return f'{seconds // 3600} 小时 {(seconds % 3600) // 60} 分前'
 
 
 def stop():
@@ -107,14 +133,20 @@ def _run_local(foreground=False):
                 child = subprocess.Popen([sys.executable, '-u', str(BASE / 'bridge.py')],
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True, start_new_session=True)
+                write_health('starting', pid=child.pid)
                 logger.info('event=bridge_started pid=%s', child.pid)
                 for line in child.stdout:
                     safe = redact(line.rstrip())
                     logger.info(safe)
+                    if '"event":"bridge_ready"' in line:
+                        write_health('ready', pid=child.pid)
+                    elif '[Lark]' in line and ' connected to ' in line:
+                        write_health('connected', pid=child.pid)
                     if foreground:
                         print(safe, flush=True)
                 code = child.wait()
                 logger.info('event=bridge_exit code=%s requested=%s', code, stopping)
+                write_health('stopped' if stopping or code == 0 else 'restarting', pid=child.pid, exit_code=code)
                 child = None
                 if stopping or code == 0:
                     break
@@ -133,7 +165,24 @@ def main():
     if action == 'run':
         run('--foreground' in sys.argv)
     elif action == 'status':
-        print('服务运行中' if running() else '服务未运行')
+        active = running()
+        print('服务运行中' if active else '服务未运行')
+        health = read_health()
+        if health:
+            labels = {
+                'starting': '桥接正在启动',
+                'ready': '桥接已初始化，等待飞书连接',
+                'connected': '桥接已连接飞书',
+                'restarting': '桥接异常退出，等待自动重启',
+                'stopped': '桥接已停止',
+            }
+            detail = labels.get(health.get('phase'), '桥接状态未知')
+            pid = health.get('pid')
+            updated_at = health.get('updated_at')
+            suffix = f'；PID {pid}' if pid else ''
+            if updated_at:
+                suffix += f'；更新于 {age_text(updated_at)}'
+            print(f'{detail}{suffix}')
         print(f'日志：{STATE / "bridge.log"}')
     elif action == 'logs':
         path = STATE / 'bridge.log'
