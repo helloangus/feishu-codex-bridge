@@ -698,18 +698,57 @@ class Bridge:
                 self.current_chat.pop("key", None)
                 self.jobs.task_done()
 
+    @staticmethod
+    def split_card_content(content: str, max_chars: int = 5600) -> list[str]:
+        """Split long Markdown without leaving a code fence open in a card."""
+        chunks: list[str] = []
+        current = ""
+        fence = ""
+
+        def update_fence(line: str) -> None:
+            nonlocal fence
+            marker = line.lstrip()
+            if marker.startswith("```"):
+                fence = "" if fence else marker[3:].strip()
+
+        def flush() -> None:
+            nonlocal current
+            if not current:
+                return
+            if fence:
+                current = current.rstrip() + "\n```\n"
+            chunks.append(current)
+            current = f"```{fence}\n" if fence else ""
+
+        for line in content.splitlines(keepends=True) or [content]:
+            remaining = line
+            while remaining:
+                capacity = max_chars - len(current)
+                if capacity <= 0:
+                    flush()
+                    continue
+                if len(remaining) <= capacity:
+                    current += remaining
+                    update_fence(remaining)
+                    break
+                if current:
+                    flush()
+                    continue
+                # A single unbroken line is longer than the card limit.
+                current = remaining[:capacity]
+                remaining = remaining[capacity:]
+                flush()
+        if current:
+            if fence:
+                current = current.rstrip() + "\n```\n"
+            chunks.append(current)
+        return chunks or ["（无内容）"]
+
     def finish_card(self, chat_id: str, title: str, content: str, color: str) -> None:
         with self.progress_lock:
             self.progress = {}
         card_id = self.active_cards.get(chat_id, "")
-        chunks = []
-        remaining = content
-        while len(remaining) > 6000:
-            boundary = remaining.rfind("\n\n", 3000, 6000)
-            cut = boundary + 2 if boundary >= 0 else 6000
-            chunks.append(remaining[:cut])
-            remaining = remaining[cut:]
-        chunks.append(remaining)
+        chunks = self.split_card_content(content)
         if card_id:
             try:
                 # Keep the primary card within Feishu's practical card size;
@@ -718,8 +757,8 @@ class Bridge:
                 chunks = chunks[1:]
             except Exception as exc:
                 log_event("card_update_failed", title=title, error_type=type(exc).__name__)
-        for chunk in chunks:
-            self.feishu.card_or_text(chat_id, title, chunk, color)
+        for index, chunk in enumerate(chunks, 2):
+            self.feishu.card_or_text(chat_id, f"{title}（续 {index}）", chunk, color)
 
     def snapshot(self) -> dict[str, tuple[int, int]]:
         result: dict[str, tuple[int, int]] = {}
