@@ -113,7 +113,8 @@ class Feishu:
                      buttons: list[dict[str, Any]] | None = None) -> str:
         try:
             return self.card(chat_id, title, content, color, buttons)
-        except Exception:
+        except Exception as exc:
+            print(f"Feishu card failed ({title}): {exc}", flush=True)
             self.text(chat_id, f"{title}\n{content}")
             return ""
 
@@ -493,10 +494,15 @@ class Bridge:
         card_id = self.active_cards.get(chat_id, "")
         if card_id:
             try:
-                self.feishu.update_card(card_id, title, content, color)
+                # Keep the primary card within Feishu's practical card size;
+                # continuation cards preserve the complete long response.
+                first, rest = content[:6000], content[6000:]
+                self.feishu.update_card(card_id, title, first, color)
+                for offset in range(0, len(rest), 6000):
+                    self.feishu.card_or_text(chat_id, f"{title}（续）", rest[offset:offset + 6000], color)
                 return
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"Feishu card update failed ({title}): {exc}", flush=True)
         self.feishu.card_or_text(chat_id, title, content, color)
 
     def snapshot(self) -> dict[str, tuple[int, int]]:
@@ -587,9 +593,12 @@ class Bridge:
             self.clear_session()
             self.feishu.card_or_text(chat_id, "新会话", "已切换到新会话，下次提问时自动创建。", "green")
         elif command == "/resume" and argument:
-            self.server.resume(key, argument)
-            self.save_session(argument)
-            self.feishu.card_or_text(chat_id, "会话已恢复", f"会话 ID：`{argument}`", "green")
+            try:
+                self.server.resume(key, argument)
+                self.save_session(argument)
+                self.feishu.card_or_text(chat_id, "会话已恢复", f"会话 ID：`{argument}`", "green")
+            except Exception as exc:
+                self.feishu.card_or_text(chat_id, "恢复会话失败", str(exc), "red")
         elif command == "/resume":
             try:
                 threads = self.server.list_threads()
