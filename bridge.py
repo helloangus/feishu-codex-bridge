@@ -39,6 +39,9 @@ QUESTION_TIMEOUT = int(os.environ.get("CODEX_QUESTION_TIMEOUT_SECONDS", "600"))
 PLAN_ACTION_TIMEOUT = int(os.environ.get("CODEX_PLAN_ACTION_TIMEOUT_SECONDS", "600"))
 STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
 GENERATED_IMAGES = Path(os.environ.get("CODEX_GENERATED_IMAGES", str(Path.home() / ".codex" / "generated_images")))
+SANDBOX_MODE = os.environ.get("CODEX_SANDBOX_MODE", "workspaceWrite")
+if SANDBOX_MODE not in {"workspaceWrite", "dangerFullAccess"}:
+    raise RuntimeError("CODEX_SANDBOX_MODE 必须是 workspaceWrite 或 dangerFullAccess")
 SNAPSHOT_MAX_FILES = int(os.environ.get("CODEX_SNAPSHOT_MAX_FILES", "200"))
 SNAPSHOT_MAX_TEXT_BYTES = int(os.environ.get("CODEX_SNAPSHOT_MAX_TEXT_BYTES", str(256 * 1024)))
 DIFF_MAX_CHARS = int(os.environ.get("CODEX_DIFF_MAX_CHARS", "20000"))
@@ -370,6 +373,9 @@ class CodexServer:
             thread = result.get("thread", result)
             thread_id = thread["id"]
             self.threads[key] = thread_id
+        sandbox_policy = {"type": "dangerFullAccess"} if SANDBOX_MODE == "dangerFullAccess" else {
+            "type": "workspaceWrite", "writableRoots": [str(directory)], "networkAccess": False,
+        }
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt}] + (extra_inputs or []),
@@ -377,11 +383,7 @@ class CodexServer:
             # request approval to leave this sandbox, which is rendered by
             # Bridge as the existing Feishu approval card.
             "approvalPolicy": "on-request",
-            "sandboxPolicy": {
-                "type": "workspaceWrite",
-                "writableRoots": [str(directory)],
-                "networkAccess": False,
-            },
+            "sandboxPolicy": sandbox_policy,
         }
         if model:
             params["model"] = model

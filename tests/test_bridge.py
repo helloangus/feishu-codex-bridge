@@ -167,6 +167,29 @@ class BridgeTests(unittest.TestCase):
             "type": "workspaceWrite", "writableRoots": ["/tmp"], "networkAccess": False,
         })
 
+    def test_danger_full_access_requires_explicit_sandbox_setting(self):
+        server = bridge.CodexServer.__new__(bridge.CodexServer)
+        server.turn_text = ""
+        server.last_turn_status = ""
+        server.last_plan_text = ""
+        server.last_turn_error = ""
+        server.threads = {"key": "thread-1"}
+        server.starting_turns = set()
+        server.pending_interrupt = set()
+        server.active_turn = {}
+        server.completions = queue.Queue()
+        server.completions.put({"params": {"threadId": "thread-1", "turn": {"id": "turn-1"}}})
+        requests = []
+        server.request = lambda method, params: requests.append((method, params)) or {"turn": {"id": "turn-1"}}
+        server._send_interrupt = lambda _key: None
+        original = bridge.SANDBOX_MODE
+        try:
+            bridge.SANDBOX_MODE = "dangerFullAccess"
+            server.turn("key", Path("/tmp"), "read this", "model")
+            self.assertEqual(requests[0][1]["sandboxPolicy"], {"type": "dangerFullAccess"})
+        finally:
+            bridge.SANDBOX_MODE = original
+
     def test_collaboration_mode_uses_app_server_default_model(self):
         server = bridge.CodexServer.__new__(bridge.CodexServer)
         server.turn_text = ""

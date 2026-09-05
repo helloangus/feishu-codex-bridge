@@ -119,7 +119,7 @@ codex --version
 | `CODEX_WORKSPACE_ROOT` | 是 | `/cd` 可访问的工作区根目录；目录及其符号链接解析后的目标都不得越出该范围。 |
 | `CODEX_MODEL` | 否 | 默认模型；也可以用 `/models` 按用户设置。 |
 | `CODEX_APP_SERVER` | 否 | app-server 启动命令，默认启用 `collaboration_modes` 实验特性。 |
-| （内置策略） | — | 每个 turn 使用 Codex `Ask for approval`（`on-request`）和仅限当前工作目录的 `workspaceWrite` sandbox；离开该范围或需要额外权限时会显示飞书审批卡。 |
+| `CODEX_SANDBOX_MODE` | 否 | 默认 `workspaceWrite`；Termux 无法运行 Linux sandbox 时，必须在 `.env` 中显式设置 `dangerFullAccess`，setup 首次配置会询问。每个 turn 仍使用 Codex `Ask for approval`（`on-request`）。 |
 | `CODEX_MAX_ATTACHMENT_BYTES` | 否 | 回传文件上限，默认 `20971520`。 |
 | `CODEX_APPROVAL_TIMEOUT_SECONDS` | 否 | 审批超时自动拒绝时间，默认 `600` 秒。 |
 | `CODEX_QUESTION_TIMEOUT_SECONDS` | 否 | Codex 选择题等待回答时间，默认 `600` 秒。 |

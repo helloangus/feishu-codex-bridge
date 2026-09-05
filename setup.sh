@@ -61,11 +61,12 @@ config_present() {
   # shellcheck disable=SC1090
   . "$ENV_FILE"
   set +a
-  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${CODEX_BRIDGE_CWD:-}" && -n "${CODEX_WORKSPACE_ROOT:-}" ]]
+  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${CODEX_BRIDGE_CWD:-}" && -n "${CODEX_WORKSPACE_ROOT:-}" ]] || return 1
+  [[ -z "${CODEX_SANDBOX_MODE:-}" || "${CODEX_SANDBOX_MODE}" == "workspaceWrite" || "${CODEX_SANDBOX_MODE}" == "dangerFullAccess" ]]
 }
 
 write_config() {
-  local app_id app_secret allowed cwd workspace_root
+  local app_id app_secret allowed cwd workspace_root sandbox_mode
   say "首次配置飞书机器人"
   printf '飞书 App ID（例如 cli_xxx）：'
   read -r app_id
@@ -87,6 +88,9 @@ write_config() {
   [[ -d "$workspace_root" ]] || fail "工作区根目录不存在：$workspace_root"
   workspace_root="$(CDPATH= cd -- "$workspace_root" && pwd -P)"
   [[ "$cwd" == "$workspace_root" || "$cwd" == "$workspace_root"/* ]] || fail "Codex 工作目录必须位于工作区根目录内"
+  printf 'Termux 是否使用 dangerFullAccess（关闭 Codex sandbox，目录权限由本机用户负责）？[y/N]：'
+  read -r sandbox_mode
+  if [[ "$sandbox_mode" =~ ^[Yy]$ ]]; then sandbox_mode="dangerFullAccess"; else sandbox_mode="workspaceWrite"; fi
 
   umask 077
   {
@@ -97,7 +101,8 @@ write_config() {
     printf 'CODEX_BRIDGE_CWD=%q\n' "$cwd"
     printf 'CODEX_WORKSPACE_ROOT=%q\n' "$workspace_root"
     printf 'CODEX_MODEL=\n'
-    printf 'CODEX_APP_SERVER=%q\n' 'codex app-server'
+    printf 'CODEX_APP_SERVER=%q\n' 'codex app-server --enable collaboration_modes'
+    printf 'CODEX_SANDBOX_MODE=%q\n' "$sandbox_mode"
     printf 'CODEX_MAX_ATTACHMENT_BYTES=20971520\n'
     printf 'CODEX_APPROVAL_TIMEOUT_SECONDS=600\n'
   } > "$ENV_FILE"

@@ -33,7 +33,7 @@
 
 ### `CodexServer`
 
-启动 `CODEX_APP_SERVER`（默认 `codex app-server --enable collaboration_modes`），通过 stdin/stdout 使用 JSON-RPC，维护 `key → thread_id`、活动 turn、审批请求和等待响应表。每个 turn 显式使用 Codex `on-request`（Ask for approval）审批策略与 `workspaceWrite` sandbox；可写根目录仅为该 turn 已固定的工作目录，网络默认关闭，越出 sandbox 的请求仍通过飞书审批卡处理。
+启动 `CODEX_APP_SERVER`（默认 `codex app-server --enable collaboration_modes`），通过 stdin/stdout 使用 JSON-RPC，维护 `key → thread_id`、活动 turn、审批请求和等待响应表。每个 turn 显式使用 Codex `on-request`（Ask for approval）审批策略。默认 sandbox 为 `workspaceWrite`，可写根目录仅为该 turn 已固定的工作目录且网络关闭；Termux 无法运行 Linux sandbox 时，用户必须在 `.env` 显式选择 `dangerFullAccess`，此时目录边界由本机用户权限负责。
 
 **一个 reader 原则**：stdout 只能由 `_receive_rpc` 读取。该线程将响应按 JSON-RPC `id` 分发给 `pending` 队列，将通知转交给 `notifications`；`_dispatch_events` 再处理通知，并把 `turn/completed` 放入 `completions`。新增 RPC 方法必须调用 `request()` 或 `send()`，绝不能直接读取 `process.stdout`。
 

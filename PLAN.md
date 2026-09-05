@@ -41,6 +41,7 @@
   已补离线回归；仍需真实飞书点击开关、查看 Markdown 计划详情及新增/修改/删除 diff 卡。
 - [x] Plan 操作置底：原进度卡只显示完成状态，计划详情发送完成后再发送带三项操作的“计划下一步”卡，避免用户回到上方点击。
 - [x] Turn sandbox 与审批：每轮固定为当前工作目录的 `workspaceWrite`，网络关闭，审批策略为 Codex Ask for approval（`on-request`）；常规目录内读取不再因桥接遗漏策略而落入本机默认规则。
+- [x] Termux sandbox 兼容：`CODEX_SANDBOX_MODE` 默认 `workspaceWrite`，setup 首次配置明确询问是否选择 `dangerFullAccess`；仅显式配置时关闭 sandbox。
 - [x] 交互时限提示：审批、Codex 选择题和 Plan 后续操作卡显示时限及超时后果；超时更新原卡为终态。
 
 - [x] 文档体系：重写面向 GitHub 访客的 README，并新增架构、设计、开发、部署和运行手册，记录实际边界、线程模型、协议、状态、运维和扩展约束。

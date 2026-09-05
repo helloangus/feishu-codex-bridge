@@ -22,6 +22,8 @@
 
 首次验收：运行 `./setup.sh --check` 和 `./start.sh status`，然后在飞书发送 `/status`、`/help`、`请只回复：连接测试成功`，并点击控制面板的状态和模型按钮。
 
+Termux 若出现 Codex sandbox 命令统一以退出码 182 失败，重新运行 setup 并在提示中选择 `dangerFullAccess`，或在 `.env` 中显式设置 `CODEX_SANDBOX_MODE=dangerFullAccess` 后重启服务。该模式关闭 Codex sandbox，保留 Ask for approval，但不提供工作目录边界隔离。
+
 ## 迁移到新设备
 
 新设备需重新安装/登录 Codex CLI、克隆 bridge、运行 `setup.sh`。确保旧设备先执行 `./start.sh stop`；本机全局锁不能跨设备阻止同一 App ID 的重复连接。
