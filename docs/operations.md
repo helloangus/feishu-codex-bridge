@@ -16,7 +16,7 @@ tail -f .runtime/bridge.log
 | 已连接飞书 | 可发送 `/status` 验证业务侧。 |
 | 异常退出，等待自动重启 | 查看日志；不要反复手工启动。 |
 
-常见日志：`message_received` 表示新消息，`message_ignored` 多为 `duplicate`/`unauthorized`，`command_received` 与 `card_action_received` 表示命令/按钮已进入处理器，`worker_error` 表示任务失败，`bridge_crash restart_in=N` 表示退避重启。日志不记录正文，但可能含路径和异常类型；对外求助时仅分享必要片段。
+常见日志：`message_received` 表示新消息，`message_ignored` 多为 `duplicate`/`unauthorized`，`user_paired` 表示用户已通过配对码加入本机白名单，`command_received` 与 `card_action_received` 表示命令/按钮已进入处理器，`worker_error` 表示任务失败，`bridge_crash restart_in=N` 表示退避重启。日志不记录正文，但可能含路径和异常类型；对外求助时仅分享必要片段。
 
 ## 停止与重启
 

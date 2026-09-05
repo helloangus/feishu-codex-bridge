@@ -79,6 +79,7 @@ codex --version
 | `/compact` | 请求 Codex 压缩当前 thread 上下文。 |
 | `/stop` | 中断当前任务，或取消等待队列中的任务。 |
 | `/approve <id>` / `/deny <id>` | 用文本处理审批；通常直接点审批卡片即可。 |
+| `/pair <配对码>` | 将发送者加入本机白名单；仅在配置配对码时可由未授权用户使用。 |
 
 ### 附件与交付物
 
@@ -109,17 +110,19 @@ codex --version
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 是 | 飞书企业自建应用凭据。 |
-| `FEISHU_ALLOWED_OPEN_IDS` | 建议 | 逗号分隔的允许用户 `open_id`；留空表示不做白名单限制。 |
+| `FEISHU_ALLOWED_OPEN_IDS` | 建议 | 逗号分隔的允许用户 `open_id`；未设置配对码时留空表示不做白名单限制。 |
+| `FEISHU_PAIRING_CODE` | 否 | 设置后可用 `/pair <配对码>` 安全地自助加入白名单；配对完成后删除该项并重启。 |
 | `CODEX_BRIDGE_CWD` | 是 | Codex 工作目录；会话、模型和收件目录默认在此目录。 |
 | `CODEX_MODEL` | 否 | 默认模型；也可以用 `/models` 按用户设置。 |
 | `CODEX_APP_SERVER` | 否 | app-server 启动命令，默认 `codex app-server`。 |
 | `CODEX_MAX_ATTACHMENT_BYTES` | 否 | 回传文件上限，默认 `20971520`。 |
 | `CODEX_APPROVAL_TIMEOUT_SECONDS` | 否 | 审批超时自动拒绝时间，默认 `600` 秒。 |
-| `CODEX_SESSION_FILE` / `CODEX_SETTINGS_FILE` / `CODEX_SEEN_MESSAGES_FILE` | 否 | 覆盖状态文件默认位置。 |
+| `CODEX_SESSION_FILE` / `CODEX_SETTINGS_FILE` / `CODEX_SEEN_MESSAGES_FILE` / `CODEX_ALLOWED_OPEN_IDS_FILE` | 否 | 覆盖状态文件默认位置。 |
 
 ## 安全边界
 
 - **务必设置 `FEISHU_ALLOWED_OPEN_IDS`。** 留空时，任何能私聊机器人的用户都可向本机 Codex 发起任务。
+- 不便取得 `open_id` 时，可暂时设置一个长随机 `FEISHU_PAIRING_CODE`，然后让本人发送 `/pair <配对码>`。每位成功配对的用户都会保存到权限为 `600` 的 `.feishu-codex-allowed-open-ids`；完成后删除配对码并重启，避免继续发放访问权限。
 - `.env` 和状态文件以 `600` 权限写入；不要将它们提交、截图或发到聊天中。
 - 日志不记录聊天全文、审批命令内容、文件内容、token、WebSocket 认证参数或明文用户 ID；事件以短哈希关联。
 - bridge 会在你设置的工作目录下载附件、运行 Codex 并扫描交付物；请使用明确且受信任的项目目录。

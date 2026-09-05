@@ -84,6 +84,25 @@ class BridgeTests(unittest.TestCase):
             finally:
                 bridge.SEEN_MESSAGES_FILE = original
 
+    def test_pairing_persists_multiple_users_without_storing_bad_attempts(self):
+        item = bridge.Bridge.__new__(bridge.Bridge)
+        with tempfile.TemporaryDirectory() as directory:
+            original_file, original_code = bridge.ALLOWED_OPEN_IDS_FILE, bridge.PAIRING_CODE
+            try:
+                bridge.ALLOWED_OPEN_IDS_FILE = Path(directory) / "allowed.json"
+                bridge.PAIRING_CODE = "correct-secret"
+                item.allowed_lock = threading.Lock()
+                item.allowed_open_ids = set()
+                self.assertFalse(item.pair_user("ou-bad", "wrong-secret"))
+                self.assertFalse(bridge.ALLOWED_OPEN_IDS_FILE.exists())
+                self.assertTrue(item.pair_user("ou-first", "correct-secret"))
+                self.assertTrue(item.pair_user("ou-second", "correct-secret"))
+                self.assertTrue(item.pair_user("ou-first", "correct-secret"))
+                self.assertEqual(item.load_allowed_open_ids(), {"ou-first", "ou-second"})
+                self.assertEqual(bridge.ALLOWED_OPEN_IDS_FILE.stat().st_mode & 0o777, 0o600)
+            finally:
+                bridge.ALLOWED_OPEN_IDS_FILE, bridge.PAIRING_CODE = original_file, original_code
+
     def test_status_reports_idle_and_active_task(self):
         item = bridge.Bridge.__new__(bridge.Bridge)
         item.server = SimpleNamespace(threads={})

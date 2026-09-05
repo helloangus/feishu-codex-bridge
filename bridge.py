@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import mimetypes
 import os
 import queue
@@ -22,12 +23,14 @@ import httpx
 ROOT = Path(os.environ.get("CODEX_BRIDGE_CWD", os.getcwd())).resolve()
 APP_ID = os.environ["FEISHU_APP_ID"]
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
-ALLOWED = {x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",") if x.strip()}
+CONFIGURED_ALLOWED = {x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",") if x.strip()}
+PAIRING_CODE = os.environ.get("FEISHU_PAIRING_CODE", "")
 DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "")
 MAX_ATTACHMENT = int(os.environ.get("CODEX_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
 SESSION_FILE = Path(os.environ.get("CODEX_SESSION_FILE", str(ROOT / ".feishu-codex-session")))
 SETTINGS_FILE = Path(os.environ.get("CODEX_SETTINGS_FILE", str(ROOT / ".feishu-codex-settings")))
 SEEN_MESSAGES_FILE = Path(os.environ.get("CODEX_SEEN_MESSAGES_FILE", str(ROOT / ".feishu-codex-seen-messages")))
+ALLOWED_OPEN_IDS_FILE = Path(os.environ.get("CODEX_ALLOWED_OPEN_IDS_FILE", str(ROOT / ".feishu-codex-allowed-open-ids")))
 APPROVAL_TIMEOUT = int(os.environ.get("CODEX_APPROVAL_TIMEOUT_SECONDS", "600"))
 STREAM_CHUNK = int(os.environ.get("CODEX_STREAM_CHUNK_CHARS", "1200"))
 GENERATED_IMAGES = Path(os.environ.get("CODEX_GENERATED_IMAGES", str(Path.home() / ".codex" / "generated_images")))
@@ -417,6 +420,8 @@ class Bridge:
         self.feishu = Feishu()
         self.server = CodexServer(self.codex_event)
         self.models = self.load_model_settings()
+        self.allowed_lock = threading.Lock()
+        self.allowed_open_ids = CONFIGURED_ALLOWED | self.load_allowed_open_ids()
         self.current_chat: dict[str, str] = {}
         self.stream_buffers: dict[str, str] = {}
         self.active_cards: dict[str, str] = {}
@@ -460,6 +465,39 @@ class Bridge:
 
     def session_key(self, user_id: str) -> str:
         return f"{user_id}:{ROOT}"
+
+    def load_allowed_open_ids(self) -> set[str]:
+        """Load self-paired users without ever logging their identifiers."""
+        try:
+            parsed = json.loads(ALLOWED_OPEN_IDS_FILE.read_text(encoding="utf-8"))
+            if isinstance(parsed, list):
+                return {str(value) for value in parsed if str(value)}
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            pass
+        return set()
+
+    def is_allowed(self, user_id: str) -> bool:
+        # Preserve the previous open-by-default behavior only when neither
+        # static IDs nor the opt-in pairing mechanism has been configured.
+        if not CONFIGURED_ALLOWED and not PAIRING_CODE:
+            return True
+        with self.allowed_lock:
+            return user_id in self.allowed_open_ids
+
+    def pair_user(self, user_id: str, code: str) -> bool:
+        """Persist a user admitted with the administrator's pairing secret."""
+        if not PAIRING_CODE or not hmac.compare_digest(code, PAIRING_CODE):
+            return False
+        with self.allowed_lock:
+            if user_id in self.allowed_open_ids:
+                return True
+            updated = sorted(self.allowed_open_ids | {user_id})
+            temporary = ALLOWED_OPEN_IDS_FILE.with_name(ALLOWED_OPEN_IDS_FILE.name + ".tmp")
+            temporary.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, ALLOWED_OPEN_IDS_FILE)
+            self.allowed_open_ids = set(updated)
+        return True
 
     def load_model_settings(self) -> dict[str, str]:
         try:
@@ -856,10 +894,16 @@ class Bridge:
         user_id = getattr(sender, "open_id", "")
         user_tag = hashlib.sha256(user_id.encode()).hexdigest()[:12] if user_id else "missing"
         log_event("message_received", user=user_tag, message=message_tag)
-        if ALLOWED and user_id not in ALLOWED:
+        content = json.loads(message.content or "{}")
+        text = content.get("text", "").strip()
+        if not self.is_allowed(user_id):
+            parts = text.split(maxsplit=1)
+            if parts and parts[0].lower() == "/pair" and self.pair_user(user_id, parts[1].strip() if len(parts) == 2 else ""):
+                log_event("user_paired", user=user_tag)
+                self.feishu.card_or_text(message.chat_id, "配对成功", "此账号已加入本机白名单。现在可以发送 `/help`。", "green")
+                return
             log_event("message_ignored", reason="unauthorized", user=user_tag)
             return
-        content = json.loads(message.content or "{}")
         message_type = getattr(message, "message_type", "text")
         resource: dict[str, str] | None = None
         if message_type in ("image", "file", "media", "audio", "video"):
@@ -923,6 +967,8 @@ class Bridge:
                 self.help_cards[card_id] = (chat_id, key)
                 if len(self.help_cards) > 100:
                     self.help_cards.pop(next(iter(self.help_cards)))
+        elif command == "/pair":
+            self.feishu.card_or_text(chat_id, "无需配对", "此账号已在白名单中。", "green")
         elif command == "/new":
             self.server.threads.pop(key, None)
             self.clear_session(key)
@@ -1046,7 +1092,7 @@ def on_card_action(data: Any) -> Any:
             command += f" {value['model']}"
         chat_id = getattr(context, "open_chat_id", "")
         if bridge and chat_id and command.startswith("/"):
-            if ALLOWED and user_id not in ALLOWED:
+            if not bridge.is_allowed(user_id):
                 return P2CardActionTriggerResponse({})
             log_event("card_action_received", command=command.split(maxsplit=1)[0])
             threading.Thread(
