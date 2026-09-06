@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,49 @@ class InputServer:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_feishu_http_defaults_to_environment_with_optional_override(self):
+        for proxy in ("", "http://127.0.0.1:7890"):
+            with patch.object(bridge, "FEISHU_PROXY_URL", proxy), patch.object(bridge.httpx, "Client") as client:
+                bridge.Feishu()
+                client.assert_called_once_with(timeout=30, trust_env=not bool(proxy), proxy=proxy or None)
+
+    def test_lark_proxy_routes_endpoint_and_websocket(self):
+        def connect(uri, *, proxy=None):
+            pass
+        post = Mock(return_value="response")
+        requests = SimpleNamespace(post=post)
+        module = SimpleNamespace(requests=requests, websockets=SimpleNamespace(connect=connect),
+                                 _ws_connect_kwargs=lambda: {"proxy": None})
+        bridge.configure_lark_proxy(module, "http://localhost:7890")
+        self.assertEqual(module._ws_connect_kwargs(), {"proxy": "http://localhost:7890"})
+        self.assertEqual(module.requests.post("https://example.test", json={"test": 1}), "response")
+        post.assert_called_once_with("https://example.test", json={"test": 1},
+                                     proxies={"http": "http://localhost:7890", "https": "http://localhost:7890"})
+        self.assertIs(requests.post, post)
+
+    def test_lark_proxy_uses_environment_by_default(self):
+        from websockets.uri import get_proxy, parse_uri
+
+        def connect(uri, *, proxy=None):
+            pass
+        requests = SimpleNamespace(post=Mock())
+        module = SimpleNamespace(requests=requests, websockets=SimpleNamespace(connect=connect),
+                                 _ws_connect_kwargs=lambda: {"proxy": None})
+        bridge.configure_lark_proxy(module, "")
+        self.assertEqual(module._ws_connect_kwargs(), {"proxy": True})
+        self.assertIs(module.requests, requests)
+        uri = parse_uri("wss://msg-frontier.feishu.cn/ws")
+        for env, expected in (({}, None),
+                              ({"https_proxy": "http://localhost:7890"}, "http://localhost:7890"),
+                              ({"HTTPS_PROXY": "http://localhost:7891"}, "http://localhost:7891"),
+                              ({"https_proxy": "http://localhost:7890", "no_proxy": ".feishu.cn"}, None)):
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(get_proxy(uri), expected)
+
+    def test_lark_proxy_rejects_unsupported_sdk(self):
+        with self.assertRaises(RuntimeError):
+            bridge.configure_lark_proxy(SimpleNamespace(), "")
+
     def test_card_uses_mobile_safe_button_layouts(self):
         card = bridge.Feishu.make_card("标题", "内容", buttons=[
             {"text": "状态 /status", "group": "任务", "value": {"command": "/status"}},
@@ -159,13 +203,18 @@ class BridgeTests(unittest.TestCase):
         requests = []
         server.request = lambda method, params: requests.append((method, params)) or {"turn": {"id": "turn-1"}}
         server._send_interrupt = lambda _key: None
-        server.turn("key", Path("/tmp"), "plan this", "model", plan_mode=True)
-        self.assertEqual(requests[0][0], "turn/start")
-        self.assertEqual(requests[0][1]["collaborationMode"]["mode"], "plan")
-        self.assertEqual(requests[0][1]["approvalPolicy"], "on-request")
-        self.assertEqual(requests[0][1]["sandboxPolicy"], {
-            "type": "workspaceWrite", "writableRoots": ["/tmp"], "networkAccess": False,
-        })
+        original = bridge.SANDBOX_MODE
+        try:
+            bridge.SANDBOX_MODE = "workspaceWrite"
+            server.turn("key", Path("/tmp"), "plan this", "model", plan_mode=True)
+            self.assertEqual(requests[0][0], "turn/start")
+            self.assertEqual(requests[0][1]["collaborationMode"]["mode"], "plan")
+            self.assertEqual(requests[0][1]["approvalPolicy"], "on-request")
+            self.assertEqual(requests[0][1]["sandboxPolicy"], {
+                "type": "workspaceWrite", "writableRoots": ["/tmp"], "networkAccess": False,
+            })
+        finally:
+            bridge.SANDBOX_MODE = original
 
     def test_danger_full_access_requires_explicit_sandbox_setting(self):
         server = bridge.CodexServer.__new__(bridge.CodexServer)

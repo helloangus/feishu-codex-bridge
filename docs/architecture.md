@@ -29,7 +29,7 @@
 
 ### `Feishu`
 
-负责 tenant access token 缓存、文本/卡片发送、卡片更新、图片或文件上传及附件下载。HTTP 客户端使用 `trust_env=False`，避免 Termux 中错误的代理变量影响 REST 调用。
+负责 tenant access token 缓存、文本/卡片发送、卡片更新、图片或文件上传及附件下载。HTTP 客户端默认使用 `trust_env=True`，SDK WebSocket 恢复环境代理发现，地址获取保留 requests 原生环境代理行为。`FEISHU_PROXY_URL` 可显式覆盖三条连接路径。SDK 适配仅修改飞书模块引用，不修改共享 requests 模块。
 
 ### `CodexServer`
 

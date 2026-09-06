@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import inspect
 import difflib
 import mimetypes
 import os
@@ -16,6 +17,7 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import httpx
@@ -26,6 +28,7 @@ WORKSPACE_ROOT_RAW = os.environ.get("CODEX_WORKSPACE_ROOT", "")
 WORKSPACE_ROOT = Path(WORKSPACE_ROOT_RAW).expanduser().resolve() if WORKSPACE_ROOT_RAW else None
 APP_ID = os.environ["FEISHU_APP_ID"]
 APP_SECRET = os.environ["FEISHU_APP_SECRET"]
+FEISHU_PROXY_URL = os.environ.get("FEISHU_PROXY_URL", "").strip()
 CONFIGURED_ALLOWED = {x.strip() for x in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",") if x.strip()}
 PAIRING_CODE = os.environ.get("FEISHU_PAIRING_CODE", "")
 DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "")
@@ -54,9 +57,9 @@ def log_event(event: str, **fields: Any) -> None:
 
 class Feishu:
     def __init__(self) -> None:
-        # Termux may export a SOCKS proxy without socksio installed. The Feishu
-        # client should use the normal network path unless explicitly extended.
-        self.http = httpx.Client(timeout=30, trust_env=False)
+        # Follow the launching environment unless a Feishu override is supplied.
+        self.http = httpx.Client(timeout=30, trust_env=not bool(FEISHU_PROXY_URL),
+                                 proxy=FEISHU_PROXY_URL or None)
         self._token = ""
         self._token_expiry = 0.0
 
@@ -1681,6 +1684,23 @@ def patch_lark_card_callback(lark: Any) -> None:
     client_class._handle_data_frame = handle_data_frame
 
 
+def configure_lark_proxy(client_module, proxy_url: str) -> None:
+    """Restore SDK WebSocket environment discovery, with an optional override."""
+    if (not hasattr(client_module, "_ws_connect_kwargs") or
+            "proxy" not in inspect.signature(client_module.websockets.connect).parameters):
+        raise RuntimeError("飞书代理需要支持 _ws_connect_kwargs 的 lark-oapi 和 websockets>=15")
+    client_module._ws_connect_kwargs = lambda: {"proxy": proxy_url or True}
+    if not proxy_url:
+        return
+    post = client_module.requests.post
+
+    def proxy_post(*args, **kwargs):
+        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        return post(*args, **kwargs)
+
+    client_module.requests = SimpleNamespace(post=proxy_post)
+
+
 def main() -> None:
     global bridge
     if WORKSPACE_ROOT is None:
@@ -1693,6 +1713,8 @@ def main() -> None:
     bridge = Bridge()
     log_event("bridge_ready", cwd=str(ROOT))
     import lark_oapi as lark
+    import lark_oapi.ws.client as lark_client
+    configure_lark_proxy(lark_client, FEISHU_PROXY_URL)
     patch_lark_card_callback(lark)
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(on_message)
