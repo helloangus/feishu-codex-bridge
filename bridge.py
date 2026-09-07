@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import html
 import hashlib
 import hmac
 import inspect
@@ -11,6 +12,7 @@ import mimetypes
 import os
 import queue
 import shlex
+import stat
 import subprocess
 import threading
 import time
@@ -47,6 +49,18 @@ if SANDBOX_MODE not in {"workspaceWrite", "dangerFullAccess"}:
     raise RuntimeError("CODEX_SANDBOX_MODE 必须是 workspaceWrite 或 dangerFullAccess")
 SNAPSHOT_MAX_FILES = int(os.environ.get("CODEX_SNAPSHOT_MAX_FILES", "200"))
 SNAPSHOT_MAX_TEXT_BYTES = int(os.environ.get("CODEX_SNAPSHOT_MAX_TEXT_BYTES", str(256 * 1024)))
+IGNORED_DIRECTORIES = {".git", ".runtime", "feishu-inbox", "__pycache__", ".venv", "venv",
+                       "node_modules", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache",
+                       "target", "build", "dist"}
+IGNORED_SUFFIXES = {".pyc", ".pyo", ".o", ".obj", ".class", ".so", ".dll", ".a", ".lib"}
+ARTIFACT_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico",
+                     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
+                     ".mp3", ".wav", ".ogg", ".m4a", ".mp4", ".mov", ".webm",
+                     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z"}
+TEXT_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".c", ".h", ".cpp", ".hpp",
+                 ".rs", ".go", ".java", ".kt", ".swift", ".sh", ".bash", ".css", ".html",
+                 ".vue", ".svelte", ".sql", ".rb", ".php", ".cs", ".md", ".txt", ".json",
+                 ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml", ".lock"}
 DIFF_MAX_CHARS = int(os.environ.get("CODEX_DIFF_MAX_CHARS", "20000"))
 
 
@@ -112,11 +126,16 @@ class Feishu:
                 "type": item.get("type", "default"),
                 "behaviors": [{"type": "callback", "value": item["value"]}],
                 }
+                new_group = item.get("group") and elements[-1].get("_group") != item["group"]
+                # Keep navigation, independent choices, and control groups visibly
+                # separate; adjacent actions for the same entry stay together.
+                if (item.get("section") or item.get("separate") or item.get("description")
+                        or new_group or len(elements) == 1):
+                    elements.append({"tag": "hr"})
+                if item.get("section"):
+                    elements.append({"tag": "markdown", "content": f"**{item['section']}**"})
                 if item.get("description"):
-                    # Vertical layout is deliberately used for mobile: a narrow
-                    # side button truncates labels such as a model identifier.
-                    if len(elements) > 1:
-                        elements.append({"tag": "hr"})
+                    # Vertical layout preserves long labels on mobile.
                     elements.append({"tag": "markdown", "content": item["description"]})
                     elements.append(button)
                 elif item.get("group"):
@@ -343,6 +362,8 @@ class CodexServer:
             self.event("user_input", message)
         elif message.get("id") is not None and method.endswith("requestApproval"):
             self.event("approval", message)
+        elif method == "thread/archived":
+            self.event("archived", params)
         elif method.endswith("agentMessage/delta"):
             delta = params.get("delta", params.get("text", ""))
             self.turn_text += delta
@@ -451,10 +472,16 @@ class CodexServer:
             raise RuntimeError("当前还没有 Codex 会话")
         self.request("thread/compact/start", {"threadId": thread_id})
 
-    def list_threads(self, directory: Path) -> list[dict[str, Any]]:
+    def list_threads(self, directory: Path, archived: bool = False) -> list[dict[str, Any]]:
         result = self.request("thread/list", {"cwd": [str(directory)], "limit": 20,
-                                                "sortKey": "updated_at", "sortDirection": "desc"})
+                                                "sortKey": "updated_at", "sortDirection": "desc", "archived": archived})
         return result.get("data", [])
+
+    def archive_thread(self, thread_id: str, archived: bool = True) -> None:
+        self.request("thread/archive" if archived else "thread/unarchive", {"threadId": thread_id})
+
+    def read_thread(self, thread_id: str) -> dict[str, Any]:
+        return self.request("thread/read", {"threadId": thread_id, "includeTurns": False})["thread"]
 
     def refresh_models(self) -> list[str]:
         result = self.request("model/list", {})
@@ -497,6 +524,9 @@ class Bridge:
         self.active_task_tokens: dict[str, str] = {}
         self.stopping_tasks: set[str] = set()
         self.task_lock = threading.Lock()
+        self.thread_cards: dict[str, dict[str, Any]] = {}
+        self.thread_lock = threading.RLock()
+        self.thread_mutation = False
         self.help_cards: dict[str, tuple[str, str]] = {}
         self.approval_cards: dict[int, str] = {}
         self.approval_summaries: dict[int, str] = {}
@@ -783,7 +813,10 @@ class Bridge:
         return "\n\n".join(parts)
 
     def codex_event(self, kind: str, value: Any) -> None:
-        if kind == "item":
+        if kind == "archived":
+            with self.thread_lock, self.task_lock:
+                self.clear_thread_bindings(str(value.get("threadId", "")))
+        elif kind == "item":
             item = value.get("item", {})
             if item.get("id"):
                 self.approval_items[item["id"]] = item
@@ -878,12 +911,14 @@ class Bridge:
             buttons = [{
                 "text": str(option.get("label", "选择")),
                 "description": str(option.get("description", "")),
+                "separate": True,
                 "type": "primary" if position == 0 else "default",
                 "value": {"command": "/question-answer", "request_id": request_id,
                           "question_id": question["id"], "answer": str(option.get("label", ""))},
             } for position, option in enumerate(options)]
             if question.get("isOther"):
-                buttons.append({"text": "其他（文字输入）", "value": {
+                buttons.append({"text": "其他（文字输入）", "section": "自行回答",
+                                "description": "以上选项都不合适时，点击后发送你的回答。", "value": {
                     "command": "/question-other", "request_id": request_id,
                     "question_id": question["id"]}})
             content = (f"**{question.get('header', '需要你的选择')}**\n\n{question.get('question', '')}\n\n"
@@ -994,6 +1029,7 @@ class Bridge:
                                       ("模型", "当前", "/model"), ("模型", "列表", "/models")]
         ] + [plan_button] + [
             {"text": f"{label} {cmd}", "group": group,
+             "section": "停止任务" if cmd == "/stop" else "",
              "type": "danger" if cmd == "/stop" else "default", "value": {"command": cmd}}
             for group, label, cmd in [("目录", "切换", "/cd"),
                                       ("任务", "状态", "/status"), ("任务", "压缩", "/compact"),
@@ -1096,8 +1132,10 @@ class Bridge:
                     else:
                         content = f"耗时 {elapsed} 秒\n\n" + (result_text or "没有返回文字。")
                         self.finish_card(chat_id, title, content, "red" if status == "failed" else "green")
-                self.send_file_diffs(chat_id, directory, before)
-                paths = list(dict.fromkeys(self.changed_files(directory, before) + self.generated_files(key, started_at)))
+                after = self.snapshot(directory)
+                self.send_file_diffs(chat_id, directory, before, after)
+                paths = list(dict.fromkeys(self.changed_files(directory, before, after)
+                                           + self.generated_files(key, started_at)))[:10]
                 deliveries = []
                 for path in paths:
                     try:
@@ -1167,11 +1205,11 @@ class Bridge:
                     current += remaining
                     update_fence(remaining)
                     break
-                if current:
+                if current and current != (f"```{fence}\n" if fence else ""):
                     flush()
                     continue
-                # A single unbroken line is longer than the card limit.
-                current = remaining[:capacity]
+                # Split an oversized line even when a reopened fence is present.
+                current += remaining[:capacity]
                 remaining = remaining[capacity:]
                 flush()
         if current:
@@ -1229,9 +1267,19 @@ class Bridge:
             self.feishu.card_or_text(chat_id, title + suffix, chunk, color)
 
     @staticmethod
+    def file_kind(path: Path) -> str:
+        if (any(part in IGNORED_DIRECTORIES for part in path.parts)
+                or path.suffix.lower() in IGNORED_SUFFIXES
+                or path.name.startswith(".feishu-codex") or path.name == ".env"
+                or (path.name.startswith(".env.") and path.name != ".env.example")):
+            return "ignore"
+        return "artifact" if path.suffix.lower() in ARTIFACT_SUFFIXES else "text"
+
+    @staticmethod
     def _snapshot_text(path: Path) -> tuple[str | None, str]:
         try:
-            data = path.read_bytes()
+            with path.open("rb") as stream:
+                data = stream.read(SNAPSHOT_MAX_TEXT_BYTES + 1)
         except OSError:
             return None, "无法读取"
         if len(data) > SNAPSHOT_MAX_TEXT_BYTES:
@@ -1245,56 +1293,85 @@ class Bridge:
 
     def snapshot(self, directory: Path) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
-        candidates: list[Path] = []
-        for path in directory.rglob("*"):
-            if (not path.is_file() or ".git" in path.parts or ".runtime" in path.parts or
-                    "feishu-inbox" in path.parts or path.name.startswith(".feishu-codex")):
-                continue
-            candidates.append(path)
-        for path in sorted(candidates)[:SNAPSHOT_MAX_FILES]:
-            try:
-                stat = path.stat()
-                text, skipped = self._snapshot_text(path)
-                result[str(path)] = {"metadata": (stat.st_mtime_ns, stat.st_size),
-                                     "text": text, "skipped": skipped}
-            except OSError:
-                pass
+        for root, directories, files in os.walk(directory, followlinks=False):
+            directories[:] = sorted(name for name in directories
+                                    if name not in IGNORED_DIRECTORIES
+                                    and not (Path(root) / name).is_symlink())
+            for name in sorted(files):
+                path = Path(root) / name
+                kind = self.file_kind(path.relative_to(directory))
+                if kind == "ignore" or path.is_symlink():
+                    continue
+                if len(result) >= SNAPSHOT_MAX_FILES:
+                    return result
+                try:
+                    file_stat = path.stat()
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        continue
+                    text, skipped = self._snapshot_text(path) if kind == "text" else (None, "")
+                    if kind == "text" and text is None and path.suffix.lower() not in TEXT_SUFFIXES:
+                        kind = "unknown"
+                    result[str(path)] = {"metadata": (file_stat.st_mtime_ns, file_stat.st_size),
+                                         "text": text, "skipped": skipped, "kind": kind}
+                except OSError:
+                    pass
         return result
 
-    def changed_files(self, directory: Path, before: dict[str, dict[str, Any]]) -> list[Path]:
-        after = self.snapshot(directory)
-        changed: list[Path] = []
-        for name, state in after.items():
-            if not before.get(name) or before[name]["metadata"] != state["metadata"]:
-                path = Path(name)
-                if path.is_relative_to(directory) and path.stat().st_size <= MAX_ATTACHMENT:
-                    changed.append(path)
-        return changed[:10]
+    @staticmethod
+    def file_changed(old: dict[str, Any] | None, new: dict[str, Any] | None) -> bool:
+        if old is None or new is None:
+            return True
+        if old["text"] is not None and new["text"] is not None:
+            return old["text"] != new["text"]
+        return old["metadata"] != new["metadata"]
 
-    def file_diffs(self, directory: Path, before: dict[str, dict[str, Any]]) -> list[tuple[Path, str]]:
-        after = self.snapshot(directory)
+    def changed_files(self, directory: Path, before: dict[str, dict[str, Any]],
+                      after: dict[str, dict[str, Any]] | None = None) -> list[Path]:
+        after = self.snapshot(directory) if after is None else after
+        return [Path(name) for name, state in after.items()
+                if state.get("kind") == "artifact" and self.file_changed(before.get(name), state)][:10]
+
+    def file_diffs(self, directory: Path, before: dict[str, dict[str, Any]],
+                   after: dict[str, dict[str, Any]] | None = None) -> list[tuple[Path, str]]:
+        after = self.snapshot(directory) if after is None else after
         changes: list[tuple[Path, str]] = []
         for name in sorted(set(before) | set(after)):
             old, new = before.get(name), after.get(name)
-            if old and new and old["metadata"] == new["metadata"]:
+            if not self.file_changed(old, new):
                 continue
             path = Path(name)
+            if new is None and path.exists():
+                continue
             relative = path.relative_to(directory)
-            skipped = (old or new or {}).get("skipped", "无法生成文本差异")
+            if self.file_kind(relative) in {"ignore", "artifact"}:
+                continue
+            operation = "新增" if old is None else ("删除" if new is None else "修改")
             if (old and old["text"] is None) or (new and new["text"] is None):
-                changes.append((path, f"路径：`{relative}`\n\n无法生成文本差异：{skipped}。"))
+                skipped = next(state.get("skipped") or "无法读取" for state in (old, new)
+                               if state and state["text"] is None)
+                changes.append((path, f"{operation} · 无法生成文本差异：{skipped}。未上传原文件。"))
                 continue
             old_text = old["text"] if old else ""
             new_text = new["text"] if new else ""
-            diff = "".join(difflib.unified_diff(old_text.splitlines(keepends=True), new_text.splitlines(keepends=True),
-                                                fromfile=f"a/{relative}", tofile=f"b/{relative}"))
+            # Normalize missing final newlines for display so +/- lines never run together.
+            old_lines, new_lines = old_text.splitlines(), new_text.splitlines()
+            diff_lines = list(difflib.unified_diff(old_lines, new_lines,
+                             fromfile=f"a/{relative}", tofile=f"b/{relative}", lineterm=""))
+            added = sum(line.startswith("+") for line in diff_lines[2:])
+            removed = sum(line.startswith("-") for line in diff_lines[2:])
+            diff = "\n".join(diff_lines)
             if len(diff) > DIFF_MAX_CHARS:
-                diff = diff[:DIFF_MAX_CHARS] + "\n…（差异已截断）\n"
-            changes.append((path, f"```diff\n{diff or '（文件元数据变化，但文本内容未变化）'}\n```"))
+                diff = diff[:DIFF_MAX_CHARS] + "\n…（差异已截断）"
+            note = ""
+            if old_text.endswith("\n") != new_text.endswith("\n"):
+                note = "\n文件末尾换行状态发生变化。"
+            changes.append((path, f"{operation} · +{added} / -{removed}{note}\n\n```diff\n"
+                            + (diff or "（空文件或文件末尾换行变化）") + "\n```"))
         return changes
 
-    def send_file_diffs(self, chat_id: str, directory: Path, before: dict[str, dict[str, Any]]) -> None:
-        for path, content in self.file_diffs(directory, before):
+    def send_file_diffs(self, chat_id: str, directory: Path, before: dict[str, dict[str, Any]],
+                        after: dict[str, dict[str, Any]] | None = None) -> None:
+        for path, content in self.file_diffs(directory, before, after):
             relative = path.relative_to(directory)
             self.send_split_cards(chat_id, f"文件差异：{relative}", content, "blue")
 
@@ -1361,7 +1438,12 @@ class Bridge:
                 return
             generation = self.generations.get(key, 0)
             with self.task_lock:
-                self.user_job_counts[user_id] = self.user_job_counts.get(user_id, 0) + 1
+                changing = getattr(self, "thread_mutation", False)
+                if not changing:
+                    self.user_job_counts[user_id] = self.user_job_counts.get(user_id, 0) + 1
+            if changing:
+                self.feishu.card_or_text(message.chat_id, "对话操作中", "请等待归档或恢复完成后重新发送消息。", "yellow")
+                return
             self.jobs.put((user_id, key, directory, message.chat_id, text, resource, generation))
 
     def resolve_approval(self, request_id: int, chat_id: str, yes: bool,
@@ -1385,6 +1467,137 @@ class Bridge:
             except Exception as exc:
                 log_event("approval_card_update_failed", error_type=type(exc).__name__)
         self.feishu.card_or_text(chat_id, title, content)
+
+    @staticmethod
+    def thread_title(thread: dict[str, Any]) -> str:
+        title = next((" ".join(str(thread.get(field) or "").split())
+                      for field in ("name", "title", "preview") if str(thread.get(field) or "").strip()), "未命名")[:60]
+        title = html.escape(title)
+        for char in "\\`*_[]":
+            title = title.replace(char, "\\" + char)
+        return title
+
+    def show_threads(self, user_id: str, chat_id: str, key: str, directory: Path,
+                     archived: bool = False, source: str = "") -> None:
+        with self.thread_lock:
+            threads = self.server.list_threads(directory, archived=archived)[:8]
+            current = self.server.threads.get(key) or self.load_session(key)
+            buttons = []
+            token = uuid.uuid4().hex
+            allowed = {}
+            for thread in threads:
+                thread_id = thread.get("id")
+                if not thread_id:
+                    continue
+                allowed[thread_id] = thread
+                description = f"**{self.thread_title(thread)}**" + (" · 当前对话" if thread_id == current else "")
+                description += f"\nID：`{thread_id}`"
+                operations = [("取消归档", "unarchive")] if archived else [("恢复", "resume"), ("归档", "archive")]
+                for index, (label, operation) in enumerate(operations):
+                    buttons.append({"text": label, "type": "default" if operation == "archive" else "primary",
+                                    "description": description if index == 0 else "",
+                                    "value": {"command": "/thread-action", "token": token,
+                                              "thread_id": thread_id, "operation": operation}})
+            buttons.append({"text": "返回普通对话列表" if archived else "查看已归档对话",
+                            "section": "列表导航", "value": {
+                "command": "/thread-action", "token": token,
+                "operation": "list", "thread_id": ""}})
+            title = "已归档对话" if archived else "对话列表"
+            content = ("归档会隐藏对话并保留历史记录。" if threads else "没有找到对话。")
+            content += "\n\n操作卡 10 分钟后失效，届时请重新发送 /resume 或 /archived。"
+            if source:
+                try:
+                    self.feishu.update_card(source, title, content, "blue", buttons)
+                    card_id = source
+                except Exception:
+                    card_id = self.feishu.card_or_text(chat_id, title, content, "blue", buttons)
+            else:
+                card_id = self.feishu.card_or_text(chat_id, title, content, "blue", buttons)
+            for old_token, state in list(self.thread_cards.items()):
+                if state["card"] == card_id or time.time() - state["created"] > 600:
+                    self.thread_cards.pop(old_token, None)
+            self.thread_cards[token] = {"user": user_id, "chat": chat_id, "key": key,
+                                        "directory": directory, "archived": archived, "threads": allowed,
+                                        "card": card_id, "created": time.time()}
+            while len(self.thread_cards) > 100:
+                self.thread_cards.pop(next(iter(self.thread_cards)))
+
+    def clear_thread_bindings(self, thread_id: str) -> None:
+        keys = {key for key, value in self.server.threads.items() if value == thread_id}
+        try:
+            raw = SESSION_FILE.read_text(encoding="utf-8").strip()
+            try:
+                saved = json.loads(raw)
+            except json.JSONDecodeError:
+                saved = raw
+            if isinstance(saved, dict):
+                keys.update(key for key, value in saved.items() if value == thread_id)
+            elif saved == thread_id:
+                self.clear_session()
+        except FileNotFoundError:
+            pass
+        for key in keys:
+            self.server.threads.pop(key, None)
+            self.clear_session(key)
+        for action_id, action in list(self.plan_actions.items()):
+            if action.get("key") in keys:
+                self.plan_actions.pop(action_id, None)
+        for token, state in list(self.thread_cards.items()):
+            if thread_id in state["threads"]:
+                self.thread_cards.pop(token, None)
+
+    def change_thread(self, user_id: str, chat_id: str, key: str, directory: Path,
+                      thread_id: str, operation: str) -> None:
+        # Reserve admission under the short-lived lock; RPC must not block the
+        # Feishu receive callback on this lock while waiting for app-server.
+        with self.task_lock:
+            if (getattr(self, "thread_mutation", False) or any(self.user_job_counts.values())
+                    or self.active_task_tokens):
+                raise ValueError("有任务执行中、正在排队或正在切换对话，请等待完成或先停止任务。")
+            self.thread_mutation = True
+        try:
+            thread = self.server.read_thread(thread_id)
+            if (thread.get("status") or {}).get("type") == "active":
+                raise ValueError("该对话正在执行任务，请先停止或等待完成。")
+            if not thread.get("cwd") or Path(thread["cwd"]).resolve() != directory.resolve():
+                raise ValueError("该对话不属于当前目录")
+            if operation == "resume":
+                self.server.resume(key, thread_id, directory)
+                self.save_session(thread_id, key)
+                title = "会话已恢复"
+            else:
+                self.server.archive_thread(thread_id, archived=operation == "archive")
+                if operation == "archive":
+                    self.clear_thread_bindings(thread_id)
+                title = "对话已归档" if operation == "archive" else "已取消归档"
+        finally:
+            with self.task_lock:
+                self.thread_mutation = False
+        self.feishu.card_or_text(chat_id, title,
+                                 f"**{self.thread_title(thread)}**\nID：`{thread_id}`", "green")
+
+    def thread_action(self, user_id: str, chat_id: str, key: str,
+                      value: dict[str, Any], source: str) -> None:
+        try:
+            with self.thread_lock:
+                state = self.thread_cards.get(str(value.get("token", "")))
+                if (not state or (state["user"], state["chat"], state["key"], state["card"])
+                        != (user_id, chat_id, key, source) or time.time() - state["created"] > 600
+                        or state["directory"] != self.current_directory(user_id)):
+                    raise ValueError("对话卡片已失效或不属于当前用户、聊天及目录，请重新发送 /resume。")
+                operation = value.get("operation")
+                if operation == "list":
+                    self.show_threads(user_id, chat_id, key, state["directory"], not state["archived"], source)
+                    return
+                thread_id = str(value.get("thread_id", ""))
+                expected = {"unarchive"} if state["archived"] else {"resume", "archive"}
+                if thread_id not in state["threads"] or operation not in expected:
+                    raise ValueError("无效的对话操作")
+                self.change_thread(user_id, chat_id, key, state["directory"], thread_id, operation)
+                self.thread_cards.pop(str(value.get("token", "")), None)
+                self.show_threads(user_id, chat_id, key, state["directory"], state["archived"], source)
+        except Exception as exc:
+            self.feishu.card_or_text(chat_id, "对话操作失败", str(exc), "red")
 
     def command(self, user_id: str, chat_id: str, key: str, text: str, source: str = "") -> None:
         parts = text.split(maxsplit=1)
@@ -1451,9 +1664,15 @@ class Bridge:
         elif command == "/pair":
             self.feishu.card_or_text(chat_id, "无需配对", "此账号已在白名单中。", "green")
         elif command == "/new":
-            self.server.threads.pop(key, None)
-            self.clear_session(key)
-            self.feishu.card_or_text(chat_id, "新会话", "已切换到新会话，下次提问时自动创建。", "green")
+            try:
+                with self.thread_lock, self.task_lock:
+                    if any(self.user_job_counts.values()) or self.active_task_tokens:
+                        raise ValueError("有任务执行中或正在排队，请等待完成或先停止任务。")
+                    self.server.threads.pop(key, None)
+                    self.clear_session(key)
+                self.feishu.card_or_text(chat_id, "新会话", "已切换到新会话，下次提问时自动创建。", "green")
+            except Exception as exc:
+                self.feishu.card_or_text(chat_id, "新建会话失败", str(exc), "red")
         elif command == "/plan":
             if argument.lower() in ("on", "开启", "打开"):
                 self.plan_modes[key] = True
@@ -1481,27 +1700,21 @@ class Bridge:
                                          "控制面板更新失败，请发送 `/help` 刷新。", "yellow")
         elif command in ("/plan-implement", "/plan-clear-implement", "/plan-stay"):
             try:
-                self.resolve_plan_action(user_id, chat_id, key, command, argument, source)
+                with self.thread_lock:
+                    self.resolve_plan_action(user_id, chat_id, key, command, argument, source)
             except Exception as exc:
                 self.feishu.card_or_text(chat_id, "计划操作失败", str(exc), "red")
-        elif command == "/resume" and argument:
+        elif command in ("/archive", "/unarchive") or (command == "/resume" and argument):
             try:
-                self.server.resume(key, argument, directory)
-                self.save_session(argument, key)
-                self.feishu.card_or_text(chat_id, "会话已恢复", f"会话 ID：`{argument}`", "green")
+                if not argument:
+                    raise ValueError(f"请输入 {command} <thread_id>")
+                with self.thread_lock:
+                    self.change_thread(user_id, chat_id, key, directory, argument, command[1:])
             except Exception as exc:
-                self.feishu.card_or_text(chat_id, "恢复会话失败", str(exc), "red")
-        elif command == "/resume":
+                self.feishu.card_or_text(chat_id, "对话操作失败", str(exc), "red")
+        elif command in ("/resume", "/archived"):
             try:
-                threads = self.server.list_threads(directory)
-                shown = threads[:8]
-                content = "选择下方会话继续对话。" if shown else "没有找到会话"
-                buttons = [{"text": "恢复", "description": f"**{index}. {(item.get('title') or '未命名')[:60]}**\n`{str(item.get('id'))[:8]}…`", "type": "primary", "value": {"command": "/resume", "thread_id": item.get("id")}}
-                           for index, item in enumerate(shown, 1) if item.get("id")]
-                # A resume button carries the same command semantics as text.
-                for button in buttons:
-                    button["value"]["command"] = "/resume"
-                self.feishu.card_or_text(chat_id, "可恢复会话", content, "blue", buttons)
+                self.show_threads(user_id, chat_id, key, directory, command == "/archived")
             except Exception as exc:
                 self.feishu.card_or_text(chat_id, "读取会话列表失败", str(exc), "red")
         elif command == "/model":
@@ -1597,6 +1810,13 @@ def on_card_action(data: Any) -> Any:
         command = str(value.get("command", ""))
         chat_id = getattr(context, "open_chat_id", "")
         source = getattr(context, "open_message_id", "")
+        if command == "/thread-action":
+            if bridge and chat_id and bridge.is_allowed(user_id):
+                log_event("card_action_received", command=command)
+                threading.Thread(target=bridge.thread_action,
+                                 args=(user_id, chat_id, bridge.session_key(user_id), value, source),
+                                 daemon=True).start()
+            return P2CardActionTriggerResponse({})
         if command in ("/question-answer", "/question-other"):
             if bridge and chat_id and bridge.is_allowed(user_id):
                 log_event("card_action_received", command=command)

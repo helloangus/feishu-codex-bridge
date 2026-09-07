@@ -1,0 +1,9 @@
+# Reproduce the Python compatibility baseline. Production requirements remain
+# unchanged while Rust is introduced; update this set in a dedicated PR.
+lark-oapi==1.7.3
+httpx[socks]==0.28.1
+websockets==15.0.1
+requests[socks]==2.34.2
+python-socks[asyncio]==3.0.0
+jsonschema==4.17.3
+pyrsistent==0.20.0

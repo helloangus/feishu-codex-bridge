@@ -43,7 +43,7 @@ elif command == "/example":
 
 需要用户及时操作的卡片必须显示超时后果，并在可更新的原卡上反映超时终态；当前审批、Codex 选择题和 Plan 后续操作默认均为 600 秒，可分别通过 `CODEX_APPROVAL_TIMEOUT_SECONDS`、`CODEX_QUESTION_TIMEOUT_SECONDS` 和 `CODEX_PLAN_ACTION_TIMEOUT_SECONDS` 配置。
 
-`Feishu.make_card()` 统一生成 Card JSON 2.0。按钮使用 `behaviors: [{"type": "callback", "value": ...}]`，不要使用旧版 `action` 容器。长说明使用垂直满宽布局；短控制项可用两列。
+`Feishu.make_card()` 统一生成 Card JSON 2.0。按钮使用 `behaviors: [{"type": "callback", "value": ...}]`，不要使用旧版 `action` 容器。长说明使用垂直满宽布局；短控制项可用两列。卡片正文与操作区、不同条目及不同控制组统一用分隔线区分；同一条目的多个操作保持相邻。独立导航或补充操作使用按钮元数据 `section` 指定分区标题；无说明但彼此独立的选项使用 `separate: True`，两者只参与渲染，不发送到飞书按钮 schema。
 
 ## 修改 app-server 适配层
 
@@ -53,7 +53,7 @@ elif command == "/example":
 
 ## 测试与验收
 
-`tests/test_bridge.py` 使用 fake outbox 和 `Bridge.__new__`，不启动真实 app-server；`tests/test_service.py` 使用临时目录。测试不得读取真实 `.env`、访问网络、启动长期进程或修改用户工作目录。
+`tests/test_delivery_threads.py` 覆盖对话归档、卡片归属与交付分类；`tests/test_bridge.py` 使用 fake outbox 和 `Bridge.__new__`，不启动真实 app-server；`tests/test_service.py` 使用临时目录。测试不得读取真实 `.env`、访问网络、启动长期进程或修改用户工作目录。
 
 提交前：
 
@@ -64,3 +64,7 @@ elif command == "/example":
 - [ ] README、docs、PLAN 已同步
 - [ ] 修改飞书或 Codex 接口后完成真实飞书验收
 - [ ] 修改 Plan 或交付物展示后，真实点击控制面板开关，并确认 Plan Markdown 与 diff 卡片显示。
+
+## Rust 迁移开发
+
+工具链固定在 rust-toolchain.toml，依赖固定在 Cargo.lock。先运行 `cargo fmt --all`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、`cargo test --workspace --locked`、`cargo xtask check-boundaries`，再运行 Python 回归。Rust CLI 的跨语言 unittest 在未构建二进制时会明确跳过，CI 先构建再运行。当前状态与扩展边界见 [Rust 方案](rust-refactor.md)。

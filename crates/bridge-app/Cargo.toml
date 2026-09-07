@@ -1,0 +1,13 @@
+[package]
+name = "bridge-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bridge-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

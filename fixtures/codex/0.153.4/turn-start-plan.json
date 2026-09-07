@@ -1,0 +1,29 @@
+{
+  "threadId": "t",
+  "input": [
+    {
+      "type": "text",
+      "text": "hello"
+    },
+    {
+      "type": "localImage",
+      "path": "/tmp/project/image.png",
+      "detail": "auto"
+    }
+  ],
+  "model": "available-model",
+  "approvalPolicy": "on-request",
+  "sandboxPolicy": {
+    "type": "workspaceWrite",
+    "writableRoots": [
+      "/tmp/project"
+    ],
+    "networkAccess": false
+  },
+  "collaborationMode": {
+    "mode": "plan",
+    "settings": {
+      "model": "available-model"
+    }
+  }
+}

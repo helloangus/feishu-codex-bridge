@@ -36,6 +36,12 @@
 
 ## 后续体验完善
 
+- [x] 统一卡片分区：对话底部导航独立标题与分隔线，选择题独立选项及“自行回答”分开，控制面板各组与停止按钮明确分隔；同一条目操作保持相邻。已补布局回归，手机端视觉验收待确认。
+
+- [x] 对话归档与取消归档：列表显示标题、完整 ID 和当前对话标记；支持原卡刷新、归属/过期校验及任务入队互斥，归档清理绑定。接口按本机 Codex CLI 0.153.4 schema 核对。
+- [x] 工程文本只展示本轮差异；已知图片/文档等成果才上传；缓存、依赖与编译产物不读取、不比较、不上传。结束快照复用，附件过滤后统一限额；修复超长单行代码块分段循环。
+- [ ] 上述两项真实飞书验收及手机卡片截图：已通过 44 项离线回归、语法/空白检查和 setup 前置检查，并通过 start.sh restart 加载新代码，status 已确认重新连接飞书；仍需按 docs/operations.md 做手机端人工验收，离线回归不代表联调通过。
+
 - [x] Plan 模式与选择题交互：`/plan` 按用户/目录保存，计划完成卡支持实现、清空上下文后实现和继续规划；Codex 选择题以飞书选项卡和“其他”文字回答回传。
 - [x] 分离 Plan 详情、过程与文件差异：`/help` Plan 为状态型原卡开关；完成卡与完整计划详情分开；受限文本快照生成本轮 unified diff 卡，交付物仅列文件。
   已补离线回归；仍需真实飞书点击开关、查看 Markdown 计划详情及新增/修改/删除 diff 卡。
@@ -74,3 +80,42 @@
 - [x] 飞书专用代理：显式配置 REST、地址获取与 WebSocket 代理，修复 Fake-IP 无法直连时持续等待连接；增加离线回归。
 
 - [x] 飞书默认跟随启动环境的代理变量和 NO_PROXY；移除本机固定代理覆盖，保留可选专用配置，新增环境代理/直连回归。
+
+## Rust 重构：开始实施
+
+约束已确认：Linux/Termux、最终全 Rust、允许 Python SDK 过渡、首版串行、JSON 状态、新部署显式授权。完整方案与阶段验收见 docs/rust-refactor.md。
+
+- [x] 正式安装 Rust 1.85.1，固定 workspace 工具链与 Cargo.lock。
+- [x] 六个生产 crate 与 xtask 边界检查；core 无网络/SDK 依赖。
+- [x] 命令、任务/交互状态机、有界 FIFO、保存失败拒绝入队。
+- [x] JSON 单写入者、fsync 原子保存、跨重启去重与损坏版本拒绝。
+- [x] 旧状态 dry-run、导入、Python 格式导出；不读取真实 .env。
+- [x] 路径解析、逐级 no-follow 普通文件打开、有界快照与文本 diff/成果分类。
+- [x] CLI 配置检查、基础 CI、Rust 与 Python 跨语言回归。
+- [ ] P0 性能测量、完整行为/协议 fixture 和既有待完成手机验收。
+- [ ] P1 完整异步 ports、全部 Python 行为在 Rust 的对等回归。
+- [x] P2 子集：有界双向 RPC、异步 backend、子进程握手/回收、0.153.4 schema 和 turn 契约。
+- [x] P3 子集：REST/卡片/流式附件边界、SDK 薄进程、严格 IPC 解码和卡片命令往返回归。
+- [ ] P2 完整 Codex app-server 执行器、连接代次、schema 与事件契约验证。
+- [ ] P3 Rust 业务主循环、REST/卡片/附件与 Python SDK 薄进程。
+- [ ] P4 Rust 飞书长连接、代理矩阵、Termux 实机与手机验收。
+- [ ] P5 Rust supervisor、日志/健康、打包发布、持续运行和生产回退演练。
+
+没有切换、重启或更改现有生产服务配置。当前 Rust 二进制不能替代 bridge.py。
+
+2026-09-07：39 项 Rust 与 54 项 Python 回归通过；Android 检查受 ring 所需 C/汇编编译器的 proot 包装故障阻塞，尚未通过当前完整 workspace 的 Android 验证。SDK ACK 持久化确认和主循环仍待实现。
+
+- [x] 已从原始 Codex 会话逐字恢复完整重构计划，作为设计基线：`docs/plans/rust-refactor-original.md`；进度与基线分开维护，后续偏离通过 ADR 记录。
+- [x] 飞书 REST 新增无网络响应测试：HTTP/业务错误、畸形/超大响应、路径参数隔离；Rust 回归累计 42 项通过。完整请求和附件契约仍待补齐。
+
+后续重构同时对照 `docs/plans/rust-refactor-original.md` 与本文件；原始方案保留不变，偏离记录 ADR。
+- [x] P2 事件子集：输出/完成/归档映射到应用类型，保留执行身份，拒绝缺失身份和未知终态。应用事件消费、审批/问答/Plan 仍待完成。
+- [x] ADR 0001 记录显式 boxed future 与原方案 async-trait 的实现差异。
+
+本轮验证：44 项 Rust 测试通过；fmt、Clippy（-D warnings）、依赖边界和 diff 空白检查通过。未进行真实飞书/Codex 验收。
+
+- [x] P2：命令/文件审批与逐题问答映射、一次性回复句柄、未知请求错误响应；增加版本 schema 与 Rust/Python 共用 fixture。
+- [x] P2/P3：交互归属、容量、期限与部分答案注册表；完成先于启动响应的有界缓冲；Plan 完成项和失败详情映射。
+- [x] P3：SDK 等待 Rust 接受确认后应答，超时/队列满失败；Rust 有界 IPC pump、一次性确认句柄和首次连接生命周期通知。
+- [ ] 将上述端口接入完整业务 actor、耐久认领与 supervisor；目前 ACK 接口测试通过并不代表生产持久化链路已完成。
+- [ ] Codex additionalPermissions/networkApprovalContext 暂安全拒绝，需补完整权限展示及契约才开放；不能视为审批功能全覆盖。

@@ -1,0 +1,56 @@
+[
+  {
+    "method": "item/commandExecution/requestApproval",
+    "schema": "CommandExecutionRequestApproval",
+    "params": {
+      "threadId": "t",
+      "turnId": "u",
+      "itemId": "i",
+      "startedAtMs": 1,
+      "command": "echo test"
+    },
+    "reply": {
+      "decision": "decline"
+    }
+  },
+  {
+    "method": "item/fileChange/requestApproval",
+    "schema": "FileChangeRequestApproval",
+    "params": {
+      "threadId": "t",
+      "turnId": "u",
+      "itemId": "i",
+      "startedAtMs": 1
+    },
+    "reply": {
+      "decision": "decline"
+    }
+  },
+  {
+    "method": "item/tool/requestUserInput",
+    "schema": "ToolRequestUserInput",
+    "params": {
+      "threadId": "t",
+      "turnId": "u",
+      "itemId": "i",
+      "isBlocking": true,
+      "questions": [
+        {
+          "id": "q",
+          "header": "h",
+          "question": "Choose",
+          "isOther": true,
+          "isSecret": false,
+          "options": null
+        }
+      ]
+    },
+    "reply": {
+      "answers": {
+        "q": {
+          "answers": []
+        }
+      }
+    }
+  }
+]

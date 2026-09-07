@@ -5,3 +5,10 @@
 __pycache__/
 *.pyc
 .runtime/
+
+target/
+.feishu-codex-allowed-open-ids
+feishu-inbox/
+bridge.toml
+.bridge-state/
+.venv/

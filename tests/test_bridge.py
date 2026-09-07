@@ -93,6 +93,34 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(model_button["tag"], "button")
         self.assertEqual(model_button["width"], "fill")
 
+    def test_help_groups_and_stop_have_clear_boundaries(self):
+        item = bridge.Bridge.__new__(bridge.Bridge)
+        item.plan_modes = {}
+        elements = bridge.Feishu.make_card("面板", "说明", buttons=item.help_buttons("key"))["body"]["elements"]
+        for index, element in enumerate(elements):
+            if element.get("tag") == "column_set":
+                self.assertEqual(elements[index - 2]["tag"], "hr")
+                self.assertNotIn("_group", element)
+        self.assertEqual(elements[-3]["tag"], "hr")
+        self.assertEqual(elements[-2]["content"], "**停止任务**")
+        self.assertEqual(elements[-1]["behaviors"][0]["value"]["command"], "/stop")
+
+    def test_question_options_without_descriptions_and_other_are_separate(self):
+        item = bridge.Bridge.__new__(bridge.Bridge)
+        item.question_lock = threading.RLock()
+        item.feishu = Outbox()
+        item.pending_questions = {1: {"index": 0, "chat_id": "chat", "created": time.time(), "questions": [
+            {"id": "q", "options": [{"label": "A", "description": "说明 A"}, {"label": "B"}], "isOther": True}
+        ]}}
+        item.show_next_question(1)
+        buttons = item.feishu.calls[-1][0][4]
+        elements = bridge.Feishu.make_card("选择", "问题", buttons=buttons)["body"]["elements"]
+        index = next(i for i, element in enumerate(elements) if element.get("text", {}).get("content") == "B")
+        self.assertEqual(elements[index - 1]["tag"], "hr")
+        self.assertEqual(elements[index + 1]["tag"], "hr")
+        self.assertEqual(elements[index + 2]["content"], "**自行回答**")
+        self.assertEqual(elements[-1]["behaviors"][0]["value"]["command"], "/question-other")
+
     def test_split_card_content_reopens_fenced_code_block(self):
         content = "```python\n" + "x = 1\n" * 20 + "```\n结束"
         chunks = bridge.Bridge.split_card_content(content, max_chars=45)

@@ -1,0 +1,4 @@
+lark-oapi==1.7.3
+websockets==15.0.1
+requests[socks]==2.34.2
+python-socks[asyncio]==3.0.0

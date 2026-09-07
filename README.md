@@ -9,7 +9,7 @@
 ## 功能
 
 - 飞书私聊文本 → 当前目录的 Codex thread；最终 Markdown 回复以飞书卡片展示。
-- `/new`、`/resume`、`/compact` 管理 Codex 会话；服务重启后自动恢复已保存会话。
+- `/new`、`/resume`、`/archive`、`/archived`、`/compact` 管理 Codex 会话；服务重启后自动恢复已保存会话。
 - `/cd` 可在受限工作区内按用户切换目录，支持移动端快捷目录卡。
 - `/models` 卡片选择模型，模型偏好按飞书用户与工作目录保存。
 - `/help` 提供移动端友好的控制面板；支持文本命令和卡片按钮。
@@ -76,7 +76,10 @@ codex --version
 | `/status` | 显示任务状态、队列、目录、会话、模型和桥接运行时长。 |
 | `/cd` / `/cd <路径>` | 显示当前目录的子目录，或切换到工作区内的绝对/相对路径；不存在的目录会先请求确认创建。 |
 | `/new` | 清除当前用户在当前目录的会话绑定；下次提问创建新会话。 |
-| `/resume` / `/resume <thread_id>` | 列出最近会话，或恢复指定 Codex thread。 |
+| `/resume` / `/resume <thread_id>` | 按标题和完整 ID 列出最近 8 个对话，卡片支持恢复、归档；也可恢复指定 ID。 |
+| `/archive <thread_id>` | 归档当前目录的对话，从普通列表隐藏并保留历史记录。 |
+| `/archived` | 查看当前目录最近 8 个已归档对话，卡片支持取消归档。 |
+| `/unarchive <thread_id>` | 取消归档；不自动切换当前对话，可再用 `/resume` 恢复。 |
 | `/model` / `/models` / `/model <model>` | 查看、选择或设置模型。 |
 | `/plan` / `/plan on` / `/plan off` | 查看、开启或关闭 Plan 模式；控制面板会显示状态型“开启 Plan”或“关闭 Plan”按钮，并原地更新。开启后普通消息只产出计划。 |
 | `/compact` | 请求 Codex 压缩当前 thread 上下文。 |
@@ -84,12 +87,18 @@ codex --version
 | `/approve <id>` / `/deny <id>` | 用文本处理审批；通常直接点审批卡片即可。 |
 | `/pair <配对码>` | 将发送者加入本机白名单；仅在配置配对码时可由未授权用户使用。 |
 
+对话卡片底部的“列表导航”区域提供“查看已归档对话”或“返回普通对话列表”，与每条对话的操作分开。
+
+归档当前对话后会清除对应的会话绑定，下次提问自动创建新对话。归档会使用 Codex 自带接口，也可能归档派生子对话；不删除项目文件。卡片操作绑定用户、聊天和目录，10 分钟后或重启后失效，请重新打开列表。桥接有执行中或排队任务时不能归档、取消归档或恢复对话；对话操作期间到达的新提问会提示稍后重发。
+
 ### 附件与交付物
 
 - 图片下载到当前 `<cwd>/feishu-inbox/` 并作为 app-server `localImage` 输入交给 Codex。
 - 文件下载后，以本地路径附加到提示词。
-- 每轮任务最多回传 10 个新增或修改的文件；默认单文件上限为 20 MiB。文本新增、修改和删除会另以 unified diff 卡片显示，仅涵盖本轮快照后的变化；二进制、无法读取或过大的文件只标注无法生成文本差异。
-- `feishu-inbox/`、`.runtime/`、`.git/` 和 `.feishu-codex*` 状态文件不会作为交付物上传。
+- 代码、Markdown、JSON、配置等工程文本只发本轮 unified diff 卡片，不上传原文件。卡片显示相对路径、新增/修改/删除、增删行数及上下文；长差异分段并明确标注截断，仅时间戳变化不发卡。
+- 图片（含 SVG）、PDF、Office、音视频、压缩包等成果继续作为附件发送，不另发二进制差异卡。每轮合计最多 10 个，默认单文件上限 20 MiB；生成图片参与去重和总数限制。
+- 过大、无法读取或无法解码的工程文本只显示原因，不回退上传源码。未知二进制只提示变化，不自动上传。快照默认最多 200 个文件、每文件最多读取 256 KiB 文本，不保证覆盖超出扫描上限的文件。
+- `feishu-inbox/`、`.runtime/`、`.git/`、`.feishu-codex*`、真实 `.env`、符号链接，以及 `__pycache__`、`.pyc`/`.pyo`、虚拟环境、`node_modules`、常见测试缓存、`target`/`build`/`dist` 和编译产物均不读取、不比较、不上传。
 
 ## 运维
 
@@ -178,3 +187,11 @@ python -m unittest discover -s tests -v
 更换代理环境后，在新环境的终端执行 `./start.sh restart` 即可，无需修改项目配置。运行中的进程不会自动获得终端后来修改的环境变量；桌面设置中的代理也需要由启动环境导出。若 `.env` 自己设置了代理变量，应删除固定值，以免覆盖终端环境。
 
 `FEISHU_PROXY_URL` 仅用于显式覆盖，例如 `http://127.0.0.1:7890`；通常无需配置。依赖清单已包含 HTTP 与 SOCKS 代理支持；升级时执行 `python -m pip install -r requirements.txt`。
+
+## Rust 重构（进行中）
+
+已建立 Cargo workspace、核心状态机、有界调度、JSON 存储、状态迁移 CLI 与受控快照。Rust 当前是离线工具，尚未接管生产机器人。现有服务继续通过 `start.sh` 管理。
+
+详见 [Rust 实施方案与进度](docs/rust-refactor.md) 和 [迁移工具使用说明](docs/migration.md)。开发验证：`cargo test --workspace --locked`，然后运行既有 Python 回归。
+
+完整 Rust 重构设计基线见 [完整重构计划](docs/plans/rust-refactor-original.md)，实施进度见 [方案与状态](docs/rust-refactor.md)。

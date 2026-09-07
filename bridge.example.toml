@@ -1,0 +1,16 @@
+# Rust migration configuration. Current production service still uses .env.
+[workspace]
+root = "/absolute/workspace"
+cwd = "/absolute/workspace/project"
+state_dir = "/absolute/private/bridge-state"
+
+[access]
+mode = "restricted"
+allowed_open_ids = ["ou_replace_me"]
+# pairing_code_env = "FEISHU_PAIRING_CODE"
+# Legacy unrestricted deployments must explicitly choose mode = "open".
+
+[codex]
+executable = "codex"
+args = ["app-server", "--enable", "collaboration_modes"]
+sandbox = "workspaceWrite"
