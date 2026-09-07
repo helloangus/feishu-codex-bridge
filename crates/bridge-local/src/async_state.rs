@@ -2,7 +2,9 @@
 use crate::state::JsonStore;
 use bridge_app::{
     MessageJournal,
-    sessions::{DurableJournal, SessionStore, SessionStoreError, StoreFuture},
+    sessions::{
+        DurableJournal, PreferenceChange, Preferences, SessionStore, SessionStoreError, StoreFuture,
+    },
 };
 use bridge_core::SessionKey;
 use std::sync::{Arc, Mutex};
@@ -55,6 +57,42 @@ fn key(session: &SessionKey) -> Result<String, SessionStoreError> {
 }
 
 impl SessionStore for AsyncState {
+    fn preferences(&self, session: SessionKey) -> StoreFuture<'_, Preferences> {
+        Box::pin(async move {
+            let key = key(&session)?;
+            self.run(move |store| {
+                Ok(Preferences {
+                    model: store.state().models.get(&key).cloned(),
+                    plan: store.state().plan_modes.get(&key).copied().unwrap_or(false),
+                })
+            })
+            .await
+        })
+    }
+    fn set_preference(&self, session: SessionKey, change: PreferenceChange) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let key = key(&session)?;
+            self.run(move |store| {
+                let mut next = store.state().clone();
+                match change {
+                    PreferenceChange::Model(Some(model)) => {
+                        if model.is_empty() || model.len() > 256 {
+                            return Err(SessionStoreError);
+                        }
+                        next.models.insert(key, model);
+                    }
+                    PreferenceChange::Model(None) => {
+                        next.models.remove(&key);
+                    }
+                    PreferenceChange::Plan(value) => {
+                        next.plan_modes.insert(key, value);
+                    }
+                }
+                store.replace(next).map_err(|_| SessionStoreError)
+            })
+            .await
+        })
+    }
     fn clear(&self, session: SessionKey) -> StoreFuture<'_, ()> {
         Box::pin(async move {
             let key = key(&session)?;
@@ -102,6 +140,76 @@ impl DurableJournal for AsyncState {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn preferences_persist_are_scoped_and_survive_new_session()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        let own = SessionKey::new("one", "/tmp/project");
+        store
+            .set_preference(own.clone(), PreferenceChange::Model(Some("chosen".into())))
+            .await?;
+        store
+            .set_preference(own.clone(), PreferenceChange::Plan(true))
+            .await?;
+        store.bind(own.clone(), "thread".into()).await?;
+        store.clear(own.clone()).await?;
+        drop(store);
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        assert_eq!(
+            store.preferences(own.clone()).await?,
+            Preferences {
+                model: Some("chosen".into()),
+                plan: true
+            }
+        );
+        assert_eq!(
+            store
+                .preferences(SessionKey::new("two", "/tmp/project"))
+                .await?,
+            Preferences::default()
+        );
+        assert_eq!(
+            store
+                .preferences(SessionKey::new("one", "/tmp/other"))
+                .await?,
+            Preferences::default()
+        );
+        store
+            .set_preference(own.clone(), PreferenceChange::Model(None))
+            .await?;
+        assert_eq!(
+            store.preferences(own).await?,
+            Preferences {
+                model: None,
+                plan: true
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preference_write_failure_preserves_previous_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        let own = SessionKey::new("one", "/tmp/project");
+        store
+            .set_preference(own.clone(), PreferenceChange::Plan(true))
+            .await?;
+        std::fs::create_dir(temp.path().join("state.previous.json"))?;
+        assert!(
+            store
+                .set_preference(own.clone(), PreferenceChange::Plan(false))
+                .await
+                .is_err()
+        );
+        drop(store);
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        assert!(store.preferences(own).await?.plan);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn clear_is_scoped_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {

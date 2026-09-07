@@ -12,10 +12,57 @@ pub type StoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SessionStoreError>> + Send + 'a>>;
 
 pub trait SessionStore: Send + Sync {
+    fn preferences(&self, session: SessionKey) -> StoreFuture<'_, Preferences>;
+    fn set_preference(&self, session: SessionKey, change: PreferenceChange) -> StoreFuture<'_, ()>;
     fn thread(&self, session: SessionKey) -> StoreFuture<'_, Option<String>>;
     fn bind(&self, session: SessionKey, thread: String) -> StoreFuture<'_, ()>;
     /// Remove only this user's directory binding; never archive the backend thread.
     fn clear(&self, session: SessionKey) -> StoreFuture<'_, ()>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preferences {
+    pub model: Option<String>,
+    pub plan: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum PreferenceChange {
+    Model(Option<String>),
+    Plan(bool),
+}
+
+pub async fn change_preference<S: SessionStore + ?Sized>(
+    backend: &dyn AgentBackend,
+    store: &S,
+    session: SessionKey,
+    change: PreferenceChange,
+) -> Result<(), StartError> {
+    if let PreferenceChange::Model(Some(id)) = &change {
+        if id.is_empty() || id.len() > 256 || !backend.models().await?.iter().any(|m| &m.id == id) {
+            return Err(BackendError::Incompatible.into());
+        }
+    }
+    store.set_preference(session, change).await?;
+    Ok(())
+}
+
+/// Settings changes hold the global idle gate, so queued tasks cannot change mode.
+pub async fn prepare_configured<S: SessionStore + ?Sized>(
+    backend: &dyn AgentBackend,
+    store: &S,
+    task: &TaskSpec,
+    sandbox: Sandbox,
+) -> Result<TurnInput, StartError> {
+    let preferences = store.preferences(task.session.clone()).await?;
+    let mut configured = task.clone();
+    configured.model = preferences.model;
+    configured.mode = if preferences.plan {
+        bridge_core::ExecutionMode::Plan
+    } else {
+        bridge_core::ExecutionMode::Execute
+    };
+    prepare(backend, store, &configured, vec![], sandbox).await
 }
 
 /// Async counterpart of the offline MessageJournal. True means durable claim;
@@ -30,6 +77,74 @@ pub enum StartError {
     Storage(#[from] SessionStoreError),
     #[error(transparent)]
     Backend(#[from] BackendError),
+}
+
+/// A directory is the legacy visibility boundary, not per-user thread ownership.
+pub async fn list(backend: &dyn AgentBackend, session: &SessionKey) -> Result<String, StartError> {
+    let threads = backend.threads(session.workspace.clone(), false).await?;
+    let mut lines = Vec::new();
+    for thread in threads
+        .into_iter()
+        .filter(|t| t.directory.as_ref() == Some(&session.workspace))
+        .take(8)
+    {
+        if !valid_thread_id(&thread.id) {
+            continue;
+        }
+        let title: String = thread
+            .title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(160)
+            .collect();
+        lines.push(format!(
+            "{}{}\n/resume {}",
+            title,
+            if thread.active { "（执行中）" } else { "" },
+            thread.id
+        ));
+    }
+    Ok(if lines.is_empty() {
+        "当前目录没有可恢复的会话。".into()
+    } else {
+        format!(
+            "当前目录最近会话（最多 8 项），复制对应命令恢复：\n\n{}",
+            lines.join("\n\n")
+        )
+    })
+}
+
+pub fn valid_thread_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Caller holds the scheduler mutation slot throughout validation and commit.
+pub async fn resume<S: SessionStore + ?Sized>(
+    backend: &dyn AgentBackend,
+    store: &S,
+    session: SessionKey,
+    id: String,
+) -> Result<(), StartError> {
+    if !valid_thread_id(&id) || !session.workspace.is_absolute() || session.user.is_empty() {
+        return Err(BackendError::Incompatible.into());
+    }
+    let before = backend.read_thread(id.clone()).await?;
+    if before.id != id || before.active || before.directory.as_ref() != Some(&session.workspace) {
+        return Err(BackendError::Incompatible.into());
+    }
+    let resumed = backend
+        .resume_thread(id.clone(), session.workspace.clone())
+        .await?;
+    if resumed.id != id || resumed.active || resumed.directory.as_ref() != Some(&session.workspace)
+    {
+        return Err(BackendError::Incompatible.into());
+    }
+    store.bind(session, id).await?;
+    Ok(())
 }
 
 /// The scheduler must reserve global execution before calling this use case.

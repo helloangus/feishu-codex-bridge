@@ -47,10 +47,35 @@ struct Active {
     turn: Option<TurnRef>,
     stopping: bool,
     output: String,
+    plan: Option<(String, bool)>,
     truncated: bool,
     started: Instant,
 }
 enum Done {
+    PreferenceClaim {
+        input: Input,
+        session: SessionKey,
+        change: sessions::PreferenceChange,
+        result: Result<bool, ()>,
+    },
+    PreferenceChanged {
+        chat: String,
+        result: Result<(), sessions::StartError>,
+    },
+    ResumeClaim {
+        input: Input,
+        session: SessionKey,
+        thread: String,
+        result: Result<bool, ()>,
+    },
+    SessionChanged {
+        chat: String,
+        result: Result<(), sessions::StartError>,
+    },
+    Listed {
+        chat: String,
+        result: Result<String, sessions::StartError>,
+    },
     Reset {
         input: Input,
         result: Result<bool, ()>,
@@ -89,17 +114,22 @@ fn finish(
 ) -> Result<(), String> {
     if let Some(active) = active.take() {
         scheduler.finish(&active.spec.id);
-        let output = if active.output.is_empty() {
+        let (text, truncated) = active
+            .plan
+            .as_ref()
+            .map(|(text, truncated)| (text.as_str(), *truncated))
+            .unwrap_or((&active.output, active.truncated));
+        let output = if text.is_empty() {
             "（无文本输出）"
         } else {
-            &active.output
+            text
         };
         tell(
             delivery,
             &active.spec.chat,
             format!(
                 "{outcome}\n\n{output}{}",
-                if active.truncated {
+                if truncated {
                     "\n\n输出超过最小版 32 KiB 上限，已截断。"
                 } else {
                     ""
@@ -116,6 +146,15 @@ fn event(
     event: AgentEvent,
 ) -> Result<(), String> {
     match event {
+        AgentEvent::Plan { text, .. } => {
+            if let Some(active) = active {
+                let mut end = text.len().min(32 * 1024);
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                active.plan = Some((text[..end].to_owned(), end < text.len()));
+            }
+        }
         AgentEvent::Output { delta, .. } => {
             if let Some(active) = active {
                 let available = (32 * 1024_usize).saturating_sub(active.output.len());
@@ -181,10 +220,10 @@ pub async fn run(
             if active.is_none() {
                 if let Some(spec) = scheduler.start_next().cloned() {
                     tell(&delivery, &spec.chat, "已开始执行；可发送 /status 或 /stop。")?;
-                    active = Some(Active {spec: spec.clone(), gate: None, turn: None, stopping: false, output: String::new(), truncated: false, started: Instant::now()});
+                    active = Some(Active {spec: spec.clone(), gate: None, turn: None, stopping: false, output: String::new(), plan: None, truncated: false, started: Instant::now()});
                     let backend = backend.clone(); let store = store.clone(); let sandbox = settings.sandbox;
                     jobs.spawn(async move {
-                        let result = sessions::prepare(backend.as_ref(), store.as_ref(), &spec, vec![], sandbox).await.map_err(|e| e.to_string());
+                        let result = sessions::prepare_configured(backend.as_ref(), store.as_ref(), &spec, sandbox).await.map_err(|e| e.to_string());
                         Done::Prepared {id: spec.id, result}
                     });
                 }
@@ -199,6 +238,77 @@ pub async fn run(
                     if input.id.is_empty() || input.user.is_empty() || input.chat.is_empty() {(input.accept)(false);continue;}
                     let text = input.text.as_deref().unwrap_or("").trim();
                     let session = SessionKey::new(&input.user, &settings.directory);
+                    use bridge_core::command::Command;
+                    let command = Command::parse(text);
+                    if matches!(&command, Ok(Command::Models | Command::Model(_) | Command::Plan(_))) {
+                        let change = match &command {
+                            Ok(Command::Model(Some(model))) => Some(sessions::PreferenceChange::Model(if model == "default" {None} else {Some(model.clone())})),
+                            Ok(Command::Plan(Some(value))) => Some(sessions::PreferenceChange::Plan(*value)),
+                            _ => None,
+                        };
+                        if let Some(change) = change {
+                            if !scheduler.begin_session_mutation() {
+                                tell(&delivery,&input.chat,"有任务执行中、排队或设置正在更新；请等待完成或先 /stop，再修改设置。")?;
+                                (input.accept)(true);continue;
+                            }
+                            let store = store.clone();
+                            jobs.spawn(async move {let result=store.claim(input.id.clone()).await.map_err(|_|());Done::PreferenceClaim {input,session,change,result}});
+                        } else {
+                            if !seen_commands.contains_key(&input.id) {
+                                if seen_commands.len() >= 1000 {seen_commands.clear();}
+                                seen_commands.insert(input.id.clone(),Instant::now());
+                                let store=store.clone();let backend=backend.clone();let chat=input.chat.clone();
+                                jobs.spawn(async move {
+                                    let result = async {
+                                        let preferences=store.preferences(session).await?;
+                                        match command {
+                                            Ok(Command::Models) => {
+                                                let models=backend.models().await?;
+                                                let mut lines=vec!["可用模型（最多 20 项）：".to_owned()];
+                                                for model in models.into_iter().take(20) {
+                                                    if model.id.len()>256 || model.id.chars().any(char::is_control) {continue;}
+                                                    lines.push(format!("{}{}\n/model {}",model.id,if preferences.model.as_ref()==Some(&model.id) {"（已选择）"} else if model.is_default {"（默认）"} else {""},model.id));
+                                                }
+                                                lines.push("/model default 恢复 Codex 默认模型".into());
+                                                Ok(lines.join("\n\n"))
+                                            }
+                                            Ok(Command::Model(None)) => Ok(format!("当前模型：{}",preferences.model.unwrap_or_else(||"Codex 默认".into()))),
+                                            _ => Ok(format!("Plan 模式：{}。使用 /plan on 或 /plan off 切换。",if preferences.plan {"已开启"} else {"已关闭"})),
+                                        }
+                                    }.await;
+                                    Done::Listed {chat,result}
+                                });
+                            }
+                            (input.accept)(true);
+                        }
+                        continue;
+                    }
+                    if let Ok(bridge_core::command::Command::Resume(target)) = bridge_core::command::Command::parse(text) {
+                        if let Some(thread) = target {
+                            if !sessions::valid_thread_id(&thread) {
+                                tell(&delivery, &input.chat, "会话 ID 无效，请复制 /resume 列表中的完整命令。")?;
+                                (input.accept)(true); continue;
+                            }
+                            if !scheduler.begin_session_mutation() {
+                                tell(&delivery, &input.chat, "有任务执行中、排队或会话正在更新；请等待完成或先 /stop，再恢复会话。")?;
+                                (input.accept)(true); continue;
+                            }
+                            let store = store.clone();
+                            jobs.spawn(async move {
+                                let result = store.claim(input.id.clone()).await.map_err(|_| ());
+                                Done::ResumeClaim { input, session, thread, result }
+                            });
+                        } else {
+                            if !seen_commands.contains_key(&input.id) {
+                                if seen_commands.len() >= 1000 {seen_commands.clear();}
+                                seen_commands.insert(input.id.clone(), Instant::now());
+                                let backend = backend.clone(); let chat = input.chat.clone();
+                                jobs.spawn(async move {Done::Listed {chat, result: sessions::list(backend.as_ref(), &session).await}});
+                            }
+                            (input.accept)(true);
+                        }
+                        continue;
+                    }
                     if text == "/new" {
                         if !scheduler.begin_session_mutation() {
                             tell(&delivery, &input.chat, "有任务执行中、排队或会话正在更新；请等待完成或先 /stop，再发送 /new。")?;
@@ -224,7 +334,7 @@ pub async fn run(
                             if seen_commands.len() >= 1000 {seen_commands.clear();}
                             seen_commands.insert(input.id.clone(), Instant::now());
                             match text {
-                                "/help" => tell(&delivery, &input.chat, "Rust 最小运行版：发送文本开始任务。\n/status 查看状态\n/stop 停止自己的任务及排队请求\n/new 全局空闲时新建自己的会话\n当前暂不支持附件、卡片操作和其他命令。")?,
+                                "/help" => tell(&delivery, &input.chat, "Rust 最小运行版：发送文本开始任务。\n/status 查看状态\n/stop 停止自己的任务及排队请求\n/new 全局空闲时新建自己的会话\n/resume 查看当前目录会话\n/resume <ID> 全局空闲时恢复会话\n/models 列出模型\n/model [ID|default] 查看或设置模型\n/plan [on|off] 查看或设置 Plan 模式\n设置修改需全局空闲；当前暂不支持附件和卡片操作。")?,
                                 "/status" => {
                                     let state = active.as_ref().map(|a| format!("运行中，已用 {} 秒{}", a.started.elapsed().as_secs(), if a.stopping {"，正在停止"} else {""})).unwrap_or_else(|| "空闲".into());
                                     tell(&delivery, &input.chat, format!("Rust 最小运行版：{state}\n等待：{}，保存中：{}", scheduler.queued(), scheduler.pending_admissions()))?;
@@ -241,7 +351,7 @@ pub async fn run(
                                     }
                                     tell(&delivery, &input.chat, format!("已取消 {removed} 项等待请求；{}", if stopping {"已请求停止当前任务"} else {"没有可停止的当前任务"}))?;
                                 }
-                                _ => tell(&delivery, &input.chat, "当前最小版仅支持文本任务、/help、/status、/stop、/new。")?,
+                                _ => tell(&delivery, &input.chat, "命令暂不支持或参数无效，请发送 /help 查看支持的命令。")?,
                             }
                         }
                         (input.accept)(true);
@@ -258,6 +368,38 @@ pub async fn run(
                 done = jobs.join_next(), if !jobs.is_empty() => {
                     let done=done.ok_or("后台任务集合异常")?.map_err(|_|"后台任务异常退出")?;
                     match done {
+                        Done::PreferenceClaim {input,session,change,result} => match result {
+                            Ok(true) => {
+                                (input.accept)(true);let backend=backend.clone();let store=store.clone();
+                                jobs.spawn(async move {Done::PreferenceChanged {chat:input.chat,result:sessions::change_preference(backend.as_ref(),store.as_ref(),session,change).await}});
+                            }
+                            Ok(false) => {scheduler.end_session_mutation();(input.accept)(true);}
+                            Err(()) => {scheduler.end_session_mutation();(input.accept)(false);tell(&delivery,&input.chat,"设置请求保存失败，请重新发送。")?;}
+                        },
+                        Done::PreferenceChanged {chat,result} => {
+                            scheduler.end_session_mutation();
+                            tell(&delivery,&chat,match result {Ok(())=>"设置已保存，后续任务生效。使用 /model 或 /plan 查看。".into(),Err(error)=>format!("设置失败：{error}；模型请从 /models 选择。不会自动重试，请检查后重新发送。")})?;
+                        }
+                        Done::ResumeClaim {input,session,thread,result} => {
+                            match result {
+                                Ok(true) => {
+                                    (input.accept)(true);
+                                    let backend = backend.clone(); let store = store.clone();
+                                    jobs.spawn(async move {Done::SessionChanged {chat: input.chat, result: sessions::resume(backend.as_ref(), store.as_ref(), session, thread).await}});
+                                }
+                                Ok(false) => {scheduler.end_session_mutation();(input.accept)(true);}
+                                Err(()) => {scheduler.end_session_mutation();(input.accept)(false);tell(&delivery,&input.chat,"恢复请求保存失败，未切换会话；请重新发送。")?;}
+                            }
+                        }
+                        Done::SessionChanged {chat,result} => {
+                            scheduler.end_session_mutation();
+                            let text = match result {
+                                Ok(()) => "会话已恢复，下次提问将继续该会话。".into(),
+                                Err(error) => format!("恢复会话失败：{error}。目标必须属于当前目录且处于空闲状态；不会自动重试，请检查后重新发送。"),
+                            };
+                            tell(&delivery,&chat,text)?;
+                        }
+                        Done::Listed {chat,result} => tell(&delivery,&chat,result.unwrap_or_else(|error|format!("读取会话列表失败：{error}")))?,
                         Done::Reset {input,result} => {
                             scheduler.end_session_mutation();
                             match result {

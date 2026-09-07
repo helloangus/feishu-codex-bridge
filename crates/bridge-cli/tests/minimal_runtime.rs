@@ -81,12 +81,17 @@ for line in sys.stdin:
     method=m.get('method')
     if method=='initialized':continue
     if method=='initialize':result={}
-    elif method=='model/list':result={'data':[{'id':'model','isDefault':True}]}
+    elif method=='model/list':result={'data':[{'id':'model','isDefault':True},{'id':'selected','isDefault':False}]}
     elif method in ('thread/start','thread/resume'):result={'thread':{'id':'thread','cwd':os.getcwd()}}
+    elif method=='thread/read':result={'thread':{'id':'thread','cwd':os.getcwd(),'status':{'type':'idle'}}}
+    elif method=='thread/list':result={'data':[{'id':'thread','cwd':os.getcwd(),'title':'local session'}, {'id':'foreign','cwd':'/foreign','title':'must not display'}]}
     elif method=='turn/start':
         turn+=1
+        assert m['params']['model']=='selected', m
+        assert m['params']['collaborationMode']['mode']=='plan', m
         if turn==1:
             emit({'method':'item/agentMessage/delta','params':{'threadId':'thread','turnId':'1','itemId':'i','delta':'fake answer'}})
+            emit({'method':'item/completed','params':{'threadId':'thread','turnId':'1','item':{'id':'plan','type':'plan','text':'authoritative plan'}}})
             emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'1','status':'completed'}}})
         result={'turn':{'id':str(turn)}}
     elif method=='turn/interrupt':
@@ -114,8 +119,20 @@ for line in sys.stdin:
         });
         let worker=tokio::spawn(runtime::run(runtime::Settings {directory:temp.path().into(),allowed:BTreeSet::from(["allowed".into(),"other-allowed".into()]),open_access:false,sandbox:bridge_app::ports::Sandbox::WorkspaceWrite,epoch:9},backend,store.clone(),Arc::new(Messages(messages)),input_rx,event_rx,cancel.clone()));
         send(&input_tx,"unauthorized","stranger","hello").await?;
+        send(&input_tx,"models","allowed","/models").await?;
+        until(&mut output,"/model selected").await?;
+        send(&input_tx,"bad-model","allowed","/model nonexistent").await?;
+        until(&mut output,"设置失败").await?;
+        send(&input_tx,"model","allowed","/model selected").await?;
+        until(&mut output,"设置已保存").await?;
+        send(&input_tx,"plan-on","allowed","/plan on").await?;
+        until(&mut output,"设置已保存").await?;
+        send(&input_tx,"plan-query","allowed","/plan").await?;
+        until(&mut output,"已开启").await?;
         send(&input_tx,"one","allowed","hello").await?;
-        assert!(until(&mut output,"执行完成").await?.contains("fake answer"));
+        let completed=until(&mut output,"执行完成").await?;
+        assert!(completed.contains("authoritative plan"));
+        assert!(!completed.contains("fake answer"));
         send(&input_tx,"two","allowed","keep working").await?;
         until(&mut output,"已开始执行").await?;
         // The fake writes this only after receiving turn/start and flushing its
@@ -125,6 +142,10 @@ for line in sys.stdin:
         }
         send(&input_tx,"busy-new","allowed","/new").await?;
         until(&mut output,"有任务执行中").await?;
+        send(&input_tx,"busy-plan","allowed","/plan off").await?;
+        until(&mut output,"有任务执行中").await?;
+        send(&input_tx,"busy-resume","allowed","/resume thread").await?;
+        until(&mut output,"有任务执行中").await?;
         assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("thread".into()));
         send(&input_tx,"other-stop","other-allowed","/stop").await?;
         until(&mut output,"没有可停止的当前任务").await?;
@@ -133,6 +154,28 @@ for line in sys.stdin:
         assert!(!tokio::fs::try_exists(temp.path().join("interrupts.jsonl")).await?);
         send(&input_tx,"stop","allowed","/stop").await?;
         until(&mut output,"任务已停止").await?;
+        send(&input_tx,"list","allowed","/resume").await?;
+        let listing=until(&mut output,"/resume thread").await?;
+        assert!(!listing.contains("foreign"));
+        send(&input_tx,"idle-new","allowed","/new").await?;
+        until(&mut output,"下次提问时自动创建").await?;
+        send(&input_tx,"resume","allowed","/resume thread").await?;
+        until(&mut output,"会话已恢复").await?;
+        assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("thread".into()));
+        // A replay cannot restore an old binding over a newer local selection.
+        store.bind(bridge_core::SessionKey::new("allowed",temp.path()),"newer".into()).await?;
+        send(&input_tx,"resume","allowed","/resume thread").await?;
+        send(&input_tx,"after-replay","allowed","/status").await?;
+        until(&mut output,"空闲").await?;
+        assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("newer".into()));
+        send(&input_tx,"plan-off","allowed","/plan off").await?;
+        until(&mut output,"设置已保存").await?;
+        send(&input_tx,"plan-on","allowed","/plan on").await?;
+        send(&input_tx,"default-model","allowed","/model default").await?;
+        until(&mut output,"设置已保存").await?;
+        let preferences=store.preferences(bridge_core::SessionKey::new("allowed",temp.path())).await?;
+        assert!(!preferences.plan,"old command replay must not re-enable Plan");
+        assert!(preferences.model.is_none());
         cancel.cancel();worker.await?.map_err(|e|->Box<dyn Error>{e.into()})?;source.await??;
         let trace=std::fs::read_to_string(temp.path().join("interrupts.jsonl"))?;
         let interrupts:Vec<serde_json::Value>=trace.lines().map(serde_json::from_str).collect::<Result<_,_>>()?;
