@@ -2,6 +2,7 @@
 use bridge_app::{
     messaging::{DeliveryFuture, MessageId, Messenger, ResourceKind},
     runtime::{self, Input},
+    sessions::SessionStore,
 };
 use bridge_codex::process::AppServer;
 use bridge_core::view::Panel;
@@ -111,7 +112,7 @@ for line in sys.stdin:
             loop {let event=tokio::select! {_=stop.cancelled()=>break,event=server.next_event()=>event};if event_tx.send(event).await.is_err(){break;}}
             server.shutdown().await
         });
-        let worker=tokio::spawn(runtime::run(runtime::Settings {directory:temp.path().into(),allowed:BTreeSet::from(["allowed".into(),"other-allowed".into()]),open_access:false,sandbox:bridge_app::ports::Sandbox::WorkspaceWrite,epoch:9},backend,store,Arc::new(Messages(messages)),input_rx,event_rx,cancel.clone()));
+        let worker=tokio::spawn(runtime::run(runtime::Settings {directory:temp.path().into(),allowed:BTreeSet::from(["allowed".into(),"other-allowed".into()]),open_access:false,sandbox:bridge_app::ports::Sandbox::WorkspaceWrite,epoch:9},backend,store.clone(),Arc::new(Messages(messages)),input_rx,event_rx,cancel.clone()));
         send(&input_tx,"unauthorized","stranger","hello").await?;
         send(&input_tx,"one","allowed","hello").await?;
         assert!(until(&mut output,"执行完成").await?.contains("fake answer"));
@@ -122,6 +123,9 @@ for line in sys.stdin:
         while !tokio::fs::try_exists(temp.path().join("started")).await? {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        send(&input_tx,"busy-new","allowed","/new").await?;
+        until(&mut output,"有任务执行中").await?;
+        assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("thread".into()));
         send(&input_tx,"other-stop","other-allowed","/stop").await?;
         until(&mut output,"没有可停止的当前任务").await?;
         send(&input_tx,"status","allowed","/status").await?;

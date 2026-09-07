@@ -14,6 +14,8 @@ pub type StoreFuture<'a, T> =
 pub trait SessionStore: Send + Sync {
     fn thread(&self, session: SessionKey) -> StoreFuture<'_, Option<String>>;
     fn bind(&self, session: SessionKey, thread: String) -> StoreFuture<'_, ()>;
+    /// Remove only this user's directory binding; never archive the backend thread.
+    fn clear(&self, session: SessionKey) -> StoreFuture<'_, ()>;
 }
 
 /// Async counterpart of the offline MessageJournal. True means durable claim;

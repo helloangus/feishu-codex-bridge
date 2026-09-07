@@ -55,6 +55,17 @@ fn key(session: &SessionKey) -> Result<String, SessionStoreError> {
 }
 
 impl SessionStore for AsyncState {
+    fn clear(&self, session: SessionKey) -> StoreFuture<'_, ()> {
+        Box::pin(async move {
+            let key = key(&session)?;
+            self.run(move |store| {
+                let mut next = store.state().clone();
+                next.sessions.remove(&key);
+                store.replace(next).map_err(|_| SessionStoreError)
+            })
+            .await
+        })
+    }
     fn thread(&self, session: SessionKey) -> StoreFuture<'_, Option<String>> {
         Box::pin(async move {
             let key = key(&session)?;
@@ -91,6 +102,41 @@ impl DurableJournal for AsyncState {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn clear_is_scoped_and_survives_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        let own = SessionKey::new("one", "/tmp/project");
+        let other_user = SessionKey::new("two", "/tmp/project");
+        let other_directory = SessionKey::new("one", "/tmp/other");
+        for session in [&own, &other_user, &other_directory] {
+            store.bind(session.clone(), "thread".into()).await?;
+        }
+        store.clear(own.clone()).await?;
+        drop(store);
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        assert_eq!(store.thread(own.clone()).await?, None);
+        assert_eq!(store.thread(other_user).await?, Some("thread".into()));
+        assert_eq!(store.thread(other_directory).await?, Some("thread".into()));
+        store.clear(own).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_failure_preserves_existing_binding() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        let own = SessionKey::new("one", "/tmp/project");
+        store.bind(own.clone(), "thread".into()).await?;
+        std::fs::create_dir(temp.path().join("state.previous.json"))?;
+        assert!(store.clear(own.clone()).await.is_err());
+        assert_eq!(store.thread(own.clone()).await?, Some("thread".into()));
+        drop(store);
+        let store = AsyncState::new(JsonStore::open(temp.path())?);
+        assert_eq!(store.thread(own).await?, Some("thread".into()));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn concurrent_bindings_survive_reopening() -> Result<(), Box<dyn std::error::Error>> {

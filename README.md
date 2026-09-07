@@ -190,7 +190,7 @@ python -m unittest discover -s tests -v
 
 ## Rust 重构（进行中）
 
-已建立 Cargo workspace、核心状态机、有界调度、JSON 存储与迁移工具，并提供 `bridge run --config bridge.toml` 前台最小版：Rust 处理授权文本、Codex 执行、回复、状态和停止，Python 仅运行 SDK 长连接。使用方式和限制见 [最小运行版](docs/minimal-runtime.md)。现有生产服务继续通过 `start.sh` 管理。
+已建立 Cargo workspace、核心状态机、有界调度、JSON 存储与迁移工具，并提供 `bridge run --config bridge.toml` 前台最小版：Rust 处理授权文本、Codex 执行、回复、状态、停止和 `/new`，Python 仅运行 SDK 长连接。使用方式和限制见 [最小运行版](docs/minimal-runtime.md)。Python 服务入口仍为 `start.sh`，Rust 前台入口单独运行，两者使用同一 App ID 锁互斥。
 
 详见 [Rust 实施方案与进度](docs/rust-refactor.md) 和 [迁移工具使用说明](docs/migration.md)。开发验证：`cargo test --workspace --locked`，然后运行既有 Python 回归。
 

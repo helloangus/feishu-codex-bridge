@@ -19,7 +19,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
-    /// 前台运行最小版（授权文本、状态、停止；需要 Python SDK 薄进程）。
+    /// 前台运行最小版（授权文本、状态、停止、新会话；需要 Python SDK 薄进程）。
     Run {
         #[arg(long)]
         config: PathBuf,
