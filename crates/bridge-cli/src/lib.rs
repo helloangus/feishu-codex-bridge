@@ -13,6 +13,16 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub access: AccessConfig,
     pub codex: CodexConfig,
+    pub feishu: Option<FeishuConfig>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeishuConfig {
+    pub app_id_env: String,
+    pub app_secret_env: String,
+    pub python: PathBuf,
+    pub adapter: PathBuf,
+    pub proxy_env: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +31,8 @@ pub struct WorkspaceConfig {
     pub cwd: PathBuf,
     pub state_dir: PathBuf,
 }
+
+pub mod bootstrap;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessConfig {

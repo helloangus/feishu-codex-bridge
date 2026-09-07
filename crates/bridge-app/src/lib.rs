@@ -1,6 +1,6 @@
 //! Application boundaries and bounded serial admission. No vendor SDK types.
 use bridge_core::{SessionKey, task::TaskSpec};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
 
 /// Durable acceptance is deliberately separate from executing side effects.
@@ -18,6 +18,8 @@ pub enum AdmissionError<E> {
     SessionMutation,
     #[error("消息 ID 不能为空")]
     MissingId,
+    #[error("该消息正在保存接收状态")]
+    Pending,
     #[error("消息状态保存失败")]
     Persistence(E),
 }
@@ -28,7 +30,13 @@ pub struct Scheduler {
     queue: VecDeque<TaskSpec>,
     active: Option<TaskSpec>,
     mutating: bool,
+    pending: BTreeMap<u64, (String, TaskSpec, Option<bool>)>,
+    next_admission: u64,
 }
+
+/// Opaque identity for a pending disk operation. The owner must commit or abort
+/// it when the supervised storage operation finishes, including cancellation.
+pub struct AdmissionTicket(u64);
 
 impl Scheduler {
     pub fn new(capacity: usize) -> Self {
@@ -37,6 +45,8 @@ impl Scheduler {
             queue: VecDeque::new(),
             active: None,
             mutating: false,
+            pending: BTreeMap::new(),
+            next_admission: 0,
         }
     }
 
@@ -52,8 +62,11 @@ impl Scheduler {
         if self.mutating {
             return Err(AdmissionError::SessionMutation);
         }
-        if self.queue.len() >= self.capacity {
+        if self.queue.len() + self.pending.len() >= self.capacity {
             return Err(AdmissionError::Full);
+        }
+        if !self.pending.is_empty() {
+            return Err(AdmissionError::Pending);
         }
         if !journal
             .claim_message(message)
@@ -63,6 +76,60 @@ impl Scheduler {
         }
         self.queue.push_back(task);
         Ok(true)
+    }
+
+    /// Reserve bounded capacity synchronously, then perform disk I/O outside
+    /// this state owner. Stop and status remain available while persistence runs.
+    pub fn reserve(
+        &mut self,
+        message: String,
+        task: TaskSpec,
+    ) -> Result<AdmissionTicket, AdmissionError<()>> {
+        if message.is_empty() {
+            return Err(AdmissionError::MissingId);
+        }
+        if self.mutating {
+            return Err(AdmissionError::SessionMutation);
+        }
+        if self.pending.values().any(|(id, _, _)| id == &message) {
+            return Err(AdmissionError::Pending);
+        }
+        if self.queue.len() + self.pending.len() >= self.capacity {
+            return Err(AdmissionError::Full);
+        }
+        let id = self.next_admission;
+        self.next_admission = id.checked_add(1).ok_or(AdmissionError::Full)?;
+        self.pending.insert(id, (message, task, None));
+        Ok(AdmissionTicket(id))
+    }
+
+    /// Call only with the result of the journal claim. An absent ticket may have
+    /// been cancelled by the user; its late disk completion cannot enqueue work.
+    pub fn commit_admission(&mut self, ticket: AdmissionTicket, newly_claimed: bool) -> bool {
+        if let Some((_, _, ready)) = self.pending.get_mut(&ticket.0) {
+            *ready = Some(newly_claimed);
+            self.drain_admissions();
+            return newly_claimed;
+        }
+        false
+    }
+
+    pub fn abort_admission(&mut self, ticket: AdmissionTicket) {
+        self.pending.remove(&ticket.0);
+        self.drain_admissions();
+    }
+
+    fn drain_admissions(&mut self) {
+        // Disk jobs may finish out of order; preserve original admission FIFO.
+        while self
+            .pending
+            .first_key_value()
+            .is_some_and(|(_, (_, _, ready))| ready.is_some())
+        {
+            if let Some((_, (_, task, Some(true)))) = self.pending.pop_first() {
+                self.queue.push_back(task);
+            }
+        }
     }
 
     pub fn start_next(&mut self) -> Option<&TaskSpec> {
@@ -83,13 +150,20 @@ impl Scheduler {
     }
 
     pub fn cancel_queued(&mut self, session: &SessionKey) -> usize {
-        let before = self.queue.len();
+        let before = self.queue.len() + self.pending.len();
         self.queue.retain(|task| &task.session != session);
-        before - self.queue.len()
+        self.pending
+            .retain(|_, (_, task, _)| &task.session != session);
+        self.drain_admissions();
+        before - self.queue.len() - self.pending.len()
     }
 
     pub fn begin_session_mutation(&mut self) -> bool {
-        if self.mutating || self.active.is_some() || !self.queue.is_empty() {
+        if self.mutating
+            || self.active.is_some()
+            || !self.queue.is_empty()
+            || !self.pending.is_empty()
+        {
             return false;
         }
         self.mutating = true;
@@ -101,6 +175,9 @@ impl Scheduler {
     }
     pub fn queued(&self) -> usize {
         self.queue.len()
+    }
+    pub fn pending_admissions(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -191,6 +268,41 @@ mod tests {
         );
         assert_eq!(scheduler.cancel_queued(&task("1").session), 1);
     }
+
+    #[test]
+    fn asynchronous_claims_preserve_fifo_when_disk_results_arrive_out_of_order()
+    -> Result<(), AdmissionError<()>> {
+        let mut scheduler = Scheduler::new(2);
+        let first = scheduler.reserve("m1".into(), task("1"))?;
+        let second = scheduler.reserve("m2".into(), task("2"))?;
+        assert!(matches!(
+            scheduler.reserve("m3".into(), task("3")),
+            Err(AdmissionError::Full)
+        ));
+        assert!(!scheduler.begin_session_mutation());
+        assert!(scheduler.commit_admission(second, true));
+        assert!(scheduler.start_next().is_none());
+        assert!(scheduler.commit_admission(first, true));
+        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("1"));
+        assert!(scheduler.finish("1"));
+        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("2"));
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_and_failed_claim_never_enqueue_late_work() -> Result<(), AdmissionError<()>> {
+        let mut scheduler = Scheduler::new(2);
+        let first = scheduler.reserve("m1".into(), task("1"))?;
+        assert_eq!(scheduler.cancel_queued(&task("1").session), 1);
+        assert!(!scheduler.commit_admission(first, true));
+        let second = scheduler.reserve("m2".into(), task("2"))?;
+        scheduler.abort_admission(second);
+        let duplicate = scheduler.reserve("m3".into(), task("3"))?;
+        assert!(!scheduler.commit_admission(duplicate, false));
+        assert!(scheduler.start_next().is_none());
+        assert!(scheduler.begin_session_mutation());
+        Ok(())
+    }
 }
 
 pub mod messaging;
@@ -203,3 +315,5 @@ pub mod requests;
 pub mod interactions;
 
 pub mod execution;
+pub mod runtime;
+pub mod sessions;

@@ -16,6 +16,14 @@ clap.workspace = true
 serde.workspace = true
 toml.workspace = true
 serde_json.workspace = true
+bridge-app.workspace = true
+bridge-codex.workspace = true
+bridge-feishu.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+fs2.workspace = true
+sha2.workspace = true
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

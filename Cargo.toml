@@ -20,15 +20,16 @@ http = "1"
 thiserror = "2"
 tempfile = "3"
 fs2 = "0.4"
+sha2 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "socks", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "process", "fs", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time", "process", "fs", "net", "signal"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 walkdir = "2"
 similar = "2.7"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

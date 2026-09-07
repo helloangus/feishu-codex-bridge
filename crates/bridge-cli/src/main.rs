@@ -19,6 +19,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// 前台运行最小版（授权文本、状态、停止；需要 Python SDK 薄进程）。
+    Run {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// 检查显式 TOML 配置；不读取 .env 或连接外部服务。
     Config {
         #[command(subcommand)]
@@ -70,6 +75,14 @@ enum MigrationAction {
 }
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        Action::Run { config } => {
+            let config = Config::read(&config).map_err(|_| "配置无法读取或 TOML 格式无效")?;
+            config.validate()?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(bridge_cli::bootstrap::run(config))?;
+        }
         Action::Config {
             command: ConfigAction::Check { file },
         } => {

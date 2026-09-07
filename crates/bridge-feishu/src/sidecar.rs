@@ -54,6 +54,7 @@ where
     let mut sequence = 0_u64;
     loop {
         let frame = tokio::select! {
+            biased;
             _=cancel.cancelled()=>return Ok(()),
             frame=lines.next()=>frame.ok_or(SidecarError::Disconnected)?.map_err(|_|SidecarError::Invalid)?,
         };

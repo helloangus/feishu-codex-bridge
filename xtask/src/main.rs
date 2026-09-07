@@ -19,8 +19,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         let name = package["name"].as_str().ok_or("missing package name")?;
         let allowed: &[&str] = match name {
             "bridge-core" => &["thiserror"],
-            "bridge-app" => &["bridge-core", "thiserror"],
+            "bridge-app" => &["bridge-core", "thiserror", "tokio", "tokio-util"],
             "bridge-local" => &[
+                "tokio",
                 "bridge-core",
                 "bridge-app",
                 "serde",
@@ -44,6 +45,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "futures-util",
             ],
             "bridge-codex" => &[
+                "rustix",
                 "bridge-core",
                 "bridge-app",
                 "serde",

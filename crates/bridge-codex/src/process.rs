@@ -13,6 +13,15 @@ use tokio::{
 pub struct AppServer {
     pub connection: Connection,
     child: Child,
+    group: Option<rustix::process::Pid>,
+}
+
+impl Drop for AppServer {
+    fn drop(&mut self) {
+        if let Some(group) = self.group.take() {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
 }
 
 impl AppServer {
@@ -31,11 +40,21 @@ impl AppServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        command.process_group(0);
         let mut child = command.spawn().map_err(|_| BackendError::Disconnected)?;
+        let group = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .filter(|id| *id > 1)
+            .and_then(rustix::process::Pid::from_raw);
         let input = child.stdin.take().ok_or(BackendError::Disconnected)?;
         let output = child.stdout.take().ok_or(BackendError::Disconnected)?;
         let connection = Connection::new(output, input, epoch, 8 * 1024 * 1024);
-        let mut server = Self { connection, child };
+        let mut server = Self {
+            connection,
+            child,
+            group,
+        };
         if let Err(error) = CodexBackend::new(server.connection.client.clone())
             .initialize()
             .await
@@ -47,9 +66,18 @@ impl AppServer {
     }
 
     /// Close stdin first, then kill and reap this owned child if it won't exit.
-    /// Full process-group supervision is provided by the service migration.
+    /// The child has its own process group; tools remaining after stdin closes
+    /// are terminated too, without signaling the bridge's process group.
     pub async fn shutdown(&mut self) -> io::Result<()> {
         let _ = self.connection.shutdown().await;
+        if let Some(group) = self.group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::TERM);
+        }
+        // Keep the unreaped child identity reserved while cleaning its group.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(group) = self.group.take() {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
         match timeout(Duration::from_secs(2), self.child.wait()).await {
             Ok(result) => {
                 result?;
@@ -103,10 +131,16 @@ impl AppServer {
         CodexBackend::new(self.connection.client.clone())
     }
     pub fn is_disconnected(&mut self) -> Result<bool, RpcError> {
-        Ok(self
+        let exited = self
             .child
             .try_wait()
             .map_err(|_| RpcError::Closed)?
-            .is_some())
+            .is_some();
+        if exited {
+            if let Some(group) = self.group.take() {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+            }
+        }
+        Ok(exited)
     }
 }

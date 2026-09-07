@@ -70,3 +70,35 @@ for line in sys.stdin:
     }).await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn shutdown_terminates_tools_in_owned_process_group() -> Result<(), Box<dyn std::error::Error>>
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let temp=tempfile::tempdir()?;
+        let script=temp.path().join("parent.py");
+        let pid_file=temp.path().join("tool.pid");
+        std::fs::write(&script,r#"
+import json,sys,subprocess,signal
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+tool=subprocess.Popen([sys.executable,'-u','-c','import signal,time; signal.signal(signal.SIGTERM,signal.SIG_DFL); print("ready",flush=True); time.sleep(30)'],stdout=subprocess.PIPE,text=True)
+assert tool.stdout.readline().strip()=='ready'
+with open(sys.argv[1],'w') as out: out.write(str(tool.pid))
+try:
+    for line in sys.stdin:
+        message=json.loads(line)
+        if 'id' in message: print(json.dumps({'id':message['id'],'result':{}}),flush=True)
+finally:
+    tool.wait()
+"#)?;
+        let args=vec!["-I".into(),"-u".into(),script.to_string_lossy().into_owned(),pid_file.to_string_lossy().into_owned()];
+        let mut server=AppServer::spawn(Path::new("python3"),&args,temp.path(),7).await?;
+        let pid=std::fs::read_to_string(pid_file)?.parse::<i32>()?;
+        let pid=rustix::process::Pid::from_raw(pid).ok_or("invalid tool pid")?;
+        assert!(rustix::process::test_kill_process(pid).is_ok());
+        server.shutdown().await?;
+        assert!(rustix::process::test_kill_process(pid).is_err());
+        Ok::<_,Box<dyn std::error::Error>>(())
+    }).await??;
+    Ok(())
+}

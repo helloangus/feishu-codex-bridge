@@ -14,3 +14,11 @@ allowed_open_ids = ["ou_replace_me"]
 executable = "codex"
 args = ["app-server", "--enable", "collaboration_modes"]
 sandbox = "workspaceWrite"
+
+# Required by `bridge run`; use an independent test bot for initial validation.
+[feishu]
+app_id_env = "FEISHU_APP_ID"
+app_secret_env = "FEISHU_APP_SECRET"
+python = "/absolute/feishu-codex-bridge/.venv/bin/python"
+adapter = "/absolute/feishu-codex-bridge/compat/feishu-sdk/adapter.py"
+# proxy_env = "FEISHU_PROXY_URL"

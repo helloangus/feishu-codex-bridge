@@ -101,7 +101,7 @@
 - [ ] P4 Rust 飞书长连接、代理矩阵、Termux 实机与手机验收。
 - [ ] P5 Rust supervisor、日志/健康、打包发布、持续运行和生产回退演练。
 
-没有切换、重启或更改现有生产服务配置。当前 Rust 二进制不能替代 bridge.py。
+没有切换、重启或更改现有生产服务配置。Rust 前台最小版仍不能完整替代 bridge.py。
 
 2026-09-07：39 项 Rust 与 54 项 Python 回归通过；Android 检查受 ring 所需 C/汇编编译器的 proot 包装故障阻塞，尚未通过当前完整 workspace 的 Android 验证。SDK ACK 持久化确认和主循环仍待实现。
 
@@ -119,3 +119,22 @@
 - [x] P3：SDK 等待 Rust 接受确认后应答，超时/队列满失败；Rust 有界 IPC pump、一次性确认句柄和首次连接生命周期通知。
 - [ ] 将上述端口接入完整业务 actor、耐久认领与 supervisor；目前 ACK 接口测试通过并不代表生产持久化链路已完成。
 - [ ] Codex additionalPermissions/networkApprovalContext 暂安全拒绝，需补完整权限展示及契约才开放；不能视为审批功能全覆盖。
+
+- [x] P3 会话准备：新建/恢复成功后先耐久保存绑定，再启动 turn；恢复 ID 不匹配拒绝执行，保存失败不启动，执行失败保留绑定且不重试。
+- [x] JSON 异步访问：最多两个阻塞任务、同一存储锁串行提交；调用者取消不打断已经开始的耐久写入。
+- [x] 异步接收预留/提交：磁盘完成乱序仍保持 FIFO；容量包含待保存项，取消后迟到的保存结果不复活任务。
+- [ ] 完整运行 actor 仍待装配；新增跨 crate 测试连接 IPC、真实 JSON 去重和调度，不能替代生产接收与 supervisor 验收。
+
+## 优先交付：前台最小运行版
+
+- [x] `bridge run --config`：Rust 业务、Codex 适配、飞书 REST 与 Python SDK 薄进程装配。
+- [x] 白名单文本任务、串行队列、耐久认领、会话连续、纯文本结果、/help、/status、/stop。
+- [x] 明确拒绝尚未开放的人工审批，问题返回空答案；不自动批准、不自动重放任务。
+- [x] 复用 Python App ID 全局锁、处理 Ctrl-C/TERM、关闭 SDK 和 Codex 进程组。
+- [x] 最小 actor 离线集成测试与使用文档 `docs/minimal-runtime.md`。
+- [ ] 独立飞书机器人真实运行验收；原生 Android/Termux 构建与运行验证仍待完成。
+- [ ] 后续恢复完整命令、卡片/审批/问答界面、附件/Plan 和完整 supervisor；不扩大本次最小版范围。
+
+检查点（按用户额度安排暂停）：70 项 Rust 测试、58 项 Python 测试通过；fmt、Clippy（-D warnings）、依赖边界、rustdoc（-D warnings）与 diff 空白检查通过。最小版 CLI 已构建并验证帮助入口，尚未进行真实飞书/Codex 联调或切换生产服务。本批改动保留在 development 工作区，尚未提交或推送；下一步优先按 `docs/minimal-runtime.md` 完成独立机器人验收。
+
+- [x] 停止测试收尾：等待 fake Codex 收到第二个 `turn/start` 并发出响应后再测试停止；同一聊天中另一位已授权用户停止无效，任务仍运行；所属用户停止后必须收到中断完成，RPC 记录严格为一次指定 thread/turn 的 `turn/interrupt`，不再接受“准备阶段已停止”作为成功。相关最小运行版集成测试 2 项通过；本次仅加强测试，未修改运行实现。

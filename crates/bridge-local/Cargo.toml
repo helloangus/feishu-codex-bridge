@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+tokio.workspace = true
 bridge-core.workspace = true
 bridge-app.workspace = true
 serde.workspace = true
