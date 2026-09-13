@@ -305,10 +305,13 @@ pub fn models(
             {
                 return None;
             }
-            let suffix = if current == Some(model.id.as_str()) {
+            let bridge_default = model.id == crate::sessions::DEFAULT_MODEL;
+            let suffix = if current == Some(model.id.as_str()) && bridge_default {
+                "（已选择·桥接默认）"
+            } else if current == Some(model.id.as_str()) {
                 "（已选择）"
-            } else if model.is_default {
-                "（默认）"
+            } else if bridge_default {
+                "（桥接默认）"
             } else {
                 ""
             };
@@ -834,12 +837,27 @@ mod tests {
         assert_eq!(thread_commands[0].1, "/resume thread-1");
         assert_eq!(thread_commands[1].1, "/archive thread-1");
 
-        let available_models = vec![crate::ports::Model {
-            id: "gpt-test".into(),
-            is_default: true,
-        }];
-        let (_, model_commands) = super::models(&available_models, Some("gpt-test"), "models");
-        assert_eq!(model_commands[0].1, "/model gpt-test");
+        let available_models = vec![
+            crate::ports::Model {
+                id: "gpt-6-astra".into(),
+                is_default: true,
+            },
+            crate::ports::Model {
+                id: crate::sessions::DEFAULT_MODEL.into(),
+                is_default: false,
+            },
+        ];
+        let (model_card, model_commands) = super::models(
+            &available_models,
+            Some(crate::sessions::DEFAULT_MODEL),
+            "models",
+        );
+        assert_eq!(model_commands[0].1, "/model gpt-6-astra");
+        assert_eq!(model_card.buttons[0].label, "gpt-6-astra");
+        assert_eq!(
+            model_card.buttons[1].label,
+            "gpt-5.6-luna（已选择·桥接默认）"
+        );
         assert_eq!(
             model_commands.last().map(|(_, command)| command.as_str()),
             Some("/models")
