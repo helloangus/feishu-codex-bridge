@@ -29,6 +29,7 @@ class RustProtocolTests(unittest.TestCase):
                 validator.validate(payload)
                 self.assertEqual(payload["approvalPolicy"], "on-request")
                 self.assertFalse(payload["sandboxPolicy"]["networkAccess"])
+                self.assertEqual(payload["sandboxPolicy"]["writableRoots"], [payload["cwd"]])
                 payload["collaborationMode"]["settings"].pop("model")
                 self.assertFalse(validator.is_valid(payload))
 

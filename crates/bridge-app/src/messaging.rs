@@ -36,6 +36,35 @@ pub struct ResourceRef {
 }
 
 pub trait Messenger: Send + Sync {
+    /// Text-only adapters can retain the existing delivery path.
+    fn rich_output(&self) -> bool {
+        false
+    }
+    fn bind_files(&self, _task: String, _thread: String) -> DeliveryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn prepare_files(
+        &self,
+        _task: String,
+        _directory: std::path::PathBuf,
+        attachments: Vec<Attachment>,
+    ) -> DeliveryFuture<'_, PreparedFiles> {
+        Box::pin(async move {
+            if attachments.is_empty() {
+                Ok(PreparedFiles::default())
+            } else {
+                Err(DeliveryError::Incompatible)
+            }
+        })
+    }
+    fn finish_files(
+        &self,
+        _task: String,
+        _chat: String,
+        _directory: std::path::PathBuf,
+    ) -> DeliveryFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     fn send_panel(&self, chat: String, panel: Panel) -> DeliveryFuture<'_, MessageId>;
     fn update_panel(&self, id: MessageId, panel: Panel) -> DeliveryFuture<'_, ()>;
     fn send_text(&self, chat: String, text: String) -> DeliveryFuture<'_, ()>;
@@ -52,4 +81,15 @@ pub trait Messenger: Send + Sync {
 pub trait ResourceFetcher: Send + Sync {
     /// Caller owns the temporary file and commits it only after success.
     fn download(&self, resource: ResourceRef, destination: File) -> DeliveryFuture<'_, u64>;
+}
+
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub resource: ResourceRef,
+    pub name: String,
+}
+#[derive(Default)]
+pub struct PreparedFiles {
+    pub prompt: String,
+    pub images: Vec<std::path::PathBuf>,
 }

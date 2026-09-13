@@ -59,15 +59,16 @@ pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, B
                 return Err(BackendError::Incompatible);
             }
             let command = method == "item/commandExecution/requestApproval";
-            // Don't offer approval while requested permission overlays cannot
-            // yet be faithfully displayed. Unsupported requests get an error.
-            if command
-                && ["additionalPermissions", "networkApprovalContext"]
-                    .iter()
-                    .any(|key| params.get(key).is_some_and(|v| !v.is_null()))
-            {
-                return Err(BackendError::Incompatible);
-            }
+            let (permissions, permissions_supported) = if command {
+                crate::permissions::profile(params.get("additionalPermissions"))?
+            } else {
+                (None, true)
+            };
+            let network_context = if command {
+                crate::permissions::context(params.get("networkApprovalContext"))?
+            } else {
+                None
+            };
             let approval_kind = if command {
                 match text(&params, "kind")?.as_deref().unwrap_or("command") {
                     "command" => ApprovalKind::Command,
@@ -77,17 +78,24 @@ pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, B
             } else {
                 ApprovalKind::FileChange
             };
-            let mut can_allow = true;
+            // Remote execution environments are not represented by this port.
+            let mut can_allow =
+                text(&params, "environmentId")?.is_none() && text(&params, "grantRoot")?.is_none();
+            can_allow &=
+                permissions_supported && network_context.as_ref().is_none_or(|v| v.len() <= 4096);
             if command {
                 if let Some(decisions) = params.get("availableDecisions").filter(|v| !v.is_null()) {
                     let decisions = decisions.as_array().ok_or(BackendError::Incompatible)?;
-                    can_allow = decisions.iter().any(|v| v == "accept");
+                    can_allow &= decisions.iter().any(|v| v == "accept");
                     if !decisions.iter().any(|v| v == "decline") {
                         return Err(BackendError::Incompatible);
                     }
                 }
             }
             RequestKind::Approval(Approval {
+                permissions,
+                network_context,
+                changes: None,
                 kind: approval_kind,
                 command: text(&params, "command")?,
                 directory: text(&params, "cwd")?,
@@ -252,10 +260,60 @@ mod tests {
         restricted["availableDecisions"] = json!(["decline", "acceptForSession"]);
         let request = decode(2, "item/commandExecution/requestApproval", restricted)?;
         assert!(payload(&request.kind, AgentReply::Approve(true)).is_err());
+        let mut remote = approval();
+        remote["environmentId"] = json!("remote");
+        remote["availableDecisions"] = json!(["accept", "decline"]);
+        let request = decode(2, "item/commandExecution/requestApproval", remote)?;
+        assert!(payload(&request.kind, AgentReply::Approve(true)).is_err());
         let mut overlay = approval();
         overlay["additionalPermissions"] = json!({"network":{"enabled":true}});
-        assert!(decode(2, "item/commandExecution/requestApproval", overlay).is_err());
+        let request = decode(2, "item/commandExecution/requestApproval", overlay)?;
+        assert_eq!(
+            payload(&request.kind, AgentReply::Approve(true))?,
+            json!({"decision":"accept"})
+        );
         assert!(decode(2, "future/requestApproval", approval()).is_err());
+        Ok(())
+    }
+    #[test]
+    fn permission_reply_never_emits_session_or_policy_authorization() -> Result<(), BackendError> {
+        for (extra, allowed) in [
+            (
+                json!({"additionalPermissions":{"fileSystem":{"write":["/output"]}},"networkApprovalContext":{"host":"example.test","protocol":"https"}}),
+                true,
+            ),
+            (
+                json!({"additionalPermissions":{"network":{"enabled":false}},"availableDecisions":["acceptForSession","decline"]}),
+                false,
+            ),
+            (
+                json!({"networkApprovalContext":{"host":"x".repeat(4096),"protocol":"http"}}),
+                false,
+            ),
+            (
+                json!({"additionalPermissions":{"fileSystem":{"entries":[{"access":"write","path":{"type":"special","value":{"kind":"unknown","path":"future"}}}]}}}),
+                false,
+            ),
+        ] {
+            let mut params = approval();
+            for (key, value) in extra.as_object().ok_or(BackendError::Incompatible)? {
+                params[key] = value.clone();
+            }
+            params["proposedNetworkPolicyAmendments"] =
+                json!([{"action":"allow","host":"example.test"}]);
+            params["proposedExecpolicyAmendment"] = json!(["echo"]);
+            let request = decode(2, "item/commandExecution/requestApproval", params)?;
+            assert_eq!(
+                payload(&request.kind, AgentReply::Approve(false))?,
+                json!({"decision":"decline"})
+            );
+            let response = payload(&request.kind, AgentReply::Approve(true));
+            if allowed {
+                assert_eq!(response?, json!({"decision":"accept"}));
+            } else {
+                assert!(response.is_err());
+            }
+        }
         Ok(())
     }
     #[test]

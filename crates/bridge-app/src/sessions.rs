@@ -12,6 +12,12 @@ pub type StoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SessionStoreError>> + Send + 'a>>;
 
 pub trait SessionStore: Send + Sync {
+    /// Persist authorization before exposing it to the runtime. Never store code.
+    fn pair(&self, _user: String, _code: String) -> StoreFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
+    /// Archive invalidates every local reference to this backend thread.
+    fn clear_thread(&self, thread: String) -> StoreFuture<'_, ()>;
     fn preferences(&self, session: SessionKey) -> StoreFuture<'_, Preferences>;
     fn set_preference(&self, session: SessionKey, change: PreferenceChange) -> StoreFuture<'_, ()>;
     fn thread(&self, session: SessionKey) -> StoreFuture<'_, Option<String>>;
@@ -73,45 +79,160 @@ pub trait DurableJournal: Send + Sync {
 
 #[derive(Debug, Error)]
 pub enum StartError {
+    #[error("当前目录没有已绑定会话，请先提问或使用 /resume 恢复会话")]
+    NoSession,
+    #[error("归档状态结果不确定；请核对并修复本地会话绑定后再重启，不能直接重发任务")]
+    Reconcile,
     #[error(transparent)]
     Storage(#[from] SessionStoreError),
     #[error(transparent)]
     Backend(#[from] BackendError),
 }
 
+/// Load an existing idle thread after restart without creating or rebinding one.
+/// The caller holds the global mutation slot until compaction's terminal event.
+pub async fn prepare_compaction<S: SessionStore + ?Sized>(
+    backend: &dyn AgentBackend,
+    store: &S,
+    session: SessionKey,
+) -> Result<String, StartError> {
+    let id = store
+        .thread(session.clone())
+        .await?
+        .ok_or(StartError::NoSession)?;
+    if !valid_thread_id(&id) || !session.workspace.is_absolute() || session.user.is_empty() {
+        return Err(BackendError::Incompatible.into());
+    }
+    let before = backend.read_thread(id.clone()).await?;
+    if before.id != id || before.active || before.directory.as_ref() != Some(&session.workspace) {
+        return Err(BackendError::Incompatible.into());
+    }
+    let loaded = backend
+        .resume_thread(id.clone(), session.workspace.clone())
+        .await?;
+    if loaded.id != id || loaded.active || loaded.directory.as_ref() != Some(&session.workspace) {
+        return Err(BackendError::Incompatible.into());
+    }
+    Ok(id)
+}
+
 /// A directory is the legacy visibility boundary, not per-user thread ownership.
-pub async fn list(backend: &dyn AgentBackend, session: &SessionKey) -> Result<String, StartError> {
-    let threads = backend.threads(session.workspace.clone(), false).await?;
+pub async fn list(
+    backend: &dyn AgentBackend,
+    session: &SessionKey,
+    archived: bool,
+) -> Result<String, StartError> {
+    let entries = list_entries(backend, session, archived).await?;
     let mut lines = Vec::new();
-    for thread in threads
-        .into_iter()
-        .filter(|t| t.directory.as_ref() == Some(&session.workspace))
-        .take(8)
-    {
-        if !valid_thread_id(&thread.id) {
-            continue;
-        }
-        let title: String = thread
-            .title
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(160)
-            .collect();
+    for thread in &entries {
+        let title = &thread.title;
         lines.push(format!(
-            "{}{}\n/resume {}",
+            "{}{}\n{} {}{}",
             title,
             if thread.active { "（执行中）" } else { "" },
-            thread.id
+            if archived { "/unarchive" } else { "/resume" },
+            thread.id,
+            if archived {
+                String::new()
+            } else {
+                format!("\n/archive {}", thread.id)
+            }
         ));
     }
     Ok(if lines.is_empty() {
-        "当前目录没有可恢复的会话。".into()
+        if archived {
+            "当前目录没有已归档会话。".into()
+        } else {
+            "当前目录没有可恢复的会话。".into()
+        }
     } else {
         format!(
-            "当前目录最近会话（最多 8 项），复制对应命令恢复：\n\n{}",
+            "当前目录{}会话（最多 8 项），复制对应命令操作：\n\n{}",
+            if archived { "已归档" } else { "最近" },
             lines.join("\n\n")
         )
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedThread {
+    pub id: String,
+    pub title: String,
+    pub active: bool,
+}
+
+pub async fn list_entries(
+    backend: &dyn AgentBackend,
+    session: &SessionKey,
+    archived: bool,
+) -> Result<Vec<ListedThread>, StartError> {
+    Ok(backend
+        .threads(session.workspace.clone(), archived)
+        .await?
+        .into_iter()
+        .filter(|thread| thread.directory.as_ref() == Some(&session.workspace))
+        .filter(|thread| valid_thread_id(&thread.id))
+        .take(8)
+        .map(|thread| ListedThread {
+            id: thread.id,
+            title: thread
+                .title
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect(),
+            active: thread.active,
+        })
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+pub enum ThreadAction {
+    Resume,
+    Archive,
+    Unarchive,
+}
+
+impl ThreadAction {
+    pub fn success(self) -> &'static str {
+        match self {
+            Self::Resume => "会话已恢复，下次提问将继续该会话。",
+            Self::Archive => "会话已归档，相关本地绑定已清除；历史记录保留，可用 /archived 查看。",
+            Self::Unarchive => "已取消归档；当前会话未切换，可用 /resume 查看并恢复。",
+        }
+    }
+}
+
+pub async fn change_thread<S: SessionStore + ?Sized>(
+    backend: &dyn AgentBackend,
+    store: &S,
+    session: SessionKey,
+    id: String,
+    action: ThreadAction,
+) -> Result<(), StartError> {
+    if matches!(action, ThreadAction::Resume) {
+        return resume(backend, store, session, id).await;
+    }
+    if !valid_thread_id(&id) || !session.workspace.is_absolute() || session.user.is_empty() {
+        return Err(BackendError::Incompatible.into());
+    }
+    let before = backend.read_thread(id.clone()).await?;
+    if before.id != id || before.active || before.directory.as_ref() != Some(&session.workspace) {
+        return Err(BackendError::Incompatible.into());
+    }
+    let archived = matches!(action, ThreadAction::Archive);
+    match backend.archive_thread(id.clone(), archived).await {
+        Ok(()) => {}
+        Err(error @ BackendError::Rejected(_)) => return Err(error.into()),
+        Err(_) => return Err(StartError::Reconcile),
+    }
+    if archived {
+        store
+            .clear_thread(id)
+            .await
+            .map_err(|_| StartError::Reconcile)?;
+    }
+    Ok(())
 }
 
 pub fn valid_thread_id(id: &str) -> bool {

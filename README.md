@@ -1,5 +1,7 @@
 # Feishu Codex Bridge
 
+Rust 原生版的配置生成、启停和本机打包入口见 [Rust 部署指南](docs/rust-deployment.md)：`bash setup-rust.sh`、`bash start-rust.sh status`、`bash package-rust.sh`。本批入口待统一验证；下文的 `setup.sh` / `start.sh` 属于保留的 Python 版本。
+
 把运行在 Termux（或兼容 Linux 环境）中的 [Codex app-server](https://developers.openai.com/) 接入飞书机器人。你可以在飞书私聊机器人，让 Codex 在指定工作目录中完成任务、审批操作、接收图片/文件，并把文本、卡片和交付物发回飞书。
 
 这个项目偏向个人或小团队的“手机上的远程 Codex 终端”：服务驻留在你的设备上，代码、会话状态和 Codex 登录态都留在本机。
@@ -190,8 +192,24 @@ python -m unittest discover -s tests -v
 
 ## Rust 重构（进行中）
 
-已建立 Cargo workspace、核心状态机、有界调度、JSON 存储与迁移工具，并提供 `bridge run --config bridge.toml` 前台最小版：Rust 处理授权文本、Codex 执行、回复、状态、停止、会话新建/恢复，以及模型和 Plan 设置，Python 仅运行 SDK 长连接。使用方式和限制见 [最小运行版](docs/minimal-runtime.md)。Python 服务入口仍为 `start.sh`，Rust 前台入口单独运行，两者使用同一 App ID 锁互斥。
+新一批开发待统一验证：Rust `/pair <配对码>` 支持持久化用户授权，配对码通过 `access.pairing_code_env` 指定的环境变量提供。后台 `service start` 增加 Rust 外层守护，配合所属桥接心跳检测、后代清理和有界重启；详见 [运行说明](docs/minimal-runtime.md)。
+
+Rust 状态查询：`target/debug/bridge status --config bridge.toml`。它读取运行锁与最后记录的健康状态，不需要飞书凭据。仅新版 `bridge run` 发布状态；旧快照的 connected 在 `running: false` 时不代表在线。详情见 [运行说明](docs/minimal-runtime.md)。
+
+开发版新增归档通知同步与启动时绑定修复（待统一验证）：收到归档通知后在下一项任务前清理相关绑定；每次启动先分页核对远端归档列表，补偿漏通知及之前未完成的本地清理。查询或保存失败拒绝启动业务，不重放归档或任务，详见 [运行说明](docs/minimal-runtime.md)。
+
+已建立 Cargo workspace、核心状态机、有界调度、JSON 存储与迁移工具，并提供 `bridge run --config bridge.toml` 前台入口。当前开发工作区已接入 Rust 原生飞书长连接，不再启动 Python SDK；代理、TLS、心跳与重连已通过离线专项验证，真实验收和部署尚未进行。使用方式和限制见 [运行说明](docs/minimal-runtime.md)。旧 Python 服务入口仍为 `start.sh`，两种入口使用同一 App ID 锁互斥。
+
+Rust `/help` 控制面板和目录创建确认已支持卡片按钮；按钮绑定用户、聊天、目录和原卡片，10 分钟有效，每个按钮可执行一次。会话和模型列表支持满宽按钮、文字降级和原卡片刷新。命令审批支持同意/拒绝按钮，10 分钟未答复、发送失败或任务停止/结束时拒绝；Rust 审批仅接受卡片点击，不开放文本审批。
+
+额外权限和网络目标审批已开发、待统一验证：卡片展示网络开关、文件读写范围与规则、目标主机及协议，只提供本次同意或拒绝，不保存长期授权。不能完整展示或未知语义的请求不能同意，具体边界见 [运行说明](docs/minimal-runtime.md)。
+
+文件修改审批已支持逐文件差异、移动目标及一次性同意/拒绝。问答仅在 Plan 模式支持逐题选择，以及点击“其他／自行回答”后用专用 `/answer` 命令提交多行答案；普通执行模式不提供问答入口，Plan 模式也不提供跳过；敏感答案不在确认回复中回显。附件支持图片、文件、音视频及富文本内资源，任务结束发送工程文本差异和成果物；当前会话生成图片参与内容去重与每轮 10 项限额。上述新增功能尚待真实飞书验收，详见 [运行说明](docs/minimal-runtime.md)。
 
 详见 [Rust 实施方案与进度](docs/rust-refactor.md) 和 [迁移工具使用说明](docs/migration.md)。开发验证：`cargo test --workspace --locked`，然后运行既有 Python 回归。
+
+Rust Plan 成功完成后提供“确认并实施”“清空上下文后实施”“继续讨论计划”卡片。选择绑定原用户、聊天、目录和会话，10 分钟有效；实施前耐久去重并再次核对会话，旧卡片不能重复启动任务。仅完整计划开放实施，真实飞书验收与部署仍延后。
+
+Rust 最终回答已使用分段 Markdown 卡片，长代码块跨段保留语言；卡片发送失败时按段补发文字。运行期间最多每 3 秒更新耗时与输出预览，结束后发送完整回复。真实飞书展示验收仍延后。
 
 完整 Rust 重构设计基线见 [完整重构计划](docs/plans/rust-refactor-original.md)，实施进度见 [方案与状态](docs/rust-refactor.md)。

@@ -42,12 +42,15 @@ impl FeishuRest {
         max_attachment: u64,
     ) -> Result<Self, DeliveryError> {
         let mut builder = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10));
-        if let Some(proxy) = proxy {
+        let policy = crate::proxy::Policy::from_env(proxy).map_err(|_| DeliveryError::Transport)?;
+        let target = Url::parse("https://open.feishu.cn/").map_err(|_| DeliveryError::Transport)?;
+        if let Some(proxy) = policy.select(&target) {
             builder = builder
                 .no_proxy()
-                .proxy(reqwest::Proxy::all(proxy).map_err(|_| DeliveryError::Transport)?);
+                .proxy(reqwest::Proxy::all(proxy.as_str()).map_err(|_| DeliveryError::Transport)?);
         }
         let http = builder.build().map_err(|_| DeliveryError::Transport)?;
         Self::with_client(

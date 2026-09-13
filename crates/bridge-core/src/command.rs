@@ -6,6 +6,7 @@ pub enum Command {
     Help,
     Status,
     ChangeDirectory(Option<String>),
+    ConfirmDirectory(String),
     New,
     Resume(Option<String>),
     Archive(String),
@@ -53,6 +54,7 @@ impl Command {
             "/help" => no_arg(Self::Help),
             "/status" => no_arg(Self::Status),
             "/cd" => Ok(Self::ChangeDirectory(optional())),
+            "/cd-confirm" => Ok(Self::ConfirmDirectory(required()?)),
             "/new" => no_arg(Self::New),
             "/resume" => Ok(Self::Resume(optional())),
             "/archive" => Ok(Self::Archive(required()?)),
@@ -93,6 +95,14 @@ mod tests {
             Err(ParseError::InvalidArgument)
         );
         assert_eq!(Command::parse("/archive"), Err(ParseError::InvalidArgument));
+        assert_eq!(
+            Command::parse("/cd-confirm"),
+            Err(ParseError::InvalidArgument)
+        );
+        assert_eq!(
+            Command::parse("/cd-confirm token"),
+            Ok(Command::ConfirmDirectory("token".into()))
+        );
         assert_eq!(
             Command::parse("/stop token"),
             Ok(Command::Stop(Some("token".into())))

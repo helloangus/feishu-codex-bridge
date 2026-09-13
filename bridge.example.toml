@@ -19,6 +19,5 @@ sandbox = "workspaceWrite"
 [feishu]
 app_id_env = "FEISHU_APP_ID"
 app_secret_env = "FEISHU_APP_SECRET"
-python = "/absolute/feishu-codex-bridge/.venv/bin/python"
-adapter = "/absolute/feishu-codex-bridge/compat/feishu-sdk/adapter.py"
+# Native Rust WebSocket; no Python or SDK adapter required.
 # proxy_env = "FEISHU_PROXY_URL"

@@ -1,4 +1,9 @@
 //! Application boundaries and bounded serial admission. No vendor SDK types.
+pub mod cards;
+pub mod diagnostics;
+pub mod directories;
+pub mod plans;
+pub mod presentation;
 use bridge_core::{SessionKey, task::TaskSpec};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
@@ -173,8 +178,22 @@ impl Scheduler {
     pub fn end_session_mutation(&mut self) {
         self.mutating = false;
     }
+    /// Backend invalidations precede queued work, but never race active preparation
+    /// or another session mutation. Pending admissions only persist task claims.
+    pub fn begin_invalidation(&mut self) -> bool {
+        if self.mutating || self.active.is_some() {
+            return false;
+        }
+        self.mutating = true;
+        true
+    }
     pub fn queued(&self) -> usize {
         self.queue.len()
+    }
+    pub fn has_task(&self, id: &str) -> bool {
+        self.active.as_ref().is_some_and(|s| s.id == id)
+            || self.queue.iter().any(|s| s.id == id)
+            || self.pending.values().any(|(_, s, _)| s.id == id)
     }
     pub fn pending_admissions(&self) -> usize {
         self.pending.len()
@@ -249,6 +268,26 @@ mod tests {
         assert!(!scheduler.finish("old"));
         assert!(scheduler.finish("1"));
         assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("2"));
+    }
+    #[test]
+    fn invalidation_precedes_queue_and_pending_admissions_without_racing_active_work() {
+        let mut scheduler = Scheduler::new(4);
+        let ticket = match scheduler.reserve("message".into(), task("1")) {
+            Ok(ticket) => ticket,
+            Err(error) => panic!("unexpected reservation failure: {error:?}"),
+        };
+        assert!(scheduler.begin_invalidation());
+        assert!(!scheduler.begin_invalidation());
+        assert!(scheduler.commit_admission(ticket, true));
+        assert!(scheduler.start_next().is_none());
+        scheduler.end_session_mutation();
+        assert!(scheduler.begin_invalidation());
+        scheduler.end_session_mutation();
+        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("1"));
+        assert!(!scheduler.begin_invalidation());
+        assert!(scheduler.finish("1"));
+        assert!(scheduler.begin_session_mutation());
+        assert!(!scheduler.begin_invalidation());
     }
     #[test]
     fn session_mutation_rejects_without_claiming() {

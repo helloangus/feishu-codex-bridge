@@ -1,6 +1,10 @@
 # 开发指南
 
-## 本地工作流
+## Rust 工作流
+
+配置和运行入口见 [Rust 部署指南](rust-deployment.md)。离线验证依次使用 `cargo fmt --all -- --check`、`cargo test --workspace -- --test-threads=1`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo build -p bridge-cli --locked`，以及下列 Python 回归和 `git diff --check`。构建、打包和真实服务启动是不同操作；验证时不要加载真实凭据或启动机器人。
+
+## Python 保留版本工作流
 
 ```sh
 cp .env.example .env

@@ -15,17 +15,7 @@ use tokio_util::{
     sync::CancellationToken,
 };
 
-pub struct Received {
-    pub event: Event,
-    pub acceptance: Option<Acceptance>,
-}
-/// Dropping this handle sends a failed ACK. No reusable or cloneable receipt.
-pub struct Acceptance(oneshot::Sender<bool>);
-impl Acceptance {
-    pub fn complete(self, accepted: bool) {
-        let _ = self.0.send(accepted);
-    }
-}
+pub use crate::ingress::{Acceptance, Received};
 #[derive(Debug, Error)]
 pub enum SidecarError {
     #[error("SDK IPC disconnected")]

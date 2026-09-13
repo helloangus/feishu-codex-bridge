@@ -12,3 +12,4 @@ feishu-inbox/
 bridge.toml
 .bridge-state/
 .venv/
+dist/

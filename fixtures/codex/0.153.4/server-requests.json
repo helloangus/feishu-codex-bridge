@@ -3,6 +3,35 @@
     "method": "item/commandExecution/requestApproval",
     "schema": "CommandExecutionRequestApproval",
     "params": {
+      "threadId": "t", "turnId": "u", "itemId": "permissions", "startedAtMs": 1,
+      "command": "fetch-and-save", "cwd": "/workspace",
+      "additionalPermissions": {
+        "network": {"enabled": true},
+        "fileSystem": {
+          "read": ["/input"], "write": ["/output"], "globScanMaxDepth": 3,
+          "entries": [{"access": "read", "path": {"type": "glob_pattern", "pattern": "/input/**"}}]
+        }
+      },
+      "networkApprovalContext": {"host": "example.test", "protocol": "https"},
+      "availableDecisions": ["accept", "decline"]
+    },
+    "reply": {"decision": "decline"}
+  },
+  {
+    "method": "item/commandExecution/requestApproval",
+    "schema": "CommandExecutionRequestApproval",
+    "params": {
+      "threadId": "t", "turnId": "u", "itemId": "network", "startedAtMs": 1,
+      "command": null, "cwd": null,
+      "networkApprovalContext": {"host": "example.test", "protocol": "socks5Tcp"},
+      "availableDecisions": ["accept", "decline"]
+    },
+    "reply": {"decision": "decline"}
+  },
+  {
+    "method": "item/commandExecution/requestApproval",
+    "schema": "CommandExecutionRequestApproval",
+    "params": {
       "threadId": "t",
       "turnId": "u",
       "itemId": "i",

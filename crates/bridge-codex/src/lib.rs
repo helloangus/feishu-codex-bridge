@@ -117,4 +117,5 @@ pub mod transport;
 
 pub mod events;
 
+mod permissions;
 pub mod requests;

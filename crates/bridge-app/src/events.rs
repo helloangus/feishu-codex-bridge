@@ -13,6 +13,14 @@ pub enum TurnOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
+    FileChanges {
+        turn: TurnRef,
+        item: String,
+        changes: Vec<crate::requests::FileChange>,
+    },
+    Started {
+        turn: TurnRef,
+    },
     Output {
         turn: TurnRef,
         item: String,

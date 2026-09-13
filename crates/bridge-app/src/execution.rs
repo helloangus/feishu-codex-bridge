@@ -31,7 +31,9 @@ impl Execution {
             AgentEvent::Output { turn, .. }
             | AgentEvent::Plan { turn, .. }
             | AgentEvent::Finished { turn, .. } => turn,
-            AgentEvent::Archived { .. } => return Ok(None),
+            AgentEvent::Archived { .. }
+            | AgentEvent::Started { .. }
+            | AgentEvent::FileChanges { .. } => return Ok(None),
         };
         if self.terminal || identity.epoch != self.epoch || identity.thread_id != self.thread {
             return Ok(None);
@@ -81,6 +83,13 @@ impl Execution {
     }
     pub fn is_terminal(&self) -> bool {
         self.terminal
+    }
+    /// Before the start response, requests may wait but must not be approved.
+    pub fn accepts_request(&self, turn: &TurnRef) -> bool {
+        !self.terminal
+            && turn.epoch == self.epoch
+            && turn.thread_id == self.thread
+            && self.turn.as_ref().is_none_or(|bound| bound == turn)
     }
 }
 

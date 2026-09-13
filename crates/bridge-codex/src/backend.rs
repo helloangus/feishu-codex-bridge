@@ -59,6 +59,65 @@ fn thread(value: Value) -> Result<ThreadSummary, BackendError> {
 }
 
 impl CodexBackend {
+    /// Read every archive page before returning evidence for local reconciliation.
+    /// Missing IDs are never interpreted as proof that a thread is active.
+    pub async fn archived_bindings(
+        &self,
+        bindings: &std::collections::BTreeSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>, BackendError> {
+        use std::collections::BTreeSet;
+        if bindings.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        if bindings
+            .iter()
+            .any(|id| !bridge_app::sessions::valid_thread_id(id))
+        {
+            return Err(BackendError::Incompatible);
+        }
+        let mut found = BTreeSet::new();
+        let mut cursors = BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let result = self.call("thread/list", json!({
+                "archived":true, "cursor":cursor, "limit":100,
+                "sortKey":"updated_at", "sortDirection":"desc", "modelProviders":[],
+                "sourceKinds":["cli","vscode","exec","appServer","subAgent",
+                    "subAgentReview","subAgentCompact","subAgentThreadSpawn","subAgentOther","unknown"]
+            })).await?;
+            let data = result
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or(BackendError::Incompatible)?;
+            if data.len() > 100 {
+                return Err(BackendError::Incompatible);
+            }
+            for entry in data {
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or(BackendError::Incompatible)?;
+                if !bridge_app::sessions::valid_thread_id(id) {
+                    return Err(BackendError::Incompatible);
+                }
+                if bindings.contains(id) {
+                    found.insert(id.to_owned());
+                }
+            }
+            match result.get("nextCursor") {
+                Some(Value::Null) => return Ok(found),
+                Some(Value::String(next)) if !next.is_empty() && next.len() <= 4096 => {
+                    if !cursors.insert(next.clone()) {
+                        return Err(BackendError::Incompatible);
+                    }
+                    cursor = Some(next.clone());
+                }
+                _ => return Err(BackendError::Incompatible),
+            }
+        }
+        Err(BackendError::Incompatible)
+    }
+
     pub fn new(rpc: RpcClient) -> Self {
         Self { rpc }
     }
@@ -163,8 +222,12 @@ impl AgentBackend for CodexBackend {
     }
     fn compact(&self, id: String) -> BackendFuture<'_, ()> {
         Box::pin(async move {
-            self.call("thread/compact/start", json!({"threadId":id}))
+            let result = self
+                .call("thread/compact/start", json!({"threadId":id}))
                 .await?;
+            if !result.is_object() {
+                return Err(BackendError::Incompatible);
+            }
             Ok(())
         })
     }
@@ -223,7 +286,7 @@ fn turn_params(input: &TurnInput) -> Result<Value, BackendError> {
         Sandbox::DangerFullAccess => json!({"type":"dangerFullAccess"}),
     };
     Ok(
-        json!({"threadId":input.thread_id,"input":content,"model":input.model,
+        json!({"threadId":input.thread_id,"cwd":input.directory,"input":content,"model":input.model,
             "approvalPolicy":"on-request","sandboxPolicy":sandbox,
             "collaborationMode":{"mode":if input.mode == ExecutionMode::Plan { "plan" } else { "default" },"settings":{"model":input.model}}
         }),

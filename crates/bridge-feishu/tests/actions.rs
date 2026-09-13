@@ -12,6 +12,7 @@ fn rendered_controls_round_trip_without_losing_arguments() -> Result<(), Box<dyn
         Command::Models,
         Command::Compact,
         Command::ChangeDirectory(Some("dir /stop".into())),
+        Command::ConfirmDirectory("cd-token".into()),
         Command::Resume(Some("thread".into())),
         Command::Resume(None),
         Command::Archive("thread".into()),
@@ -41,6 +42,7 @@ fn missing_interaction_and_archive_arguments_are_rejected() {
     for value in [
         r#"{"command":"/interaction","token":"","choice":"allow"}"#,
         r#"{"command":"/archive"}"#,
+        r#"{"command":"/cd-confirm","token":""}"#,
         r#"{"command":"/unarchive","thread_id":" "}"#,
     ] {
         assert!(decode_action(value).is_err());

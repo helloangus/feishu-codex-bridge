@@ -11,12 +11,24 @@ pub enum ApprovalKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
+    /// Fully described permission overlays; vendor JSON stays in the adapter.
+    pub permissions: Option<String>,
+    pub network_context: Option<String>,
+    pub changes: Option<Vec<FileChange>>,
     pub kind: ApprovalKind,
     pub command: Option<String>,
     pub directory: Option<String>,
     pub reason: Option<String>,
     pub grant_root: Option<String>,
     pub can_allow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub operation: String,
+    pub move_path: Option<String>,
+    pub diff: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

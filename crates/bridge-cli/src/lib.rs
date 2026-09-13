@@ -1,13 +1,13 @@
 //! Configuration validation for the Rust migration tools.
 use bridge_local::workspace::Workspace;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub workspace: WorkspaceConfig,
@@ -15,16 +15,19 @@ pub struct Config {
     pub codex: CodexConfig,
     pub feishu: Option<FeishuConfig>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeishuConfig {
     pub app_id_env: String,
     pub app_secret_env: String,
-    pub python: PathBuf,
-    pub adapter: PathBuf,
+    /// Legacy fields accepted for configuration migration; native mode never launches them.
+    #[serde(default)]
+    pub python: Option<PathBuf>,
+    #[serde(default)]
+    pub adapter: Option<PathBuf>,
     pub proxy_env: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
@@ -33,7 +36,14 @@ pub struct WorkspaceConfig {
 }
 
 pub mod bootstrap;
-#[derive(Deserialize)]
+mod descendants;
+pub mod health;
+pub mod logging;
+pub mod service_control;
+pub mod setup;
+pub mod supervisor;
+pub mod supervisor_state;
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessConfig {
     pub mode: AccessMode,
@@ -41,20 +51,20 @@ pub struct AccessConfig {
     pub allowed_open_ids: BTreeSet<String>,
     pub pairing_code_env: Option<String>,
 }
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
     Restricted,
     Open,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexConfig {
     pub executable: PathBuf,
     pub args: Vec<String>,
     pub sandbox: Sandbox,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub enum Sandbox {
     #[serde(rename = "workspaceWrite")]
     WorkspaceWrite,

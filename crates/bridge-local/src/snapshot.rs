@@ -1,5 +1,6 @@
 //! Bounded snapshots and delivery classification. Never upload engineering text.
 use rustix::fs::{Mode, OFlags, openat};
+use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::{
     collections::BTreeMap,
@@ -124,6 +125,7 @@ pub struct Entry {
     pub modified: Option<std::time::SystemTime>,
     pub text: Option<String>,
     pub skipped: Option<String>,
+    pub digest: Option<[u8; 32]>,
 }
 #[derive(Debug, Default)]
 pub struct Snapshot {
@@ -132,6 +134,13 @@ pub struct Snapshot {
 }
 
 pub fn scan(root: &Path, limits: Limits) -> io::Result<Snapshot> {
+    scan_excluding(root, limits, &[])
+}
+pub fn scan_excluding(
+    root: &Path,
+    limits: Limits,
+    excluded: &[std::path::PathBuf],
+) -> io::Result<Snapshot> {
     let root_file = File::open(root)?;
     let mut result = Snapshot {
         complete: true,
@@ -143,10 +152,10 @@ pub fn scan(root: &Path, limits: Limits) -> io::Result<Snapshot> {
         .into_iter()
         .filter_entry(|entry| {
             entry.depth() == 0
-                || entry
-                    .path()
-                    .strip_prefix(root)
-                    .is_ok_and(|relative| file_kind(relative) != FileKind::Ignore)
+                || entry.path().strip_prefix(root).is_ok_and(|relative| {
+                    file_kind(relative) != FileKind::Ignore
+                        && !excluded.iter().any(|path| relative.starts_with(path))
+                })
         });
     for (visited, entry) in iterator.enumerate() {
         if visited >= limits.entries {
@@ -186,7 +195,34 @@ pub fn scan(root: &Path, limits: Limits) -> io::Result<Snapshot> {
             modified: metadata.modified().ok(),
             text: None,
             skipped: None,
+            digest: None,
         };
+        if kind == FileKind::Artifact && metadata.len() <= 20 * 1024 * 1024 {
+            let mut hash = Sha256::new();
+            let mut reader = Read::by_ref(&mut file).take(20 * 1024 * 1024 + 1);
+            let mut buffer = [0u8; 64 * 1024];
+            let mut count = 0u64;
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        state.digest = Some(hash.finalize().into());
+                        break;
+                    }
+                    Ok(n) => {
+                        count += n as u64;
+                        hash.update(&buffer[..n]);
+                    }
+                    Err(_) => {
+                        result.complete = false;
+                        break;
+                    }
+                }
+                if count > 20 * 1024 * 1024 {
+                    result.complete = false;
+                    break;
+                }
+            }
+        }
         if kind == FileKind::Text {
             let mut bytes = Vec::new();
             match Read::by_ref(&mut file)
@@ -216,6 +252,7 @@ pub struct FileDiff {
 fn changed(old: Option<&Entry>, new: &Entry) -> bool {
     match old {
         None => true,
+        Some(old) if old.digest.is_some() && new.digest.is_some() => old.digest != new.digest,
         Some(old) => match (&old.text, &new.text) {
             (Some(a), Some(b)) => a != b,
             _ => {
@@ -232,7 +269,6 @@ pub fn artifacts(before: &Snapshot, after: &Snapshot) -> Vec<std::path::PathBuf>
         .filter(|(path, entry)| {
             entry.kind == FileKind::Artifact && changed(before.files.get(*path), entry)
         })
-        .take(10)
         .map(|(path, _)| path.clone())
         .collect()
 }
@@ -307,10 +343,19 @@ pub fn diffs(before: &Snapshot, after: &Snapshot, limits: Limits) -> Vec<FileDif
         } else {
             ""
         };
+        let fence = "`".repeat(
+            bounded
+                .split(|c| c != '`')
+                .map(str::len)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(3),
+        );
         result.push(FileDiff {
             path: path.clone(),
             content: format!(
-                "{operation} · +{added} / -{removed}{newline_note}\n\n```diff\n{bounded}\n```"
+                "{operation} · +{added} / -{removed}{newline_note}\n\n{fence}diff\n{bounded}\n{fence}"
             ),
         });
     }
@@ -321,6 +366,45 @@ pub fn diffs(before: &Snapshot, after: &Snapshot, limits: Limits) -> Vec<FileDif
 mod tests {
     use super::*;
     use std::fs;
+    #[test]
+    fn artifact_content_detects_same_metadata_edits_and_ignores_timestamp_only_changes()
+    -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("report.pdf");
+        fs::write(&path, b"old")?;
+        let before = scan(temp.path(), Limits::default())?;
+        let modified = fs::metadata(&path)?.modified()?;
+        fs::write(&path, b"new")?;
+        File::options()
+            .write(true)
+            .open(&path)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        let after = scan(temp.path(), Limits::default())?;
+        assert_eq!(artifacts(&before, &after), [Path::new("report.pdf")]);
+        File::options().write(true).open(&path)?.set_times(
+            fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(10)),
+        )?;
+        assert!(artifacts(&after, &scan(temp.path(), Limits::default())?).is_empty());
+        Ok(())
+    }
+    #[test]
+    fn deleted_text_and_newline_only_changes_are_reported() -> io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("deleted.rs"), "old\n")?;
+        fs::write(temp.path().join("newline.rs"), "same")?;
+        let before = scan(temp.path(), Limits::default())?;
+        fs::remove_file(temp.path().join("deleted.rs"))?;
+        fs::write(temp.path().join("newline.rs"), "same\n")?;
+        let changes = diffs(
+            &before,
+            &scan(temp.path(), Limits::default())?,
+            Limits::default(),
+        );
+        assert_eq!(changes.len(), 2);
+        assert!(changes[0].content.contains("删除") && changes[0].content.contains("-old"));
+        assert!(changes[1].content.contains("换行状态"));
+        Ok(())
+    }
     #[test]
     fn engineering_text_diff_and_artifacts_remain_separate() -> io::Result<()> {
         let temp = tempfile::tempdir()?;

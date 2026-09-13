@@ -23,10 +23,10 @@ impl Messenger for Delivery {
         })
     }
     fn send_panel(&self, _: String, _: Panel) -> DeliveryFuture<'_, MessageId> {
-        Box::pin(async { panic!("unexpected card") })
+        Box::pin(async { Err(bridge_app::messaging::DeliveryError::Transport) })
     }
     fn update_panel(&self, _: MessageId, _: Panel) -> DeliveryFuture<'_, ()> {
-        Box::pin(async { panic!("unexpected card") })
+        Box::pin(async { Err(bridge_app::messaging::DeliveryError::Transport) })
     }
     fn upload(&self, _: String, _: String, _: File, _: ResourceKind) -> DeliveryFuture<'_, ()> {
         Box::pin(async { panic!("unexpected upload") })
@@ -36,6 +36,8 @@ impl Messenger for Delivery {
 async fn send(tx: &mpsc::Sender<Input>, id: &str, text: &str) -> Result<bool, Box<dyn Error>> {
     let (ack, wait) = oneshot::channel();
     tx.send(Input {
+        attachments: vec![],
+        card: None,
         id: id.into(),
         user: "owner".into(),
         chat: "chat".into(),
@@ -77,6 +79,7 @@ async fn scenario(fail_at: Option<&str>) -> Result<(), Box<dyn Error>> {
             let cancel = CancellationToken::new();
             let worker = tokio::spawn(runtime::run(
                 runtime::Settings {
+                    root: temp.path().into(),
                     directory: temp.path().into(),
                     allowed: BTreeSet::from(["owner".into()]),
                     open_access: false,
@@ -153,4 +156,100 @@ async fn reset_clear_failure_is_reported_without_losing_binding() -> Result<(), 
 #[tokio::test]
 async fn reset_journal_failure_does_not_clear_binding() -> Result<(), Box<dyn Error>> {
     scenario(Some("seen-messages.json")).await
+}
+
+async fn archive_notification_scenario(fail: bool) -> Result<(), Box<dyn Error>> {
+    use bridge_app::events::{AgentEvent, Incoming};
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(AsyncState::new(JsonStore::open(temp.path())?));
+        let owner = SessionKey::new("owner", temp.path());
+        let shared = SessionKey::new("shared", temp.path().join("other"));
+        let preserved = SessionKey::new("preserved", temp.path());
+        store.bind(owner.clone(), "target".into()).await?;
+        store.bind(shared.clone(), "target".into()).await?;
+        store.bind(preserved.clone(), "keep".into()).await?;
+        if fail {
+            std::fs::remove_file(temp.path().join("state.previous.json"))?;
+            std::fs::create_dir(temp.path().join("state.previous.json"))?;
+        }
+        let (wire, mut remote) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(wire);
+        let mut connection = Connection::new(read, write, 1, 4096);
+        let backend = Arc::new(CodexBackend::new(connection.client.clone()));
+        let (_tx, inputs) = mpsc::channel(8);
+        let (events_tx, events) = mpsc::channel(8);
+        let (delivery, _replies) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(runtime::run(
+            runtime::Settings {
+                root: temp.path().into(),
+                directory: temp.path().into(),
+                allowed: BTreeSet::from(["owner".into()]),
+                open_access: false,
+                sandbox: Sandbox::WorkspaceWrite,
+                epoch: 1,
+            },
+            backend,
+            store.clone(),
+            Arc::new(Delivery(delivery)),
+            inputs,
+            events,
+            cancel.clone(),
+        ));
+        // A stale connection must not invalidate an unrelated live binding.
+        for (epoch, thread) in [(0, "keep"), (1, "target"), (1, "target")] {
+            events_tx
+                .send(Ok(Incoming::Notification(AgentEvent::Archived {
+                    epoch,
+                    thread: thread.into(),
+                })))
+                .await?;
+        }
+        if fail {
+            let result = worker.await?;
+            match result {
+                Err(error) => assert!(error.contains("归档通知同步失败")),
+                Ok(()) => panic!("archive notification failure unexpectedly completed"),
+            }
+            assert_eq!(store.thread(owner.clone()).await?, Some("target".into()));
+        } else {
+            while store.thread(owner.clone()).await?.is_some() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(store.thread(shared.clone()).await?, None);
+            cancel.cancel();
+            worker.await?.map_err(std::io::Error::other)?;
+        }
+        assert_eq!(store.thread(preserved.clone()).await?, Some("keep".into()));
+        connection.shutdown().await?;
+        use tokio::io::AsyncReadExt;
+        let mut requests = Vec::new();
+        remote.read_to_end(&mut requests).await?;
+        assert!(
+            requests.is_empty(),
+            "archive notifications must not issue backend mutations"
+        );
+        drop(store);
+        let reopened = AsyncState::new(JsonStore::open(temp.path())?);
+        assert_eq!(
+            reopened.thread(owner).await?,
+            if fail { Some("target".into()) } else { None }
+        );
+        assert_eq!(reopened.thread(preserved).await?, Some("keep".into()));
+        Ok::<_, Box<dyn Error>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn archive_notifications_clear_shared_bindings_and_ignore_stale_epochs()
+-> Result<(), Box<dyn Error>> {
+    archive_notification_scenario(false).await
+}
+
+#[tokio::test]
+async fn archive_notification_commit_failure_stops_runtime() -> Result<(), Box<dyn Error>> {
+    archive_notification_scenario(true).await
 }

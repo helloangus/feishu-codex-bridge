@@ -1,5 +1,6 @@
 {
   "threadId": "t",
+  "cwd": "/tmp/project",
   "input": [
     {
       "type": "text",

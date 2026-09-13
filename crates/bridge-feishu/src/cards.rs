@@ -18,6 +18,7 @@ pub fn action_value(action: &ButtonAction) -> Value {
             Command::Models => json!({"command":"/models"}),
             Command::Compact => json!({"command":"/compact"}),
             Command::ChangeDirectory(path) => json!({"command":"/cd","path":path}),
+            Command::ConfirmDirectory(token) => json!({"command":"/cd-confirm","token":token}),
             Command::Resume(id) => json!({"command":"/resume","thread_id":id}),
             Command::Archive(id) => json!({"command":"/archive","thread_id":id}),
             Command::Unarchive(id) => json!({"command":"/unarchive","thread_id":id}),

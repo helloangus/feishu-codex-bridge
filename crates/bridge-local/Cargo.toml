@@ -17,6 +17,7 @@ fs2.workspace = true
 walkdir.workspace = true
 similar.workspace = true
 rustix.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

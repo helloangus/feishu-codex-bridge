@@ -1,6 +1,6 @@
 # 架构与数据流
 
-本文描述当前实现。主入口为 `bridge.py`，后台生命周期由 `service.py` 管理。
+Rust 原生版由 bridge-cli 装配应用，bridge-app 管理业务，bridge-codex 独占 Codex RPC，bridge-feishu 管理原生长连接与 REST，bridge-local 管理本地状态。正常后台入口使用 guard → supervise → run 两层监督，详见 [Rust 部署指南](rust-deployment.md)。下文描述保留的 Python 实现，主入口为 `bridge.py`，后台生命周期由 `service.py` 管理。
 
 ## 目标与边界
 
@@ -113,4 +113,4 @@ bridge 启动时读取 app-server 的模型列表并缓存标记为默认的模�
 
 ## Rust 迁移边界
 
-新增 workspace 与当前 Python 运行路径并存。Rust 核心、存储和迁移工具可离线使用，尚无生产事件循环或 SDK 替代。工程边界和后续调用链见 [Rust 实施方案](rust-refactor.md)。本文前述 Python 运行流程仍是现行生产实现。
+Rust workspace 与 Python 运行路径并存，原生事件循环、飞书 WebSocket、业务交互及服务监督已实现。首次部署和打包入口待本批统一验证，真实平台验收与生产切换仍未完成。工程边界见 [Rust 实施方案](rust-refactor.md)。

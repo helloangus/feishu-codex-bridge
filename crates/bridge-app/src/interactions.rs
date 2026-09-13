@@ -206,6 +206,9 @@ mod tests {
     }
     fn kind() -> RequestKind {
         RequestKind::Approval(Approval {
+            permissions: None,
+            network_context: None,
+            changes: None,
             kind: ApprovalKind::Command,
             command: None,
             directory: None,
