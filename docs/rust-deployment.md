@@ -4,7 +4,15 @@
 
 ## 从源码准备
 
-Linux/proot Ubuntu 需要 Bash、Rust 工具链、C 编译/链接工具和已登录的 Codex CLI。在项目目录执行 `bash setup-rust.sh`。脚本构建本机 Rust 二进制，询问工作区根目录、初始目录、私有状态目录、白名单及沙箱模式，然后生成权限 0600 的 `bridge.toml`，不自动启动。已有配置只检查，不覆盖。默认采用 workspaceWrite；必须明确输入 dangerFullAccess 才关闭 Codex 沙箱。
+默认部署环境是 Ubuntu/Debian，需要 Bash 和已登录的 Codex CLI。在项目目录直接执行 `./setup-rust.sh`。若缺少 Rust、rustup 或 C 编译器，脚本会询问是否立即安装：先通过 `apt-get` 安装 `build-essential` 和 `curl`，再使用 [Rust 官网 rustup 脚本](https://rustup.rs/) 安装 Rust，不使用 Ubuntu 系统包中的 Rust；无交互自动化可设置 `BRIDGE_RUST_AUTO_INSTALL=1`。脚本构建本机 Rust 二进制，并默认以当前用户的 `$HOME` 为工作区根目录和初始目录、`$HOME/.local/state/feishu-codex-bridge` 为私有状态目录，生成权限 0600 的 `bridge.toml` 后启动服务。已有配置只检查，不覆盖。默认采用 workspaceWrite。
+
+在交互终端中，脚本会显示上述三个路径，直接回车接受默认值，或输入路径覆盖。这样首次运行无需事先手动设置工作目录，但仍可在生成配置前调整。
+
+首次启动时会询问飞书 App ID、隐藏输入的 App Secret，以及配对码，并提示可在另一个终端运行 `openssl rand -hex 16` 生成安全随机值。配对码必须为 16–256 字节且不能包含空白；首次启动或无白名单时必填，已有白名单或已有成功配对用户时可以留空。它们仅导出给本次启动的守护进程及其子进程，不写入 `bridge.toml`、状态目录或日志。启动后，尚未授权的用户需在飞书私聊机器人发送 `/pair <配对码>`；普通消息会返回授权指引，不再静默丢弃。若只需构建和生成配置，请使用 `./setup-rust.sh --no-start`；非交互启动需要预先设置 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，无白名单时还需设置 `FEISHU_PAIRING_CODE`。
+
+桥接在未设置用户模型偏好时默认使用 `gpt-5.6-luna`，启动时会通过 Codex app-server 的模型列表确认该模型可用。飞书中的 `/model <ID>` 仍可按用户和工作目录覆盖它，`/model default` 恢复此默认值。
+
+无需交互的默认值可通过环境变量覆盖：`BRIDGE_RUST_ROOT`、`BRIDGE_RUST_CWD`、`BRIDGE_RUST_STATE_DIR`、`BRIDGE_RUST_ALLOWED_USERS`（逗号分隔）及 `BRIDGE_RUST_SANDBOX`（`workspaceWrite` 或明确指定的 `dangerFullAccess`）。未指定白名单时启用配对。
 
 无白名单时使用配对：启动时提供至少 16 字节、最多 256 字节且无空白的 `FEISHU_PAIRING_CODE`，用户私聊 `/pair <配对码>`。配对成功写入授权列表。配对码会存在飞书聊天中，不写入桥接状态或日志。
 

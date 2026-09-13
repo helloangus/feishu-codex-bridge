@@ -4,6 +4,8 @@ use bridge_core::{SessionKey, task::TaskSpec};
 use std::{future::Future, path::PathBuf, pin::Pin};
 use thiserror::Error;
 
+pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("状态保存或读取失败")]
 pub struct SessionStoreError;
@@ -304,7 +306,7 @@ pub async fn prepare<S: SessionStore + ?Sized>(
                 .models()
                 .await?
                 .into_iter()
-                .find(|m| m.is_default)
+                .find(|model| model.id == DEFAULT_MODEL)
                 .filter(|m| !m.id.is_empty())
                 .ok_or(BackendError::Incompatible)?
                 .id

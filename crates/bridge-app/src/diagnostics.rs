@@ -69,14 +69,11 @@ pub fn emit(event: Event, status: Status, task: Option<&str>, count: usize) {
     let record = record(event, status, task, count);
     if let Some(sink) = SINK.get() {
         if sink.write(&record, matches!(event, Event::Panic)).is_err() {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "{{\"event\":\"log_write_failed\"}}"
-            );
+            // The terminal is for human-facing command output.  Do not expose
+            // machine-oriented records there, even when persistent logging fails.
+            let _ = writeln!(std::io::stderr().lock(), "警告：无法写入运行诊断日志。");
         }
     }
-    // Logging failures must not panic while reporting another failure.
-    let _ = writeln!(std::io::stderr().lock(), "{}", record);
 }
 
 #[cfg(test)]

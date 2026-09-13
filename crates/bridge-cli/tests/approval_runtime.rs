@@ -126,7 +126,7 @@ impl Harness {
                     continue;
                 };
                 let result = match method {
-                    "model/list" => json!({"data":[{"id":"model","isDefault":true}]}),
+                    "model/list" => json!({"data":[{"id":"gpt-5.6-luna","isDefault":false}]}),
                     "thread/start" => {
                         threads += 1;
                         json!({"thread":{"id":if threads==1 {"thread"} else {"fresh"},"cwd":cwd}})
@@ -322,7 +322,11 @@ const COMMAND: &str = "item/commandExecution/requestApproval";
 async fn pairing_admits_new_user_without_sending_code_to_codex() -> TestResult {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut h = Harness::new().await?;
-        let _initial = h.turns.recv().await.ok_or("initial turn missing")?;
+        let initial = h.turns.recv().await.ok_or("initial turn missing")?;
+        assert_eq!(initial["model"], "gpt-5.6-luna");
+        h.send("new-user", "chat", Some("hello".into()), None)
+            .await?;
+        h.until("尚未授权").await?;
         h.send("new-user", "chat", Some("/pair wrong".into()), None)
             .await?;
         h.until("配对未成功").await?;

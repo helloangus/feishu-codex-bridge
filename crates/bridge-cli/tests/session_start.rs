@@ -44,7 +44,7 @@ async fn scenario(
                 let method = value["method"].as_str().ok_or("missing method")?;
                 methods.push(method.to_owned());
                 let result = match method {
-                    "model/list" => json!({"data":[{"id":"model","isDefault":true}]}),
+                    "model/list" => json!({"data":[{"id":"gpt-5.6-luna","isDefault":false}]}),
                     "thread/start" => json!({"thread":{"id":"thread","cwd":"/tmp/project"}}),
                     "thread/resume" => {
                         assert_eq!(

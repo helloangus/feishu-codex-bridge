@@ -332,3 +332,5 @@ Plan 批次验证：Rust workspace 串行全量 145 项通过（新增 7 项 Pla
 - [ ] 下一步：接入人工审批卡片及同意/拒绝回传；随后迁移问答与附件。真实飞书验收继续延后，本轮未部署。
 
 本轮验证：模型原位刷新、旧/新按钮权限、更新失败文字降级、最近到归档原位导航集成测试通过；Rust 串行全量回归通过，Clippy、fmt、依赖边界和空白检查通过。默认并发全量中两项既有压缩测试曾报 Locked，8 项压缩定向串行及全量串行复跑通过；并发锁失败根因尚未确认，不记为已修复。
+
+- [x] 默认模型固定为 `gpt-5.6-luna`：不再把 app-server `model/list` 的产品级 `isDefault` 标记当作桥接默认值；未保存用户偏好时显式校验并选择 Luna，`/model`、`/models` 和 `/model default` 显示一致。当前 Codex CLI 0.154.0 实测确认 Luna 位于可用模型列表。Rust workspace 串行全量、Python 回归（2 项缺依赖跳过）、Clippy、rustdoc、fmt、依赖边界、语法及空白检查通过。

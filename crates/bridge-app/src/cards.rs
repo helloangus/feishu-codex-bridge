@@ -318,13 +318,13 @@ pub fn models(
             ))
         })
         .collect::<Vec<_>>();
-    buttons.push(("恢复 Codex 默认模型".into(), "/model default".into()));
+    buttons.push(("恢复桥接默认模型".into(), "/model default".into()));
     buttons.push(("刷新模型列表".into(), "/models".into()));
     let (mut card, commands) = panel(
         "可用模型",
         format!(
             "当前模型：{}。全局空闲时可修改，保存成功后回复确认。\n按钮限本人在当前聊天和目录使用，10 分钟有效，每个按钮一次。",
-            current.unwrap_or("Codex 默认")
+            current.unwrap_or(crate::sessions::DEFAULT_MODEL)
         ),
         buttons,
         prefix,

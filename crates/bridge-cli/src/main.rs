@@ -140,16 +140,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .enable_all()
                 .build()?;
             if matches!(command, ServiceAction::Status) {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&bridge_cli::health::status(state)?)?
-                );
-                if bridge_cli::supervisor::is_running(state)? {
-                    println!(
-                        "监督阶段：{}",
-                        runtime.block_on(bridge_cli::service_control::request(state, b's'))?
-                    );
-                }
+                let report = bridge_cli::health::status(state)?;
+                let phase = if report.supervisor_running || report.guard_running {
+                    runtime
+                        .block_on(bridge_cli::service_control::request(state, b's'))
+                        .ok()
+                } else {
+                    None
+                };
+                println!("{}", bridge_cli::health::display(&report, phase.as_deref()));
             } else {
                 let _control_lock = bridge_cli::service_control::command_lock(state)?;
                 runtime.block_on(async {
@@ -165,7 +164,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         ServiceAction::Status => Ok(()),
                     }
                 })?;
-                println!("服务控制完成；连接状态请通过 service status 查询");
+                println!("服务控制完成。查看运行和飞书连接状态：./start-rust.sh status");
             }
         }
         Action::Supervise { config } => {
@@ -181,12 +180,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Action::Status { config } => {
             let config = Config::read(&config).map_err(|_| "配置无法读取或 TOML 格式无效")?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&bridge_cli::health::status(
-                    &config.workspace.state_dir
-                )?)?
-            );
+            let state = &config.workspace.state_dir;
+            let report = bridge_cli::health::status(state)?;
+            let phase = if report.supervisor_running || report.guard_running {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .build()?
+                    .block_on(bridge_cli::service_control::request(state, b's'))
+                    .ok()
+            } else {
+                None
+            };
+            println!("{}", bridge_cli::health::display(&report, phase.as_deref()));
         }
         Action::Run { config } => {
             let config = Config::read(&config).map_err(|_| "配置无法读取或 TOML 格式无效")?;

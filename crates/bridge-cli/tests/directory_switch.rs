@@ -376,7 +376,7 @@ for line in sys.stdin:
     m=json.loads(line);method=m.get('method');p=m.get('params',{})
     if method=='initialized':continue
     if method=='initialize':result={}
-    elif method=='model/list':result={'data':[{'id':'default','isDefault':True},{'id':'chosen','isDefault':False}]}
+    elif method=='model/list':result={'data':[{'id':'gpt-5.6-luna','isDefault':False},{'id':'chosen','isDefault':False}]}
     elif method in ('thread/start','thread/resume'):
         cwd=p['cwd'];thread='th-'+hashlib.sha256(cwd.encode()).hexdigest()[:8]
         if method=='thread/resume':assert p['threadId']==thread
@@ -441,7 +441,7 @@ for line in sys.stdin:
                 assert!(until(&mut output,"执行完成").await?.contains(&format!("{}|chosen|plan",child.display())));
                 send(&tx,"parent","owner","/cd ..").await?;until(&mut output,"已切换目录").await?;
                 send(&tx,"root-turn","owner","hello").await?;
-                assert!(until(&mut output,"执行完成").await?.contains(&format!("{}|default|default",root.display())));
+                assert!(until(&mut output,"执行完成").await?.contains(&format!("{}|gpt-5.6-luna|default",root.display())));
                 send(&tx,"switch","owner","/cd child space").await?;
                 send(&tx,"dedup-status","owner","/status").await?;
                 assert!(until(&mut output,"当前目录").await?.contains(&format!("当前目录：{}\n",root.display())));
@@ -468,7 +468,7 @@ for line in sys.stdin:
                 send(&tx,"restart-turn","owner","hello").await?;
                 assert!(until(&mut output,"执行完成").await?.contains(&format!("{}|chosen|plan",child.display())));
                 send(&tx,"other-turn","other","hello").await?;
-                assert!(until(&mut output,"执行完成").await?.contains(&format!("{}|default|default",root.display())));
+                assert!(until(&mut output,"执行完成").await?.contains(&format!("{}|gpt-5.6-luna|default",root.display())));
                 #[cfg(unix)] {
                     std::fs::rename(&child,root.join("moved-child"))?;
                     std::os::unix::fs::symlink(temp.path(),&child)?;

@@ -163,7 +163,7 @@ for line in sys.stdin:
     elif method=='model/list':
         if preparation is not None:emit(preparation);preparation=None
         if pending:finished('failed' if mode=='failed' else 'completed');pending=False
-        result={'data':[{'id':'model','isDefault':True}]}
+        result={'data':[{'id':'gpt-5.6-luna','isDefault':False}]}
     elif method=='turn/interrupt':
         assert m['params']=={'threadId':'thread','turnId':'compact'}
         with open('compact-interrupts','a') as f:f.write('interrupt\n')
@@ -278,7 +278,7 @@ for line in sys.stdin:
     method=m.get('method')
     if method=='initialized':continue
     if method=='initialize':result={}
-    elif method=='model/list':result={'data':[{'id':'model','isDefault':True},{'id':'selected','isDefault':False}]}
+    elif method=='model/list':result={'data':[{'id':'gpt-5.6-luna','isDefault':False},{'id':'selected','isDefault':False}]}
     elif method in ('thread/start','thread/resume'):result={'thread':{'id':'thread','cwd':os.getcwd()}}
     elif method=='thread/read':result={'thread':{'id':'thread','cwd':os.getcwd(),'status':{'type':'idle'}}}
     elif method=='thread/list':result={'data':([{'id':'thread','cwd':os.getcwd(),'title':'local session'}, {'id':'foreign','cwd':'/foreign','title':'must not display'}] if m['params']['archived']==archived else [])}

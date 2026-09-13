@@ -736,7 +736,11 @@ pub async fn run(
                         }
                         continue;
                     }
-                    if !settings.open_access && !allowed.contains(&input.user) {(input.accept)(true);continue;}
+                    if !settings.open_access && !allowed.contains(&input.user) {
+                        tell(&delivery,&input.chat,"当前飞书用户尚未授权。如管理员启用了配对，请发送 /pair <配对码>；否则请联系管理员加入白名单。")?;
+                        (input.accept)(true);
+                        continue;
+                    }
                     let current=directories.get(&input.user).unwrap_or(&settings.directory).clone();
                     if input.attachments.len()>10 {tell(&delivery,&input.chat,"单条消息最多接收 10 个附件。")?;(input.accept)(true);continue;}
                     if !input.attachments.is_empty() {
@@ -958,9 +962,9 @@ pub async fn run(
                                         match command {
                                             Ok(Command::Models) => {
                                                 let models=backend.models().await?;
-                                                Ok(ListedContent::Models {entries:models,current:preferences.model})
+                                                Ok(ListedContent::Models {entries:models,current:Some(preferences.model.unwrap_or_else(||sessions::DEFAULT_MODEL.into()))})
                                             }
-                                            Ok(Command::Model(None)) => Ok(ListedContent::Text(format!("当前模型：{}",preferences.model.unwrap_or_else(||"Codex 默认".into())))),
+                                            Ok(Command::Model(None)) => Ok(ListedContent::Text(format!("当前模型：{}",preferences.model.unwrap_or_else(||sessions::DEFAULT_MODEL.into())))),
                                             _ => Ok(ListedContent::Text(format!("Plan 模式：{}。使用 /plan on 或 /plan off 切换。",if preferences.plan {"已开启"} else {"已关闭"}))),
                                         }
                                     }.await;

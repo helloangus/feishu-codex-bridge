@@ -1,6 +1,8 @@
 # Feishu Codex Bridge
 
-Rust 原生版的配置生成、启停和本机打包入口见 [Rust 部署指南](docs/rust-deployment.md)：`bash setup-rust.sh`、`bash start-rust.sh status`、`bash package-rust.sh`。本批入口待统一验证；下文的 `setup.sh` / `start.sh` 属于保留的 Python 版本。
+Rust 原生版的配置生成、启停和本机打包入口见 [Rust 部署指南](docs/rust-deployment.md)：`./setup-rust.sh`、`./start-rust.sh status`、`bash package-rust.sh`。本批入口待统一验证；下文的 `setup.sh` / `start.sh` 属于保留的 Python 版本。
+
+Rust 生成配置默认使用 `gpt-5.6-luna`；可在飞书中使用 `/models` 查看可用模型，并通过 `/model <ID>` 按工作目录覆盖。
 
 把运行在 Termux（或兼容 Linux 环境）中的 [Codex app-server](https://developers.openai.com/) 接入飞书机器人。你可以在飞书私聊机器人，让 Codex 在指定工作目录中完成任务、审批操作、接收图片/文件，并把文本、卡片和交付物发回飞书。
 

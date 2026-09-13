@@ -41,6 +41,53 @@ pub struct Report {
     pub snapshot: Option<Snapshot>,
 }
 
+/// Render the intentionally compact operator-facing status.  The serialized
+/// [`Report`] remains available to Rust callers, but command-line users should
+/// not have to infer service health from lock files, PIDs, or timestamps.
+pub fn display(report: &Report, supervisor_phase: Option<&str>) -> String {
+    let feishu = match report.snapshot.as_ref().map(|snapshot| snapshot.phase) {
+        Some(Phase::Connected) if report.heartbeat_fresh == Some(true) => {
+            "已连接，服务正常接收飞书消息。"
+        }
+        Some(Phase::Connected) => "连接状态不健康；服务可能已失去响应。",
+        Some(Phase::Reconnecting) => "连接已中断，正在自动重连。",
+        Some(Phase::Starting) if report.running => "正在启动，尚未完成飞书连接。",
+        Some(Phase::Starting) | Some(Phase::Failed) => "未连接：桥接在开始连接飞书前启动失败。",
+        Some(Phase::Stopped) => "未连接：服务已停止。",
+        None => "未知：尚未产生运行记录。",
+    };
+    let bridge = match report.snapshot.as_ref().map(|snapshot| snapshot.phase) {
+        Some(Phase::Connected) if report.heartbeat_fresh == Some(true) => "运行中",
+        Some(Phase::Reconnecting) if report.running => "运行中（正在重连）",
+        Some(Phase::Starting) if report.running => "正在启动",
+        Some(Phase::Failed) => "未运行（启动失败）",
+        Some(Phase::Stopped) => "已停止",
+        _ if report.running => "运行异常（心跳未就绪）",
+        _ => "未运行",
+    };
+    let recovery = match supervisor_phase {
+        Some("running") => "监督器正在运行。",
+        Some("stopping") => "正在停止。",
+        Some(phase) if phase.strip_prefix("backoff:").is_some() => {
+            let seconds = phase.strip_prefix("backoff:").unwrap_or_default();
+            return format!(
+                "桥接状态：{bridge}\n飞书连接：{feishu}\n自动恢复：将在 {seconds} 秒后重试。\n\n提示：本次失败发生在飞书连接之前；请检查服务启动错误。"
+            );
+        }
+        _ if report.supervisor_running || report.guard_running => "监督器正在恢复服务。",
+        _ => "未运行；不会自动重试。",
+    };
+    let hint = if matches!(
+        report.snapshot.as_ref().map(|snapshot| snapshot.phase),
+        Some(Phase::Failed)
+    ) {
+        "\n\n提示：本次失败发生在飞书连接之前；请检查服务启动错误。"
+    } else {
+        ""
+    };
+    format!("桥接状态：{bridge}\n飞书连接：{feishu}\n自动恢复：{recovery}{hint}")
+}
+
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const HEARTBEAT_MAX_AGE_MS: u64 = 30_000;
 
@@ -238,6 +285,49 @@ pub fn status(state: &Path) -> io::Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(phase: Option<Phase>, running: bool, fresh: Option<bool>) -> Report {
+        Report {
+            guard_running: true,
+            guard_snapshot: None,
+            supervisor_snapshot: None,
+            supervisor_running: true,
+            running,
+            heartbeat_fresh: fresh,
+            snapshot: phase.map(|phase| Snapshot {
+                version: 1,
+                pid: 1,
+                started_unix_ms: 1,
+                updated_unix_ms: 1,
+                phase,
+                heartbeat_unix_ms: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn display_explains_pre_connection_failure_and_retry() {
+        let text = display(
+            &report(Some(Phase::Failed), false, Some(false)),
+            Some("backoff:30"),
+        );
+        assert_eq!(
+            text,
+            "桥接状态：未运行（启动失败）\n飞书连接：未连接：桥接在开始连接飞书前启动失败。\n自动恢复：将在 30 秒后重试。\n\n提示：本次失败发生在飞书连接之前；请检查服务启动错误。"
+        );
+    }
+
+    #[test]
+    fn display_only_calls_feishu_connected_when_heartbeat_is_fresh() {
+        let text = display(
+            &report(Some(Phase::Connected), true, Some(true)),
+            Some("running"),
+        );
+        assert!(text.contains("飞书连接：已连接"));
+        assert!(!text.contains("PID"));
+        assert!(!text.contains("unix_ms"));
+    }
+
     #[test]
     fn freshness_distinguishes_expiry_legacy_clock_reversal_and_exit() -> io::Result<()> {
         let tmp = tempfile::tempdir()?;

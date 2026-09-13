@@ -127,7 +127,7 @@ async fn authorized_attachment_reaches_turn_once_and_delivery_blocks_next_task()
             while let Some(line) = lines.next_line().await? {
                 let request: Value = serde_json::from_str(&line)?;
                 let result = match request["method"].as_str().ok_or("method")? {
-                    "model/list" => json!({"data":[{"id":"model","isDefault":true}]}),
+                    "model/list" => json!({"data":[{"id":"gpt-5.6-luna","isDefault":false}]}),
                     "thread/start" | "thread/read" | "thread/resume" => {
                         json!({"thread":{"id":"thread","cwd":cwd,"status":{"type":"idle"}}})
                     }

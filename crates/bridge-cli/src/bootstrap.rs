@@ -25,6 +25,13 @@ fn credential(name: &str) -> Result<String, Box<dyn std::error::Error>> {
         .ok_or_else(|| "缺少配置指定的凭据环境变量".into())
 }
 
+fn optional_credential(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err("凭据环境变量名称无效".into());
+    }
+    Ok(std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
 /// Only locally registered opaque actions enter the runtime; raw card commands
 /// cannot bypass message/owner validation or become ordinary chat text.
 pub fn decode_card_click(
@@ -90,8 +97,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .access
         .pairing_code_env
         .as_deref()
-        .map(credential)
+        .map(optional_credential)
         .transpose()?;
+    let pairing_code = pairing_code.flatten();
     if pairing_code.as_ref().is_some_and(|code| {
         code.len() < 16 || code.len() > 256 || code.chars().any(char::is_whitespace)
     }) {
