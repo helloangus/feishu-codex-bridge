@@ -47,7 +47,11 @@ bash -n setup.sh start.sh package.sh
 git diff --check
 ```
 
-测试不读取真实配置、不访问网络、不启动长期服务。协议假进程和 schema 校验均由 Rust 测试工具完成。开发约定见 [开发指南](docs/development.md)，系统边界见 [架构说明](docs/architecture.md)。
+测试不读取真实配置、不访问外部服务、不启动长期服务；网络协议测试使用本地 socket。协议假进程和 schema 校验由 Rust 测试工具完成，脚本入口测试仍使用 Shell 替身。开发约定见 [开发指南](docs/development.md)，当前系统边界见 [架构说明](docs/architecture.md)。
+
+## 整改交接
+
+[PLAN.md](PLAN.md) 是当前工程整改清单，记录已发现的问题、修改方向与验收条件。未勾选的项目尚未实现，包括新的 xtask 命令；接手修改前先阅读交接状态，不沿用已经删除的迁移计划或过渡期设计说明。
 
 ## 发布状态
 

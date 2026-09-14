@@ -11,7 +11,7 @@ mkdir -p -- "$bridge_output"
 bridge_package="$(mktemp -d "$bridge_output/feishu-codex-bridge.XXXXXXXX")"
 cp -- "$bridge_repo/target/release/bridge" "$bridge_package/bridge"
 cp -- "$bridge_repo/bridge.example.toml" "$bridge_package/bridge.example.toml"
-cp -- "$bridge_repo/docs/rust-deployment.md" "$bridge_package/DEPLOYMENT.md"
+cp -- "$bridge_repo/docs/deployment.md" "$bridge_package/DEPLOYMENT.md"
 (cd -- "$bridge_repo" && git rev-parse HEAD && git status --porcelain --untracked-files=no && rustc -vV) > "$bridge_package/BUILD-INFO.txt"
 (cd -- "$bridge_package" && sha256sum bridge bridge.example.toml DEPLOYMENT.md BUILD-INFO.txt > SHA256SUMS)
 printf '本机发布目录：%s\n' "$bridge_package"

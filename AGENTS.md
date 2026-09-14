@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## Active handoff
+
+Read [PLAN.md](PLAN.md) for the active remediation backlog and its acceptance criteria. Unchecked items describe intended changes, not implemented capabilities. The previous migration plan and transitional ADRs have been retired. The structure below describes current ownership; update it when implementing the planned responsibility changes instead of treating it as a prohibition on refactoring.
+
 ## Structure
 
 This is a Rust workspace. `bridge-cli` assembles configuration, runtime, health, and supervision; `bridge-app` owns application behavior; `bridge-codex` owns app-server JSON-RPC; `bridge-feishu` owns native Feishu WebSocket/REST; `bridge-local` owns state and workspace access. Use `setup.sh`, `start.sh`, and `package.sh` for lifecycle and packaging. Never commit `bridge.toml`, credentials, state, logs, sessions, or downloaded attachments.
