@@ -1,6 +1,7 @@
-//! Foreground MVP composition. No shell config execution or automatic replay.
-use crate::{AccessMode, Config, Sandbox};
-use bridge_app::{ports, runtime};
+//! Foreground composition of the native bridge: Feishu ingress, Codex app
+//! server, durable state and the application runtime.
+use crate::{AccessMode, Config, credentials::valid_pairing_code, valid_env_name};
+use bridge_app::runtime;
 use bridge_codex::process::AppServer;
 use bridge_feishu::{ingress::Event, rest::FeishuRest, websocket};
 use bridge_local::{async_state::AsyncState, state::JsonStore};
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 fn credential(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !valid_env_name(name) {
         return Err("凭据环境变量名称无效".into());
     }
     std::env::var(name)
@@ -26,7 +27,7 @@ fn credential(name: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn optional_credential(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !valid_env_name(name) {
         return Err("凭据环境变量名称无效".into());
     }
     Ok(std::env::var(name).ok().filter(|value| !value.is_empty()))
@@ -100,9 +101,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(optional_credential)
         .transpose()?;
     let pairing_code = pairing_code.flatten();
-    if pairing_code.as_ref().is_some_and(|code| {
-        code.len() < 16 || code.len() > 256 || code.chars().any(char::is_whitespace)
-    }) {
+    if pairing_code
+        .as_ref()
+        .is_some_and(|code| !valid_pairing_code(code))
+    {
         return Err("配对码需为 16–256 字节且不含空白，请修改指定的环境变量".into());
     }
     if config.access.mode == AccessMode::Restricted && allowed.is_empty() && pairing_code.is_none()
@@ -316,10 +318,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             directory,
             allowed,
             open_access: config.access.mode == AccessMode::Open,
-            sandbox: match config.codex.sandbox {
-                Sandbox::WorkspaceWrite => ports::Sandbox::WorkspaceWrite,
-                Sandbox::DangerFullAccess => ports::Sandbox::DangerFullAccess,
-            },
+            sandbox: config.codex.sandbox.into(),
             epoch,
         },
         backend,
