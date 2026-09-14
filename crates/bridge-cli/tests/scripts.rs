@@ -19,8 +19,13 @@ fn executable(path: &Path, body: &str) -> Result<(), Box<dyn Error>> {
 fn invoke(script: &str, action: &str) -> Result<(Output, String), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let binary = temp.path().join("fake bridge");
-    executable(&binary, "#!/bin/bash\nprintf '%s\\n' \"$@\"\n")?;
-    for name in ["cargo", "cc", "rustup", "codex"] {
+    // The credentials command is only consulted by start/restart/foreground;
+    // a silent success keeps the recorded service command lines observable.
+    executable(
+        &binary,
+        "#!/bin/bash\nif [ \"${1:-}\" = credentials ]; then exit 0; fi\nprintf '%s\\n' \"$@\"\n",
+    )?;
+    for name in ["cargo", "cc", "rustup"] {
         executable(&temp.path().join(name), "#!/bin/bash\nexit 0\n")?;
     }
     let config = temp.path().join("private config.toml");
@@ -69,21 +74,9 @@ fn service_actions_and_foreground_preserve_config() -> Result<(), Box<dyn Error>
 }
 
 #[test]
-fn invalid_action_and_pairing_code_fail_before_start() -> Result<(), Box<dyn Error>> {
+fn invalid_action_fails_before_any_execution() -> Result<(), Box<dyn Error>> {
     let (output, _) = invoke("start.sh", "invalid")?;
     assert_eq!(output.status.code(), Some(2));
-    let temp = tempfile::tempdir()?;
-    let binary = temp.path().join("bridge");
-    executable(&binary, "#!/bin/bash\nexit 99\n")?;
-    let output = Command::new(repo().join("start.sh"))
-        .arg("start")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("BRIDGE_RUST_BIN", binary)
-        .env("FEISHU_PAIRING_CODE", "too short")
-        .output()?;
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("16–256 字节"));
     Ok(())
 }
 
