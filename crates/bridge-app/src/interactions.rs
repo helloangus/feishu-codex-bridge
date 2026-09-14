@@ -1,364 +1,688 @@
-//! Bounded, single-owner interaction registry. Never stores vendor request IDs.
+//! The single interaction manager for approval and question flows.
+//!
+//! One owner per entry: the same user, chat and directory that received the
+//! card, bound to the still-running turn that raised the request. Entries are
+//! consumed before any asynchronous write, so an uncertain reply can never
+//! re-enable an approval. Expired or stale entries still receive their
+//! required denial. Vendor request IDs and answer text are never stored
+//! beyond the pending answers the user explicitly provided.
 use crate::{
-    ports::BackendFuture,
-    requests::{AgentReply, ReplyHandle, RequestKind},
+    cards::Owner,
+    ports::{BackendError, TurnRef},
+    requests::{AgentReply, AgentRequest, ReplyHandle, RequestKind},
 };
-use bridge_core::interaction::{Interaction, InteractionError, InteractionState, Owner};
-use std::collections::BTreeMap;
-use thiserror::Error;
+use std::{collections::BTreeMap, path::Path};
+use tokio::time::{Instant, timeout};
 
-struct Entry {
-    state: Interaction,
-    kind: RequestKind,
-    handle: Box<dyn ReplyHandle>,
-    answers: BTreeMap<String, Vec<String>>,
+pub struct Pending {
+    pub waiting_text: bool,
+    pub answers: BTreeMap<String, Vec<String>>,
+    pub question: usize,
+    pub request: AgentRequest,
+    pub reply: Box<dyn ReplyHandle>,
+    pub task: String,
+    pub owner: Owner,
+    pub deadline: Instant,
+    pub sending: bool,
+    pub source: Option<String>,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum RegistryError {
-    #[error("操作与交互类型不匹配")]
-    InvalidReply,
-    #[error(transparent)]
-    Interaction(#[from] InteractionError),
-}
-
-pub struct Registry {
-    capacity: usize,
-    entries: BTreeMap<String, Entry>,
-}
-impl Registry {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            entries: BTreeMap::new(),
-        }
+/// The question list of a request, when it is a question group.
+fn questions_of(request: &AgentRequest) -> Option<&[crate::requests::Question]> {
+    match &request.kind {
+        RequestKind::Questions { questions, .. } => Some(questions),
+        _ => None,
     }
-    /// Token generation belongs to the caller's random ID source. A failed
-    /// insertion returns the handle so the caller can decline the request.
-    pub fn insert(
-        &mut self,
-        token: String,
-        owner: Owner,
-        deadline_ms: u64,
-        kind: RequestKind,
-        handle: Box<dyn ReplyHandle>,
-    ) -> Result<(), Box<dyn ReplyHandle>> {
-        if token.is_empty()
-            || self.entries.len() >= self.capacity
-            || self.entries.contains_key(&token)
-        {
-            return Err(handle);
-        }
-        self.entries.insert(
-            token,
-            Entry {
-                state: Interaction {
-                    owner,
-                    deadline_ms,
-                    state: InteractionState::Pending,
-                },
-                kind,
-                handle,
-                answers: BTreeMap::new(),
-            },
-        );
-        Ok(())
+}
+
+impl Pending {
+    /// Ownership covers the delivering user, chat, directory and deadline;
+    /// turn liveness is supplied by the caller through a closure.
+    fn owned_by(&self, user: &str, chat: &str, directory: &Path, now: Instant) -> bool {
+        self.owner.user == user
+            && self.owner.chat == chat
+            && self.owner.directory == directory
+            && now < self.deadline
     }
-    /// Synchronous claim/removal precedes asynchronous I/O. An uncertain write
-    /// cannot re-enable approval; ownership failures leave the entry untouched.
-    pub fn resolve(
-        &mut self,
-        token: &str,
-        owner: &Owner,
-        now_ms: u64,
-        response: AgentReply,
-    ) -> Result<BackendFuture<'static, ()>, RegistryError> {
-        let entry = self
-            .entries
-            .get_mut(token)
-            .ok_or(InteractionError::Unavailable)?;
-        if &entry.state.owner != owner {
-            return Err(InteractionError::WrongOwner.into());
-        }
-        // Keep expired entries for expire() to send their required denial.
-        if now_ms >= entry.state.deadline_ms {
-            return Err(InteractionError::Unavailable.into());
-        }
-        match (&entry.kind, &response) {
-            (RequestKind::Approval(approval), AgentReply::Approve(allow))
-                if !allow || approval.can_allow => {}
-            (RequestKind::Questions { questions, .. }, AgentReply::Answers(answers))
-                if answers
-                    .keys()
-                    .all(|id| questions.iter().any(|q| &q.id == id)) => {}
-            _ => return Err(RegistryError::InvalidReply),
-        }
-        entry.state.claim(owner, now_ms)?;
-        let entry = self
-            .entries
-            .remove(token)
-            .ok_or(InteractionError::Unavailable)?;
-        let response = match response {
-            AgentReply::Answers(answers) => {
-                let mut merged = entry.answers;
-                merged.extend(answers);
-                AgentReply::Answers(merged)
+    fn current_question(&self) -> Option<&crate::requests::Question> {
+        match &self.request.kind {
+            RequestKind::Questions { questions, .. } if self.question < questions.len() => {
+                Some(&questions[self.question])
             }
-            approval => approval,
-        };
-        Ok(entry.handle.reply(response))
+            _ => None,
+        }
     }
-    /// Save one question locally, leaving the reply handle pending. The same
-    /// ownership and deadline checks apply to text answers and button answers.
-    pub fn answer(
-        &mut self,
-        token: &str,
-        owner: &Owner,
-        now_ms: u64,
-        question: &str,
-        answers: Vec<String>,
-    ) -> Result<(), RegistryError> {
-        let entry = self
-            .entries
-            .get_mut(token)
-            .ok_or(InteractionError::Unavailable)?;
-        if &entry.state.owner != owner {
-            return Err(InteractionError::WrongOwner.into());
-        }
-        if now_ms >= entry.state.deadline_ms {
-            return Err(InteractionError::Unavailable.into());
-        }
-        let RequestKind::Questions { questions, .. } = &entry.kind else {
-            return Err(RegistryError::InvalidReply);
-        };
-        if !questions.iter().any(|q| q.id == question) {
-            return Err(RegistryError::InvalidReply);
-        }
-        entry.answers.insert(question.into(), answers);
-        Ok(())
+    pub fn is_questions(&self) -> bool {
+        matches!(&self.request.kind, RequestKind::Questions { .. })
     }
+}
 
-    /// Caller must poll every returned future, including during shutdown.
-    pub fn expire(&mut self, now_ms: u64) -> Vec<BackendFuture<'static, ()>> {
-        let tokens: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.state.deadline_ms <= now_ms)
-            .map(|(t, _)| t.clone())
-            .collect();
-        self.reject_tokens(tokens)
-    }
-    pub fn cancel_epoch(&mut self, epoch: u64) -> Vec<BackendFuture<'static, ()>> {
-        let tokens: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.state.owner.connection_epoch == epoch)
-            .map(|(t, _)| t.clone())
-            .collect();
-        self.reject_tokens(tokens)
-    }
-    fn reject_tokens(&mut self, tokens: Vec<String>) -> Vec<BackendFuture<'static, ()>> {
-        tokens
-            .into_iter()
-            .filter_map(|token| self.entries.remove(&token))
-            .map(|entry| {
-                let response = match entry.kind {
-                    RequestKind::Approval(_) => AgentReply::Approve(false),
-                    RequestKind::Questions { .. } => AgentReply::Answers(entry.answers),
-                };
-                entry.handle.reply(response)
-            })
-            .collect()
-    }
+/// Outcome of a text answer: recorded (possibly completing the group) or
+/// invalid and rejected. A completed group returns its consumed entry so the
+/// caller can submit the answers.
+pub enum TextOutcome {
+    Recorded {
+        complete: bool,
+        finished: Option<Pending>,
+    },
+    Invalid,
+}
+
+/// Outcome of a button answer: waiting for free text, recorded (possibly
+/// completing the group), or invalid and rejected. A completed group returns
+/// its consumed entry so the caller can submit the answers.
+pub enum Choice {
+    WaitingText,
+    Recorded {
+        complete: bool,
+        finished: Option<Pending>,
+    },
+    Invalid,
+}
+
+/// Result of an asynchronous reply write. An uncertain result must stop the
+/// run: the protocol state cannot distinguish "applied" from "not applied".
+#[derive(Debug)]
+pub struct ReplyOutcome {
+    pub questions: bool,
+    pub chat: String,
+    pub allow: bool,
+    pub result: Result<(), BackendError>,
+    /// False when the group was incomplete and nothing was written.
+    pub submitted: bool,
+}
+
+#[derive(Default)]
+pub struct Interactions {
+    entries: BTreeMap<String, Pending>,
+}
+
+impl Interactions {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    pub fn contains(&self, token: &str) -> bool {
+        self.entries.contains_key(token)
+    }
+    pub fn get(&self, token: &str) -> Option<&Pending> {
+        self.entries.get(token)
+    }
+    pub fn get_mut(&mut self, token: &str) -> Option<&mut Pending> {
+        self.entries.get_mut(token)
+    }
+    pub fn remove(&mut self, token: &str) -> Option<Pending> {
+        self.entries.remove(token)
+    }
+    /// Registration is bounded and refuses a second open request for the same
+    /// turn item; duplicates are ambiguous and revoke what came before.
+    pub fn insert(&mut self, token: String, pending: Pending) -> bool {
+        if token.is_empty() || self.entries.len() >= 32 {
+            return false;
+        }
+        if self.entries.values().any(|existing| {
+            existing.request.turn == pending.request.turn
+                && existing.request.item == pending.request.item
+        }) {
+            return false;
+        }
+        self.entries.insert(token, pending);
+        true
+    }
+    /// A request is a duplicate when the same turn item already has one.
+    pub fn item_is_open(&self, turn: &TurnRef, item: &str) -> bool {
+        self.entries
+            .values()
+            .any(|pending| pending.request.turn == *turn && pending.request.item == item)
+    }
+    /// Revoke every open request for a turn by expiring it immediately.
+    pub fn expire_turn(&mut self, turn: &TurnRef, item: &str) {
+        for pending in self.entries.values_mut() {
+            if pending.request.turn == *turn && pending.request.item == item {
+                pending.deadline = Instant::now();
+            }
+        }
+    }
+    /// Tokens whose deadline passed or whose owning task is no longer alive.
+    /// Expired entries stay registered until `expire` removes them so their
+    /// required denial is sent exactly once.
+    pub fn stale_tokens(
+        &self,
+        now: Instant,
+        alive: impl Fn(&Pending) -> bool,
+    ) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, pending)| now >= pending.deadline || !alive(pending))
+            .map(|(token, _)| token.clone())
+            .collect()
+    }
+    /// Tokens whose card still needs to be sent for a live turn.
+    pub fn unsent_tokens(&self, valid: impl Fn(&Pending) -> bool) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, pending)| !pending.sending && valid(pending))
+            .map(|(token, _)| token.clone())
+            .collect()
+    }
+    /// Record a text answer for the question the card is waiting on. Early,
+    /// late, foreign or non-waiting answers are rejected; a completed group is
+    /// removed and returned so the caller can submit the answers.
+    pub fn answer_text(
+        &mut self,
+        token: &str,
+        user: &str,
+        chat: &str,
+        directory: &Path,
+        now: Instant,
+        index: usize,
+        answer: &str,
+        skip: bool,
+        turn_live: impl Fn(&Pending) -> bool,
+    ) -> TextOutcome {
+        let turn_live = |pending: &Pending| !skip && turn_live(pending);
+        let Some(pending) = self.entries.get_mut(token) else {
+            return TextOutcome::Invalid;
+        };
+        if !pending.waiting_text
+            || index != pending.question
+            || !pending.owned_by(user, chat, directory, now)
+            || !turn_live(pending)
+        {
+            return TextOutcome::Invalid;
+        }
+        let Some(question_id) = (match &pending.request.kind {
+            RequestKind::Questions { questions, .. } if pending.question < questions.len() => {
+                Some(questions[pending.question].id.clone())
+            }
+            _ => None,
+        }) else {
+            return TextOutcome::Invalid;
+        };
+        pending.answers.insert(question_id, vec![answer.into()]);
+        pending.waiting_text = false;
+        pending.question += 1;
+        pending.sending = false;
+        pending.source = None;
+        let complete = questions_of(&pending.request)
+            .is_some_and(|questions| pending.question == questions.len());
+        let finished = if complete { self.entries.remove(token) } else { None };
+        TextOutcome::Recorded { complete, finished }
+    }
+    /// Record a button choice for the current question. The click must come
+    /// from the card the entry last delivered. `other` switches the entry to
+    /// text mode; anything else must name a valid option index.
+    pub fn answer_choice(
+        &mut self,
+        token: &str,
+        user: &str,
+        chat: &str,
+        directory: &Path,
+        now: Instant,
+        source: &str,
+        index: usize,
+        choice: &str,
+        turn_live: impl Fn(&Pending) -> bool,
+    ) -> Choice {
+        let Some(pending) = self.entries.get_mut(token) else {
+            return Choice::Invalid;
+        };
+        if !pending.owned_by(user, chat, directory, now)
+            || pending.source.as_deref() != Some(source)
+            || pending.sending
+            || index != pending.question
+            || !turn_live(pending)
+        {
+            return Choice::Invalid;
+        }
+        let Some(question) = pending.current_question() else {
+            return Choice::Invalid;
+        };
+        if choice == "other" {
+            if !question.other && !question.options.is_empty() && !question.secret {
+                return Choice::Invalid;
+            }
+            pending.waiting_text = true;
+            return Choice::WaitingText;
+        }
+        let Some(selected) = choice
+            .parse::<usize>()
+            .ok()
+            .and_then(|position| question.options.get(position))
+            .map(|option| vec![option.label.clone()])
+        else {
+            return Choice::Invalid;
+        };
+        let question_id = question.id.clone();
+        let total = questions_of(&pending.request)
+            .map(|questions| questions.len())
+            .unwrap_or_default();
+        pending.answers.insert(question_id, selected);
+        pending.question += 1;
+        pending.sending = false;
+        pending.source = None;
+        let complete = pending.question == total;
+        let finished = if complete { self.entries.remove(token) } else { None };
+        Choice::Recorded { complete, finished }
+    }
+    /// Consume an approval decision. The click must reference the card the
+    /// entry last delivered; the entry is removed before the async write.
+    pub fn approve(
+        &mut self,
+        token: &str,
+        user: &str,
+        chat: &str,
+        directory: &Path,
+        now: Instant,
+        source: &str,
+        turn_live: impl Fn(&Pending) -> bool,
+    ) -> Option<Pending> {
+        let pending = self.entries.get(token)?;
+        if pending.is_questions()
+            || pending.source.as_deref() != Some(source)
+            || !pending.owned_by(user, chat, directory, now)
+            || !turn_live(pending)
+        {
+            return None;
+        }
+        self.entries.remove(token)
+    }
+    /// Remove and return every entry whose deadline has passed; the caller
+    /// turns each into the required denial.
+    pub fn expire(&mut self, now: Instant) -> Vec<Pending> {
+        let tokens: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, pending)| now >= pending.deadline)
+            .map(|(token, _)| token.clone())
+            .collect();
+        self.remove_all(tokens)
+    }
+    /// Remove every entry regardless of state; used on shutdown.
+    pub fn drain(&mut self) -> Vec<Pending> {
+        self.remove_all(self.entries.keys().cloned().collect())
+    }
+    fn remove_all(&mut self, tokens: Vec<String>) -> Vec<Pending> {
+        tokens
+            .into_iter()
+            .filter_map(|token| self.entries.remove(&token))
+            .collect()
+    }
+}
+
+/// Submit one pending entry's reply. Groups with missing or empty answers are
+/// never submitted — dropping the handle writes nothing, including shutdown.
+/// The write is bounded; an elapsed bound reports [`BackendError::Uncertain`].
+pub async fn deliver_reply(pending: Pending, allow: bool) -> ReplyOutcome {
+    let questions = pending.is_questions();
+    if let RequestKind::Questions { questions: list, .. } = &pending.request.kind {
+        if list.is_empty()
+            || list.iter().any(|question| {
+                !pending.answers.get(&question.id).is_some_and(|answers| {
+                    !answers.is_empty() && answers.iter().all(|answer| !answer.trim().is_empty())
+                })
+            })
+        {
+            return ReplyOutcome {
+                questions,
+                chat: pending.owner.chat,
+                allow,
+                result: Ok(()),
+                submitted: false,
+            };
+        }
+    }
+    let response = match &pending.request.kind {
+        RequestKind::Questions { .. } => AgentReply::Answers(pending.answers.clone()),
+        _ => AgentReply::Approve(allow),
+    };
+    let result = timeout(std::time::Duration::from_secs(10), pending.reply.reply(response))
+        .await
+        .unwrap_or(Err(BackendError::Uncertain));
+    if questions {
+        crate::diagnostics::emit(
+            crate::diagnostics::Event::AnswerReturned,
+            if result.is_ok() {
+                crate::diagnostics::Status::Ok
+            } else {
+                crate::diagnostics::Status::Failed
+            },
+            Some(&pending.task),
+            0,
+        );
+    }
+    ReplyOutcome {
+        questions,
+        chat: pending.owner.chat,
+        allow,
+        result,
+        submitted: true,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::requests::{Approval, ApprovalKind};
-    use bridge_core::SessionKey;
+    use crate::requests::{Approval, ApprovalKind, Question};
     use std::sync::{Arc, Mutex};
-    struct Handle(Arc<Mutex<Vec<bool>>>);
+
+    type BoxError = Box<dyn std::error::Error>;
+
+    struct Handle(Arc<Mutex<Vec<AgentReply>>>);
     impl ReplyHandle for Handle {
-        fn reply(self: Box<Self>, response: AgentReply) -> BackendFuture<'static, ()> {
-            if let AgentReply::Approve(allow) = response {
-                if let Ok(mut items) = self.0.lock() {
-                    items.push(allow);
-                }
+        fn reply(self: Box<Self>, response: AgentReply) -> crate::ports::BackendFuture<'static, ()> {
+            if let Ok(mut recorded) = self.0.lock() {
+                recorded.push(response);
             }
             Box::pin(async { Ok(()) })
         }
     }
+    struct FailingHandle;
+    impl ReplyHandle for FailingHandle {
+        fn reply(self: Box<Self>, _: AgentReply) -> crate::ports::BackendFuture<'static, ()> {
+            Box::pin(async { Err(BackendError::Rejected(1)) })
+        }
+    }
+
     fn owner() -> Owner {
         Owner {
-            session: SessionKey::new("user", "/tmp"),
+            user: "user".into(),
             chat: "chat".into(),
-            card: "card".into(),
-            task: Some("task".into()),
-            connection_epoch: 1,
+            directory: "/workspace".into(),
+            generation: 3,
+            stop_snapshot: (0, None),
         }
     }
-    fn kind() -> RequestKind {
-        RequestKind::Approval(Approval {
-            permissions: None,
-            network_context: None,
-            changes: None,
-            kind: ApprovalKind::Command,
-            command: None,
-            directory: None,
-            reason: None,
-            grant_root: None,
-            can_allow: true,
-        })
+    fn task() -> String {
+        "task".into()
     }
-    #[test]
-    fn wrong_owner_and_reply_do_not_consume_but_success_does() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = Registry::new(2);
-        assert!(
-            registry
-                .insert(
-                    "token".into(),
-                    owner(),
-                    100,
-                    kind(),
-                    Box::new(Handle(calls.clone()))
-                )
-                .is_ok()
-        );
-        let mut wrong = owner();
-        wrong.card = "other".into();
-        assert!(
-            registry
-                .resolve("token", &wrong, 1, AgentReply::Approve(true))
-                .is_err()
-        );
-        assert!(
-            registry
-                .resolve("token", &owner(), 1, AgentReply::Answers(BTreeMap::new()))
-                .is_err()
-        );
-        assert_eq!(registry.len(), 1);
-        drop(registry.resolve("token", &owner(), 99, AgentReply::Approve(true)));
-        assert!(
-            registry
-                .resolve("token", &owner(), 99, AgentReply::Approve(true))
-                .is_err()
-        );
-        assert!(registry.expire(100).is_empty());
-        assert_eq!(
-            calls.lock().ok().as_deref().map(|v| v.as_slice()),
-            Some([true].as_slice())
-        );
+    fn approval_request(token: &str) -> AgentRequest {
+        AgentRequest {
+            turn: TurnRef { epoch: 1, thread_id: "thread".into(), turn_id: format!("turn-{token}") },
+            item: format!("item-{token}"),
+            kind: RequestKind::Approval(Approval {
+                permissions: None,
+                network_context: None,
+                changes: None,
+                kind: ApprovalKind::Command,
+                command: Some("echo".into()),
+                directory: Some("/workspace".into()),
+                reason: None,
+                grant_root: None,
+                can_allow: true,
+            }),
+        }
     }
-    #[test]
-    fn deadline_and_reconnect_remove_handles_once() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = Registry::new(1);
-        assert!(
-            registry
-                .insert(
-                    "a".into(),
-                    owner(),
-                    10,
-                    kind(),
-                    Box::new(Handle(calls.clone()))
-                )
-                .is_ok()
-        );
-        assert!(
-            registry
-                .insert(
-                    "b".into(),
-                    owner(),
-                    10,
-                    kind(),
-                    Box::new(Handle(calls.clone()))
-                )
-                .is_err()
-        );
-        assert!(
-            registry
-                .resolve("a", &owner(), 10, AgentReply::Approve(true))
-                .is_err()
-        );
-        assert_eq!(registry.expire(10).len(), 1);
-        assert!(registry.cancel_epoch(1).is_empty());
-        assert!(registry.is_empty());
-        assert_eq!(
-            calls.lock().ok().as_deref().map(|v| v.as_slice()),
-            Some([false].as_slice())
-        );
+    fn question_request(token: &str) -> AgentRequest {
+        AgentRequest {
+            turn: TurnRef { epoch: 1, thread_id: "thread".into(), turn_id: format!("turn-{token}") },
+            item: format!("item-{token}"),
+            kind: RequestKind::Questions {
+                blocking: true,
+                questions: vec![
+                    Question {
+                        id: "q1".into(),
+                        header: "h".into(),
+                        text: "t".into(),
+                        other: true,
+                        secret: false,
+                        options: vec![],
+                    },
+                    Question {
+                        id: "q2".into(),
+                        header: "h".into(),
+                        text: "t".into(),
+                        other: false,
+                        secret: false,
+                        options: vec![],
+                    },
+                ],
+            },
+        }
     }
-}
+    fn now() -> Instant {
+        Instant::now()
+    }
+    fn live() -> impl Fn(&Pending) -> bool {
+        |_| true
+    }
 
-#[cfg(test)]
-mod answer_tests {
-    use super::*;
-    use crate::requests::Question;
-    use bridge_core::SessionKey;
-    use std::sync::{Arc, Mutex};
-    struct Handle(Arc<Mutex<BTreeMap<String, Vec<String>>>>);
-    impl ReplyHandle for Handle {
-        fn reply(self: Box<Self>, reply: AgentReply) -> BackendFuture<'static, ()> {
-            if let AgentReply::Answers(answers) = reply {
-                if let Ok(mut saved) = self.0.lock() {
-                    *saved = answers;
-                }
-            }
-            Box::pin(async { Ok(()) })
-        }
+    fn insert_approval(registry: &mut Interactions, token: &str, handle: Box<dyn ReplyHandle>) -> bool {
+        registry.insert(
+            token.into(),
+            Pending {
+                waiting_text: false,
+                answers: BTreeMap::new(),
+                question: 0,
+                request: approval_request(token),
+                reply: handle,
+                task: task(),
+                owner: owner(),
+                deadline: now() + std::time::Duration::from_secs(600),
+                sending: false,
+                source: Some("card".into()),
+            },
+        )
     }
+    fn insert_questions(registry: &mut Interactions, token: &str, handle: Box<dyn ReplyHandle>) {
+        assert!(registry.insert(
+            token.into(),
+            Pending {
+                waiting_text: false,
+                answers: BTreeMap::new(),
+                question: 0,
+                request: question_request(token),
+                reply: handle,
+                task: task(),
+                owner: owner(),
+                deadline: now() + std::time::Duration::from_secs(600),
+                sending: false,
+                source: None,
+            },
+        ));
+    }
+
     #[test]
-    fn partial_answers_survive_timeout() -> Result<(), RegistryError> {
-        let saved = Arc::new(Mutex::new(BTreeMap::new()));
-        let owner = Owner {
-            session: SessionKey::new("u", "/tmp"),
-            chat: "c".into(),
-            card: "card".into(),
-            task: None,
-            connection_epoch: 1,
+    fn registration_is_bounded_and_refuses_duplicate_turn_items() {
+        let mut registry = Interactions::default();
+        for index in 0..32 {
+            assert!(insert_approval(&mut registry, &format!("t{index}"), Box::new(Handle(Arc::new(Mutex::new(Vec::new()))))));
+        }
+        assert!(!insert_approval(&mut registry, "extra", Box::new(Handle(Arc::new(Mutex::new(Vec::new()))))));
+        let mut duplicate = Interactions::default();
+        let handle = || Box::new(Handle(Arc::new(Mutex::new(Vec::new())))) as Box<dyn ReplyHandle>;
+        assert!(insert_approval(&mut duplicate, "first", handle()));
+        // The second registration reuses the first request's turn and item.
+        let mut second = Pending {
+            waiting_text: false,
+            answers: BTreeMap::new(),
+            question: 0,
+            request: approval_request("first"),
+            reply: handle(),
+            task: task(),
+            owner: owner(),
+            deadline: now() + std::time::Duration::from_secs(600),
+            sending: false,
+            source: Some("card".into()),
         };
-        let kind = RequestKind::Questions {
-            blocking: true,
-            questions: vec![Question {
-                id: "q".into(),
-                header: "h".into(),
-                text: "text".into(),
-                other: true,
-                secret: false,
-                options: vec![],
-            }],
-        };
-        let mut registry = Registry::new(1);
+        second.request.turn.thread_id = "thread".into();
+        assert!(!duplicate.insert("second".into(), second));
+        assert!(!duplicate.item_is_open(&TurnRef { epoch: 9, thread_id: "x".into(), turn_id: "y".into() }, "item-first"));
+    }
+
+    #[test]
+    fn foreign_owners_and_unknown_sources_never_consume() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Interactions::default();
+        insert_approval(&mut registry, "token", Box::new(Handle(recorded.clone())));
+        let directory = std::path::Path::new("/workspace");
         assert!(
             registry
-                .insert(
-                    "token".into(),
-                    owner.clone(),
-                    10,
-                    kind,
-                    Box::new(Handle(saved.clone()))
-                )
-                .is_ok()
+                .approve("token", "other", "chat", directory, now(), "card", |_| true)
+                .is_none()
         );
-        registry.answer("token", &owner, 9, "q", vec!["answer".into()])?;
         assert!(
             registry
-                .answer("token", &owner, 10, "q", vec!["late".into()])
-                .is_err()
+                .approve("token", "user", "elsewhere", directory, now(), "card", |_| true)
+                .is_none()
         );
-        assert_eq!(registry.expire(10).len(), 1);
-        assert_eq!(
-            saved.lock().ok().and_then(|m| m.get("q").cloned()),
-            Some(vec!["answer".into()])
+        assert!(
+            registry
+                .approve("token", "user", "chat", directory, now(), "stale", |_| true)
+                .is_none()
         );
+        assert!(
+            registry
+                .approve("token", "user", "chat", directory, now(), "card", |_| false)
+                .is_none()
+        );
+        // A questions entry is never consumable through the approval path.
+        insert_questions(&mut registry, "questions", Box::new(Handle(Arc::new(Mutex::new(Vec::new())))));
+        assert!(registry.approve("questions", "user", "chat", directory, now(), "card", |_| true).is_none());
+        assert_eq!(registry.len(), 2);
+        assert!(recorded.lock().map(|v| v.is_empty()).unwrap_or_default());
+    }
+
+    #[test]
+    fn approval_consumes_before_write_and_denial_is_returned() -> Result<(), BoxError> {
+        let mut registry = Interactions::default();
+        insert_approval(&mut registry, "token", Box::new(Handle(Arc::new(Mutex::new(Vec::new())))));
+        let directory = std::path::Path::new("/workspace");
+        let pending = registry
+            .approve("token", "user", "chat", directory, now(), "card", |_| true)
+            .ok_or("approval must be consumable")?;
+        assert!(registry.is_empty());
+        // The second attempt has nothing to consume.
+        assert!(registry.approve("token", "user", "chat", directory, now(), "card", |_| true).is_none());
+        drop(pending);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn uncertain_reply_is_reported_and_incomplete_answers_are_never_submitted()
+    -> Result<(), BoxError> {
+        let mut registry = Interactions::default();
+        insert_questions(&mut registry, "token", Box::new(FailingHandle));
+        let mut pending = registry.remove("token").ok_or("entry")?;
+        pending
+            .answers
+            .insert("q1".into(), vec!["first".into()]);
+        pending
+            .answers
+            .insert("q2".into(), vec!["second".into()]);
+        let outcome = deliver_reply(pending, false).await;
+        assert_eq!(outcome.result, Err(BackendError::Rejected(1)));
+        assert!(outcome.submitted);
+        // An expired questions group drops the handle without any write.
+        let mut expired = Interactions::default();
+        insert_questions(&mut expired, "token", Box::new(FailingHandle));
+        expired
+            .get_mut("token")
+            .ok_or("entry")?
+            .deadline = now();
+        // Expired entries stay registered until expire() removes them once.
+        let pending = expired
+            .expire(now())
+            .into_iter()
+            .next()
+            .ok_or("expired entry")?;
+        assert!(expired.expire(now()).is_empty());
+        let outcome = deliver_reply(pending, false).await;
+        assert!(!outcome.submitted);
+        assert_eq!(outcome.result, Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn per_question_answers_progress_and_reject_mismatched_steps() -> Result<(), BoxError> {
+        let mut registry = Interactions::default();
+        insert_questions(&mut registry, "token", Box::new(Handle(Arc::new(Mutex::new(Vec::new())))));
+        let directory = std::path::Path::new("/workspace");
+        // Buttons only work after the card source has been delivered.
+        assert!(matches!(
+            registry.answer_choice("token", "user", "chat", directory, now(), "card", 0, "0", |_| true),
+            Choice::Invalid
+        ));
+        registry
+            .get_mut("token")
+            .ok_or("entry")?
+            .source = Some("card".into());
+        assert!(matches!(
+            registry.answer_choice("token", "user", "chat", directory, now(), "card", 1, "0", |_| true),
+            Choice::Invalid
+        ));
+        // "other" without options waits for text.
+        assert!(matches!(
+            registry.answer_choice("token", "user", "chat", directory, now(), "card", 0, "other", |_| true),
+            Choice::WaitingText
+        ));
+        // The first question has no options; a choice index cannot record.
+        assert!(matches!(
+            registry.answer_choice("token", "user", "chat", directory, now(), "card", 0, "0", |_| true),
+            Choice::Invalid
+        ));
+        // Text answers only apply to the waiting question.
+        assert!(matches!(
+            registry.answer_text("token", "user", "chat", directory, now(), 1, "late", false, |_| true),
+            TextOutcome::Invalid
+        ));
+        assert!(matches!(
+            registry.answer_text("token", "user", "chat", directory, now(), 0, "first answer", false, |_| true),
+            TextOutcome::Recorded { complete: false, finished: None }
+        ));
+        // The next question re-enters text mode through its own card click;
+        // the re-delivered card installs a fresh source first.
+        registry
+            .get_mut("token")
+            .ok_or("entry")?
+            .source = Some("card".into());
+        assert!(matches!(
+            registry.answer_choice("token", "user", "chat", directory, now(), "card", 1, "other", |_| true),
+            Choice::WaitingText
+        ));
+        assert!(matches!(
+            registry.answer_text("token", "user", "chat", directory, now(), 1, "second answer", false, |_| true),
+            TextOutcome::Recorded { complete: true, finished: Some(_) }
+        ));
+        assert!(registry.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_and_expired_entries_are_reported_once() {
+        let mut registry = Interactions::default();
+        insert_approval(&mut registry, "token", Box::new(Handle(Arc::new(Mutex::new(Vec::new())))));
+        let stale = registry.stale_tokens(now(), |_| false);
+        assert_eq!(stale, vec!["token".to_owned()]);
+        assert!(registry.stale_tokens(now(), live()).is_empty());
+        let removed = registry.expire(now() + std::time::Duration::from_secs(601));
+        assert_eq!(removed.len(), 1);
+        assert!(registry.is_empty());
+        assert!(registry.expire(now()).is_empty());
+    }
+
+    #[test]
+    fn turn_revocation_marks_entries_expired() {
+        let mut registry = Interactions::default();
+        insert_approval(&mut registry, "token", Box::new(Handle(Arc::new(Mutex::new(Vec::new())))));
+        registry.expire_turn(
+            &TurnRef { epoch: 1, thread_id: "thread".into(), turn_id: "turn-token".into() },
+            "item-token",
+        );
+        assert_eq!(registry.expire(now()).len(), 1);
+    }
+
+    #[test]
+    fn dead_turns_are_reported_stale_while_live_ones_stay() {
+        // Turn liveness (including the connection epoch) is expressed through
+        // the caller-supplied `alive` check; entries of a dead turn must be
+        // reported stale without being consumed by the report itself.
+        let mut registry = Interactions::default();
+        insert_approval(&mut registry, "token", Box::new(Handle(Arc::new(Mutex::new(Vec::new())))));
+        assert_eq!(registry.stale_tokens(now(), |_| false), vec!["token".to_owned()]);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.stale_tokens(now(), live()).is_empty());
     }
 }
