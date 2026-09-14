@@ -29,7 +29,7 @@ tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 walkdir = "2"
 similar = "2.7"
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
 tokio-tungstenite = { version = "0.26.2", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 prost = "0.13.5"
 base64 = "0.22"
