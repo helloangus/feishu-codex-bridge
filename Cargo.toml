@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "sy
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 walkdir = "2"
-similar = "2.7"
+similar = "3.2"
 rustix = { version = "1", features = ["fs", "process"] }
 tokio-tungstenite = { version = "0.26.2", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 prost = "0.13.5"
