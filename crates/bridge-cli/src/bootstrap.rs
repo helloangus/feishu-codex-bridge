@@ -47,7 +47,7 @@ pub fn decode_card_click(
     }
 }
 
-/// Same directory/hash naming as service.py, so Python and Rust exclude each other.
+/// Stable App ID-derived lock shared by every native service entry point.
 pub fn app_lock(directory: &Path, app_id: &str) -> Result<File, Box<dyn std::error::Error>> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     fs::DirBuilder::new()

@@ -125,300 +125,375 @@ async fn compaction_stop_during_preparation_never_submits() -> Result<(), Box<dy
 
 async fn compact_scenario(mode: &str) -> Result<(), Box<dyn Error>> {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let temp=tempfile::tempdir()?;
-        let script=temp.path().join("compact.py");
-        std::fs::write(&script,r#"
-import json,sys,os
-mode=sys.argv[1]
-pending=False
-preparation=None
-def emit(v): print(json.dumps(v),flush=True)
-def started(thread='thread',turn='compact'):
-    emit({'method':'turn/started','params':{'threadId':thread,'turn':{'id':turn,'status':'inProgress'}}})
-def finished(status='completed',turn='compact'):
-    emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':turn,'status':status,'error':({'message':'fake compact error'} if status=='failed' else None)}}})
-for line in sys.stdin:
-    m=json.loads(line);method=m.get('method')
-    if method=='initialized':continue
-    if method=='initialize':result={}
-    elif method in ('thread/read','thread/resume'):
-        assert m['params']['threadId']=='thread'
-        result={'thread':{'id':('wrong' if mode=='wrong_resume' and method=='thread/resume' else 'thread'),'cwd':('/foreign' if mode=='foreign' else os.getcwd()),'status':{'type':('active' if mode=='active' else 'idle')}}}
-        with open('preparation','a') as f:f.write(method+'\n')
-        if mode=='prepare_stop' and method=='thread/read':
-            preparation={'id':m['id'],'result':result};continue
-    elif method=='thread/compact/start':
-        assert m['params']=={'threadId':'thread'}
-        with open('compactions','a') as f:f.write('compact\n')
-        if mode=='rejected':
-            emit({'id':m['id'],'error':{'code':-32000,'message':'rejected'}});continue
-        if mode=='uncertain':
-            emit({'id':m['id'],'result':None});continue
-        pending=True
-        started('unrelated','foreign')
-        started()
-        finished(turn='stale')
-        if mode=='early':finished();pending=False
-        result={}
-    elif method=='model/list':
-        if preparation is not None:emit(preparation);preparation=None
-        if pending:finished('failed' if mode=='failed' else 'completed');pending=False
-        result={'data':[{'id':'gpt-5.6-luna','isDefault':False}]}
-    elif method=='turn/interrupt':
-        assert m['params']=={'threadId':'thread','turnId':'compact'}
-        with open('compact-interrupts','a') as f:f.write('interrupt\n')
-        finished('interrupted');pending=False;result={}
-    else:raise RuntimeError(method)
-    emit({'id':m['id'],'result':result})
-"#)?;
-        let mut server=AppServer::spawn(Path::new("python3"),&["-I".into(),"-u".into(),script.to_string_lossy().into_owned(),mode.into()],temp.path(),19).await?;
-        let backend=Arc::new(server.backend());
-        let state_path=temp.path().join("state");
-        let key=bridge_core::SessionKey::new("allowed",temp.path());
-        let initial=AsyncState::new(JsonStore::open(&state_path)?);
-        if mode!="empty" {initial.bind(key.clone(),"thread".into()).await?;}
+        let temp = tempfile::tempdir()?;
+        let mut server = AppServer::spawn(
+            Path::new(env!("CARGO_BIN_EXE_fake-codex-runtime")),
+            &["compact".into(), mode.into()],
+            temp.path(),
+            19,
+        )
+        .await?;
+        let backend = Arc::new(server.backend());
+        let state_path = temp.path().join("state");
+        let key = bridge_core::SessionKey::new("allowed", temp.path());
+        let initial = AsyncState::new(JsonStore::open(&state_path)?);
+        if mode != "empty" {
+            initial.bind(key.clone(), "thread".into()).await?;
+        }
         drop(initial);
-        let store=Arc::new(AsyncState::new(JsonStore::open(&state_path)?));
-        if mode=="storage" {
+        let store = Arc::new(AsyncState::new(JsonStore::open(&state_path)?));
+        if mode == "storage" {
             std::fs::create_dir(state_path.join("seen-messages.json"))?;
         }
-        let (input_tx,input_rx)=mpsc::channel(16);
-        let (event_tx,event_rx)=mpsc::channel(16);
-        let (messages,mut output)=mpsc::channel(64);
-        let cancel=CancellationToken::new();let stop=cancel.clone();
-        let source=tokio::spawn(async move {
-            loop {let event=tokio::select! {_=stop.cancelled()=>break,event=server.next_event()=>event};if event_tx.send(event).await.is_err(){break;}}
+        let (input_tx, input_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let (messages, mut output) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let source = tokio::spawn(async move {
+            loop {
+                let event =
+                    tokio::select! {_=stop.cancelled()=>break,event=server.next_event()=>event};
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
             server.shutdown().await
         });
-        let worker=tokio::spawn(runtime::run(runtime::Settings {root:temp.path().into(),directory:temp.path().into(),allowed:BTreeSet::from(["allowed".into(),"other".into()]),open_access:false,sandbox:bridge_app::ports::Sandbox::WorkspaceWrite,epoch:19},backend,store.clone(),Arc::new(Messages(messages)),input_rx,event_rx,cancel.clone()));
-        if mode=="storage" {
-            let (ack,wait)=oneshot::channel();
-            input_tx.send(Input { attachments:vec![],card: None,id:"compact".into(),user:"allowed".into(),chat:"chat".into(),text:Some("/compact".into()),accept:Box::new(move|value|{let _=ack.send(value);})}).await?;
+        let worker = tokio::spawn(runtime::run(
+            runtime::Settings {
+                root: temp.path().into(),
+                directory: temp.path().into(),
+                allowed: BTreeSet::from(["allowed".into(), "other".into()]),
+                open_access: false,
+                sandbox: bridge_app::ports::Sandbox::WorkspaceWrite,
+                epoch: 19,
+            },
+            backend,
+            store.clone(),
+            Arc::new(Messages(messages)),
+            input_rx,
+            event_rx,
+            cancel.clone(),
+        ));
+        if mode == "storage" {
+            let (ack, wait) = oneshot::channel();
+            input_tx
+                .send(Input {
+                    attachments: vec![],
+                    card: None,
+                    id: "compact".into(),
+                    user: "allowed".into(),
+                    chat: "chat".into(),
+                    text: Some("/compact".into()),
+                    accept: Box::new(move |value| {
+                        let _ = ack.send(value);
+                    }),
+                })
+                .await?;
             assert!(!wait.await?);
-            until(&mut output,"压缩请求保存失败").await?;
+            until(&mut output, "压缩请求保存失败").await?;
             assert!(!temp.path().join("preparation").exists());
-            cancel.cancel();worker.await??;source.await??;
+            cancel.cancel();
+            worker.await??;
+            source.await??;
             return Ok(());
         }
-        send(&input_tx,"compact","allowed","/compact").await?;
-        if mode=="prepare_stop" {
-            while !tokio::fs::try_exists(temp.path().join("preparation")).await? {tokio::time::sleep(Duration::from_millis(5)).await;}
-            send(&input_tx,"prepare-stop","allowed","/stop").await?;
-            until(&mut output,"已请求停止当前任务").await?;
-            send(&input_tx,"release-read","allowed","/models").await?;
-            until(&mut output,"准备阶段已停止，未启动压缩").await?;
+        send(&input_tx, "compact", "allowed", "/compact").await?;
+        if mode == "prepare_stop" {
+            while !tokio::fs::try_exists(temp.path().join("preparation")).await? {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            send(&input_tx, "prepare-stop", "allowed", "/stop").await?;
+            until(&mut output, "已请求停止当前任务").await?;
+            send(&input_tx, "release-read", "allowed", "/models").await?;
+            until(&mut output, "准备阶段已停止，未启动压缩").await?;
             assert!(!temp.path().join("compactions").exists());
-        } else if matches!(mode,"empty"|"foreign"|"active"|"wrong_resume") {
-            until(&mut output,"压缩准备失败").await?;
+        } else if matches!(mode, "empty" | "foreign" | "active" | "wrong_resume") {
+            until(&mut output, "压缩准备失败").await?;
             assert!(!temp.path().join("compactions").exists());
-        } else if mode=="uncertain" {
-            until(&mut output,"压缩启动结果不确定").await?;
+        } else if mode == "uncertain" {
+            until(&mut output, "压缩启动结果不确定").await?;
             assert!(worker.await?.is_err());
-            cancel.cancel();source.await??;
-            assert_eq!(std::fs::read_to_string(temp.path().join("compactions"))?,"compact\n");
+            cancel.cancel();
+            source.await??;
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("compactions"))?,
+                "compact\n"
+            );
             return Ok(());
-        } else if mode=="rejected" {
-            until(&mut output,"压缩请求被拒绝").await?;
-        } else if mode=="early" {
-            until(&mut output,"上下文压缩完成").await?;
+        } else if mode == "rejected" {
+            until(&mut output, "压缩请求被拒绝").await?;
+        } else if mode == "early" {
+            until(&mut output, "上下文压缩完成").await?;
         } else {
-            until(&mut output,"正在等待完成").await?;
-            send(&input_tx,"status","allowed","/status").await?;
-            let status=until(&mut output,"上下文压缩中").await?;
+            until(&mut output, "正在等待完成").await?;
+            send(&input_tx, "status", "allowed", "/status").await?;
+            let status = until(&mut output, "上下文压缩中").await?;
             assert!(!status.contains("上下文压缩完成"));
-            send(&input_tx,"busy","allowed","/new").await?;
-            until(&mut output,"有任务执行中").await?;
-            send(&input_tx,"again","allowed","/compact").await?;
-            until(&mut output,"有任务执行中").await?;
-            let (ack,wait)=oneshot::channel();
-            input_tx.send(Input { attachments:vec![],card: None,id:"blocked-task".into(),user:"allowed".into(),chat:"chat".into(),text:Some("must not run".into()),accept:Box::new(move|value|{let _=ack.send(value);})}).await?;
+            send(&input_tx, "busy", "allowed", "/new").await?;
+            until(&mut output, "有任务执行中").await?;
+            send(&input_tx, "again", "allowed", "/compact").await?;
+            until(&mut output, "有任务执行中").await?;
+            let (ack, wait) = oneshot::channel();
+            input_tx
+                .send(Input {
+                    attachments: vec![],
+                    card: None,
+                    id: "blocked-task".into(),
+                    user: "allowed".into(),
+                    chat: "chat".into(),
+                    text: Some("must not run".into()),
+                    accept: Box::new(move |value| {
+                        let _ = ack.send(value);
+                    }),
+                })
+                .await?;
             assert!(!wait.await?);
-            until(&mut output,"任务队列繁忙").await?;
-            send(&input_tx,"other-stop","other","/stop").await?;
-            until(&mut output,"没有可停止").await?;
+            until(&mut output, "任务队列繁忙").await?;
+            send(&input_tx, "other-stop", "other", "/stop").await?;
+            until(&mut output, "没有可停止").await?;
             assert!(!temp.path().join("compact-interrupts").exists());
-            if mode=="stop" {
-                send(&input_tx,"stop","allowed","/stop").await?;
-                until(&mut output,"上下文压缩已停止").await?;
-                assert_eq!(std::fs::read_to_string(temp.path().join("compact-interrupts"))?,"interrupt\n");
+            if mode == "stop" {
+                send(&input_tx, "stop", "allowed", "/stop").await?;
+                until(&mut output, "上下文压缩已停止").await?;
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("compact-interrupts"))?,
+                    "interrupt\n"
+                );
             } else {
-                send(&input_tx,"finish","allowed","/models").await?;
-                until(&mut output,if mode=="failed" {"上下文压缩失败：fake compact error"} else {"上下文压缩完成"}).await?;
+                send(&input_tx, "finish", "allowed", "/models").await?;
+                until(
+                    &mut output,
+                    if mode == "failed" {
+                        "上下文压缩失败：fake compact error"
+                    } else {
+                        "上下文压缩完成"
+                    },
+                )
+                .await?;
             }
         }
-        send(&input_tx,"compact","allowed","/compact").await?;
-        send(&input_tx,"idle","allowed","/status").await?;
-        until(&mut output,"空闲").await?;
-        assert_eq!(store.thread(key).await?,if mode=="empty" {None} else {Some("thread".into())});
-        if !matches!(mode,"empty"|"foreign"|"active"|"wrong_resume"|"prepare_stop") {
-            assert_eq!(std::fs::read_to_string(temp.path().join("compactions"))?,"compact\n");
-            assert_eq!(std::fs::read_to_string(temp.path().join("preparation"))?,"thread/read\nthread/resume\n");
+        send(&input_tx, "compact", "allowed", "/compact").await?;
+        send(&input_tx, "idle", "allowed", "/status").await?;
+        until(&mut output, "空闲").await?;
+        assert_eq!(
+            store.thread(key).await?,
+            if mode == "empty" {
+                None
+            } else {
+                Some("thread".into())
+            }
+        );
+        if !matches!(
+            mode,
+            "empty" | "foreign" | "active" | "wrong_resume" | "prepare_stop"
+        ) {
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("compactions"))?,
+                "compact\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("preparation"))?,
+                "thread/read\nthread/resume\n"
+            );
         }
-        cancel.cancel();worker.await??;source.await??;
+        cancel.cancel();
+        worker.await??;
+        source.await??;
         drop(store);
-        let reopened=AsyncState::new(JsonStore::open(&state_path)?);
-        assert!(!bridge_app::sessions::DurableJournal::claim(&reopened,"compact".into()).await?);
-        Ok::<_,Box<dyn Error>>(())
-    }).await??;
+        let reopened = AsyncState::new(JsonStore::open(&state_path)?);
+        assert!(!bridge_app::sessions::DurableJournal::claim(&reopened, "compact".into()).await?);
+        Ok::<_, Box<dyn Error>>(())
+    })
+    .await??;
     Ok(())
 }
 
 async fn scenario(fail_archive_commit: bool) -> Result<(), Box<dyn Error>> {
-    tokio::time::timeout(Duration::from_secs(15),async {
-        let temp=tempfile::tempdir()?;
-        let script=temp.path().join("fake.py");
-        std::fs::write(&script,r#"
-import json,sys,os
-def emit(value):
-    print(json.dumps(value),flush=True)
-turn=0
-archived=False
-for line in sys.stdin:
-    m=json.loads(line)
-    method=m.get('method')
-    if method=='initialized':continue
-    if method=='initialize':result={}
-    elif method=='model/list':result={'data':[{'id':'gpt-5.6-luna','isDefault':False},{'id':'selected','isDefault':False}]}
-    elif method in ('thread/start','thread/resume'):result={'thread':{'id':'thread','cwd':os.getcwd()}}
-    elif method=='thread/read':result={'thread':{'id':'thread','cwd':os.getcwd(),'status':{'type':'idle'}}}
-    elif method=='thread/list':result={'data':([{'id':'thread','cwd':os.getcwd(),'title':'local session'}, {'id':'foreign','cwd':'/foreign','title':'must not display'}] if m['params']['archived']==archived else [])}
-    elif method in ('thread/archive','thread/unarchive'):
-        assert m['params']['threadId']=='thread'
-        archived=method=='thread/archive'
-        with open('archive-actions','a') as trace:trace.write(method+'\n')
-        result={}
-    elif method=='turn/start':
-        turn+=1
-        assert m['params']['model']=='selected', m
-        assert m['params']['collaborationMode']['mode']=='plan', m
-        if turn==1:
-            emit({'method':'item/agentMessage/delta','params':{'threadId':'thread','turnId':'1','itemId':'i','delta':'fake answer'}})
-            emit({'method':'item/completed','params':{'threadId':'thread','turnId':'1','item':{'id':'plan','type':'plan','text':'authoritative plan'}}})
-            emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':'1','status':'completed'}}})
-        result={'turn':{'id':str(turn)}}
-    elif method=='turn/interrupt':
-        assert m['params']=={'threadId':'thread','turnId':'2'}, m
-        with open('interrupts.jsonl','a') as trace:
-            trace.write(json.dumps(m['params'])+'\n')
-        emit({'method':'turn/completed','params':{'threadId':'thread','turn':{'id':str(turn),'status':'interrupted'}}})
-        result={}
-    else:raise RuntimeError('unexpected method')
-    emit({'id':m['id'],'result':result})
-    if method=='turn/start' and turn==2:
-        with open('started','w') as marker:
-            marker.write('2')
-"#)?;
-        let mut server=AppServer::spawn(Path::new("python3"),&["-I".into(),"-u".into(),script.to_string_lossy().into_owned()],temp.path(),9).await?;
-        let backend=Arc::new(server.backend());
-        let store=Arc::new(AsyncState::new(JsonStore::open(&temp.path().join("state"))?));
-        let (input_tx,input_rx)=mpsc::channel(16);
-        let (event_tx,event_rx)=mpsc::channel(16);
-        let (messages,mut output)=mpsc::channel(64);
-        let cancel=CancellationToken::new();let stop=cancel.clone();
-        let source=tokio::spawn(async move {
-            loop {let event=tokio::select! {_=stop.cancelled()=>break,event=server.next_event()=>event};if event_tx.send(event).await.is_err(){break;}}
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let temp = tempfile::tempdir()?;
+        let mut server = AppServer::spawn(
+            Path::new(env!("CARGO_BIN_EXE_fake-codex-runtime")),
+            &["runtime".into()],
+            temp.path(),
+            9,
+        )
+        .await?;
+        let backend = Arc::new(server.backend());
+        let store = Arc::new(AsyncState::new(JsonStore::open(
+            &temp.path().join("state"),
+        )?));
+        let (input_tx, input_rx) = mpsc::channel(16);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let (messages, mut output) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let source = tokio::spawn(async move {
+            loop {
+                let event =
+                    tokio::select! {_=stop.cancelled()=>break,event=server.next_event()=>event};
+                if event_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
             server.shutdown().await
         });
-        let worker=tokio::spawn(runtime::run(runtime::Settings {root:temp.path().into(),directory:temp.path().into(),allowed:BTreeSet::from(["allowed".into(),"other-allowed".into()]),open_access:false,sandbox:bridge_app::ports::Sandbox::WorkspaceWrite,epoch:9},backend,store.clone(),Arc::new(Messages(messages)),input_rx,event_rx,cancel.clone()));
-        send(&input_tx,"unauthorized","stranger","hello").await?;
-        send(&input_tx,"models","allowed","/models").await?;
-        until(&mut output,"/model selected").await?;
-        send(&input_tx,"bad-model","allowed","/model nonexistent").await?;
-        until(&mut output,"设置失败").await?;
-        send(&input_tx,"model","allowed","/model selected").await?;
-        until(&mut output,"设置已保存").await?;
-        send(&input_tx,"plan-on","allowed","/plan on").await?;
-        until(&mut output,"设置已保存").await?;
-        send(&input_tx,"plan-query","allowed","/plan").await?;
-        until(&mut output,"已开启").await?;
-        send(&input_tx,"one","allowed","hello").await?;
-        let completed=until(&mut output,"执行完成").await?;
+        let worker = tokio::spawn(runtime::run(
+            runtime::Settings {
+                root: temp.path().into(),
+                directory: temp.path().into(),
+                allowed: BTreeSet::from(["allowed".into(), "other-allowed".into()]),
+                open_access: false,
+                sandbox: bridge_app::ports::Sandbox::WorkspaceWrite,
+                epoch: 9,
+            },
+            backend,
+            store.clone(),
+            Arc::new(Messages(messages)),
+            input_rx,
+            event_rx,
+            cancel.clone(),
+        ));
+        send(&input_tx, "unauthorized", "stranger", "hello").await?;
+        send(&input_tx, "models", "allowed", "/models").await?;
+        until(&mut output, "/model selected").await?;
+        send(&input_tx, "bad-model", "allowed", "/model nonexistent").await?;
+        until(&mut output, "设置失败").await?;
+        send(&input_tx, "model", "allowed", "/model selected").await?;
+        until(&mut output, "设置已保存").await?;
+        send(&input_tx, "plan-on", "allowed", "/plan on").await?;
+        until(&mut output, "设置已保存").await?;
+        send(&input_tx, "plan-query", "allowed", "/plan").await?;
+        until(&mut output, "已开启").await?;
+        send(&input_tx, "one", "allowed", "hello").await?;
+        let completed = until(&mut output, "执行完成").await?;
         assert!(completed.contains("authoritative plan"));
         assert!(!completed.contains("fake answer"));
-        send(&input_tx,"two","allowed","keep working").await?;
-        until(&mut output,"已开始执行").await?;
+        send(&input_tx, "two", "allowed", "keep working").await?;
+        until(&mut output, "已开始执行").await?;
         // The fake writes this only after receiving turn/start and flushing its
         // response. Poll a concrete acknowledgement, not an assumed delay.
         while !tokio::fs::try_exists(temp.path().join("started")).await? {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        send(&input_tx,"busy-new","allowed","/new").await?;
-        until(&mut output,"有任务执行中").await?;
-        send(&input_tx,"busy-plan","allowed","/plan off").await?;
-        until(&mut output,"有任务执行中").await?;
-        send(&input_tx,"busy-resume","allowed","/resume thread").await?;
-        until(&mut output,"有任务执行中").await?;
-        send(&input_tx,"busy-archive","allowed","/archive thread").await?;
-        until(&mut output,"有任务执行中").await?;
-        assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("thread".into()));
-        send(&input_tx,"other-stop","other-allowed","/stop").await?;
-        until(&mut output,"没有可停止的当前任务").await?;
-        send(&input_tx,"status","allowed","/status").await?;
-        assert!(!until(&mut output,"运行中").await?.contains("正在停止"));
+        send(&input_tx, "busy-new", "allowed", "/new").await?;
+        until(&mut output, "有任务执行中").await?;
+        send(&input_tx, "busy-plan", "allowed", "/plan off").await?;
+        until(&mut output, "有任务执行中").await?;
+        send(&input_tx, "busy-resume", "allowed", "/resume thread").await?;
+        until(&mut output, "有任务执行中").await?;
+        send(&input_tx, "busy-archive", "allowed", "/archive thread").await?;
+        until(&mut output, "有任务执行中").await?;
+        assert_eq!(
+            store
+                .thread(bridge_core::SessionKey::new("allowed", temp.path()))
+                .await?,
+            Some("thread".into())
+        );
+        send(&input_tx, "other-stop", "other-allowed", "/stop").await?;
+        until(&mut output, "没有可停止的当前任务").await?;
+        send(&input_tx, "status", "allowed", "/status").await?;
+        assert!(!until(&mut output, "运行中").await?.contains("正在停止"));
         assert!(!tokio::fs::try_exists(temp.path().join("interrupts.jsonl")).await?);
-        send(&input_tx,"stop","allowed","/stop").await?;
-        until(&mut output,"任务已停止").await?;
-        send(&input_tx,"list","allowed","/resume").await?;
-        let listing=until(&mut output,"/resume thread").await?;
+        send(&input_tx, "stop", "allowed", "/stop").await?;
+        until(&mut output, "任务已停止").await?;
+        send(&input_tx, "list", "allowed", "/resume").await?;
+        let listing = until(&mut output, "/resume thread").await?;
         assert!(!listing.contains("foreign"));
-        send(&input_tx,"idle-new","allowed","/new").await?;
-        until(&mut output,"下次提问时自动创建").await?;
-        send(&input_tx,"resume","allowed","/resume thread").await?;
-        until(&mut output,"会话已恢复").await?;
-        assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("thread".into()));
+        send(&input_tx, "idle-new", "allowed", "/new").await?;
+        until(&mut output, "下次提问时自动创建").await?;
+        send(&input_tx, "resume", "allowed", "/resume thread").await?;
+        until(&mut output, "会话已恢复").await?;
+        assert_eq!(
+            store
+                .thread(bridge_core::SessionKey::new("allowed", temp.path()))
+                .await?,
+            Some("thread".into())
+        );
         // A replay cannot restore an old binding over a newer local selection.
-        store.bind(bridge_core::SessionKey::new("allowed",temp.path()),"newer".into()).await?;
-        send(&input_tx,"resume","allowed","/resume thread").await?;
-        send(&input_tx,"after-replay","allowed","/status").await?;
-        until(&mut output,"空闲").await?;
-        assert_eq!(store.thread(bridge_core::SessionKey::new("allowed",temp.path())).await?,Some("newer".into()));
-        send(&input_tx,"plan-off","allowed","/plan off").await?;
-        until(&mut output,"设置已保存").await?;
-        send(&input_tx,"plan-on","allowed","/plan on").await?;
-        send(&input_tx,"default-model","allowed","/model default").await?;
-        until(&mut output,"设置已保存").await?;
-        let preferences=store.preferences(bridge_core::SessionKey::new("allowed",temp.path())).await?;
-        assert!(!preferences.plan,"old command replay must not re-enable Plan");
+        store
+            .bind(
+                bridge_core::SessionKey::new("allowed", temp.path()),
+                "newer".into(),
+            )
+            .await?;
+        send(&input_tx, "resume", "allowed", "/resume thread").await?;
+        send(&input_tx, "after-replay", "allowed", "/status").await?;
+        until(&mut output, "空闲").await?;
+        assert_eq!(
+            store
+                .thread(bridge_core::SessionKey::new("allowed", temp.path()))
+                .await?,
+            Some("newer".into())
+        );
+        send(&input_tx, "plan-off", "allowed", "/plan off").await?;
+        until(&mut output, "设置已保存").await?;
+        send(&input_tx, "plan-on", "allowed", "/plan on").await?;
+        send(&input_tx, "default-model", "allowed", "/model default").await?;
+        until(&mut output, "设置已保存").await?;
+        let preferences = store
+            .preferences(bridge_core::SessionKey::new("allowed", temp.path()))
+            .await?;
+        assert!(
+            !preferences.plan,
+            "old command replay must not re-enable Plan"
+        );
         assert!(preferences.model.is_none());
-        let own=bridge_core::SessionKey::new("allowed",temp.path());
-        store.bind(own.clone(),"thread".into()).await?;
+        let own = bridge_core::SessionKey::new("allowed", temp.path());
+        store.bind(own.clone(), "thread".into()).await?;
         if fail_archive_commit {
-            let backup=temp.path().join("state/state.previous.json");
-            if backup.is_file() {std::fs::remove_file(&backup)?;}
+            let backup = temp.path().join("state/state.previous.json");
+            if backup.is_file() {
+                std::fs::remove_file(&backup)?;
+            }
             std::fs::create_dir(backup)?;
         }
-        send(&input_tx,"archive","allowed","/archive thread").await?;
+        send(&input_tx, "archive", "allowed", "/archive thread").await?;
         if fail_archive_commit {
-            until(&mut output,"归档状态结果不确定").await?;
+            until(&mut output, "归档状态结果不确定").await?;
             assert!(worker.await?.is_err());
-            cancel.cancel();source.await??;
-            assert_eq!(store.thread(own).await?,Some("thread".into()));
-            return Ok::<_,Box<dyn Error>>(());
+            cancel.cancel();
+            source.await??;
+            assert_eq!(store.thread(own).await?, Some("thread".into()));
+            return Ok::<_, Box<dyn Error>>(());
         }
-        until(&mut output,"会话已归档").await?;
+        until(&mut output, "会话已归档").await?;
         assert!(store.thread(own.clone()).await?.is_none());
-        send(&input_tx,"archived-list","allowed","/archived").await?;
-        until(&mut output,"/unarchive thread").await?;
-        send(&input_tx,"unarchive","allowed","/unarchive thread").await?;
-        until(&mut output,"已取消归档").await?;
+        send(&input_tx, "archived-list", "allowed", "/archived").await?;
+        until(&mut output, "/unarchive thread").await?;
+        send(&input_tx, "unarchive", "allowed", "/unarchive thread").await?;
+        until(&mut output, "已取消归档").await?;
         assert!(store.thread(own.clone()).await?.is_none());
-        store.bind(own.clone(),"thread".into()).await?;
-        send(&input_tx,"archive","allowed","/archive thread").await?;
-        send(&input_tx,"archive-replay-status","allowed","/status").await?;
-        until(&mut output,"空闲").await?;
-        assert_eq!(store.thread(own).await?,Some("thread".into()));
-        assert_eq!(std::fs::read_to_string(temp.path().join("archive-actions"))?,"thread/archive\nthread/unarchive\n");
-        cancel.cancel();worker.await?.map_err(|e|->Box<dyn Error>{e.into()})?;source.await??;
-        let trace=std::fs::read_to_string(temp.path().join("interrupts.jsonl"))?;
-        let interrupts:Vec<serde_json::Value>=trace.lines().map(serde_json::from_str).collect::<Result<_,_>>()?;
-        assert_eq!(interrupts,vec![serde_json::json!({"threadId":"thread","turnId":"2"})]);
-        Ok::<_,Box<dyn Error>>(())
-    }).await??;
+        store.bind(own.clone(), "thread".into()).await?;
+        send(&input_tx, "archive", "allowed", "/archive thread").await?;
+        send(&input_tx, "archive-replay-status", "allowed", "/status").await?;
+        until(&mut output, "空闲").await?;
+        assert_eq!(store.thread(own).await?, Some("thread".into()));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("archive-actions"))?,
+            "thread/archive\nthread/unarchive\n"
+        );
+        cancel.cancel();
+        worker.await?.map_err(|e| -> Box<dyn Error> { e.into() })?;
+        source.await??;
+        let trace = std::fs::read_to_string(temp.path().join("interrupts.jsonl"))?;
+        let interrupts: Vec<serde_json::Value> = trace
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            interrupts,
+            vec![serde_json::json!({"threadId":"thread","turnId":"2"})]
+        );
+        Ok::<_, Box<dyn Error>>(())
+    })
+    .await??;
     Ok(())
 }
 
 #[test]
-fn global_app_lock_matches_python_and_excludes_second_instance() -> Result<(), Box<dyn Error>> {
+fn global_app_lock_excludes_second_instance() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let lock = bridge_cli::bootstrap::app_lock(temp.path(), "test-app")?;
     assert!(bridge_cli::bootstrap::app_lock(temp.path(), "test-app").is_err());

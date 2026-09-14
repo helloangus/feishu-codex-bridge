@@ -50,8 +50,6 @@ pub fn initialize(
         feishu: Some(FeishuConfig {
             app_id_env: "FEISHU_APP_ID".into(),
             app_secret_env: "FEISHU_APP_SECRET".into(),
-            python: None,
-            adapter: None,
             proxy_env: None,
         }),
     };

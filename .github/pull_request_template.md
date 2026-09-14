@@ -5,7 +5,7 @@
 ## 验证
 
 - [ ] Rust 格式、Clippy、测试与依赖边界检查
-- [ ] Python 回归
+- [ ] 仓库零 Python 门禁与 Shell 语法检查
 - [ ] README、docs、PLAN 与实际阶段一致
 - [ ] 涉及飞书/Codex 接口时附真实联调记录及脱敏卡片截图
 

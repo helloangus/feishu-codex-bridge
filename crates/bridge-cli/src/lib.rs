@@ -1,4 +1,4 @@
-//! Configuration validation for the Rust migration tools.
+//! Configuration validation and native service assembly.
 use bridge_local::workspace::Workspace;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,11 +20,6 @@ pub struct Config {
 pub struct FeishuConfig {
     pub app_id_env: String,
     pub app_secret_env: String,
-    /// Legacy fields accepted for configuration migration; native mode never launches them.
-    #[serde(default)]
-    pub python: Option<PathBuf>,
-    #[serde(default)]
-    pub adapter: Option<PathBuf>,
     pub proxy_env: Option<String>,
 }
 #[derive(Deserialize, Serialize)]

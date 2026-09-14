@@ -54,3 +54,23 @@ fn config_check_prints_human_result_without_structured_diagnostics()
     assert!(String::from_utf8(output.stderr)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn retired_runtime_fields_and_state_conversion_commands_are_rejected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = temp.path().join("bridge.toml");
+    let text = format!(
+        "[workspace]\nroot = {:?}\ncwd = {:?}\nstate_dir = {:?}\n[access]\nmode = 'open'\nallowed_open_ids = []\n[codex]\nexecutable = 'codex'\nargs = ['app-server']\nsandbox = 'workspaceWrite'\n[feishu]\napp_id_env = 'APP_ID'\napp_secret_env = 'APP_SECRET'\npython = '/removed'\nadapter = '/removed'\n",
+        temp.path(),
+        temp.path(),
+        temp.path().join("state")
+    );
+    fs::write(&config, text)?;
+    assert!(Config::read(&config).is_err());
+    let output = Command::new(env!("CARGO_BIN_EXE_bridge"))
+        .arg("migrate")
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    Ok(())
+}

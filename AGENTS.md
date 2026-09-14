@@ -1,34 +1,26 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Structure
 
-`bridge.py` contains the Feishu event handlers, cards, Codex app-server JSON-RPC adapter, session state, attachments, and delivery handling. `service.py` owns the process lock, health file, log rotation, and restart supervision. Use `start.sh` for normal service lifecycle and `setup.sh` for first-device setup. Runtime configuration comes from `.env.example`; never commit a real `.env`.
+This is a Rust workspace. `bridge-cli` assembles configuration, runtime, health, and supervision; `bridge-app` owns application behavior; `bridge-codex` owns app-server JSON-RPC; `bridge-feishu` owns native Feishu WebSocket/REST; `bridge-local` owns state and workspace access. Use `setup.sh`, `start.sh`, and `package.sh` for lifecycle and packaging. Never commit `bridge.toml`, credentials, state, logs, sessions, or downloaded attachments.
 
-Tests live in `tests/`: `test_bridge.py` covers bridge behavior with fakes, and `test_service.py` covers supervisor helpers in temporary directories. Keep user-facing and operational documentation in `README.md` and `docs/` (`architecture.md`, `design.md`, `development.md`, `deployment.md`, `operations.md`). Update `PLAN.md` when planned work or its status changes.
-
-## Build, Test, and Development Commands
+## Validation
 
 ```sh
-python -m unittest discover -s tests -v  # run offline regression tests
-python -m py_compile bridge.py service.py # check Python syntax
-git diff --check                          # find whitespace errors
-./setup.sh --check                        # validate deployment prerequisites
-./start.sh foreground                     # run under the normal supervisor
-./start.sh status                         # inspect service and Feishu health
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked -- --test-threads=1
+cargo build -p bridge-cli --bin bridge --locked
+cargo doc --workspace --no-deps --locked
+cargo xtask check-boundaries
+bash -n setup.sh start.sh package.sh
+git diff --check
 ```
 
-Use `start.sh` instead of directly running `bridge.py`; direct execution skips locking, log rotation, and restart behavior.
+Tests must stay offline, use temporary directories and fakes, and must not change the user working directory or launch long-running services. The repository must not add Python source, bytecode, dependency manifests, interpreter calls, or test tooling.
 
-## Coding Style & Naming Conventions
+## Style and safety
 
-Use Python with four-space indentation, standard-library-first imports, `snake_case` for functions and variables, `PascalCase` for classes, and `UPPER_CASE` for module constants. Prefer small, explicit helpers over broad abstractions. User-triggered or RPC work must catch exceptions and respond through the existing Feishu card/text path; do not let exceptions escape callback threads.
+Use stable Rust 1.85.1, rustfmt, explicit error propagation, bounded channels, and typed protocol boundaries. `bridge-codex` remains the sole app-server stdin/stdout owner. Route Feishu events through the native ingress and application runtime. Never interpolate user input into shell commands. User-triggered failures must be returned through the existing card/text delivery path.
 
-`CodexServer` is the sole owner of app-server stdin/stdout JSON-RPC. Route new notifications through `handle_event()` and `Bridge.codex_event()` rather than reading stdout elsewhere. Do not interpolate user input into shell commands.
-
-## Testing Guidelines
-
-Add a focused `unittest` regression for every offline-verifiable change. Name test methods `test_<behavior>`. Tests must not load a real `.env`, call the network, start long-running processes, or alter the user working directory; use fakes and `TemporaryDirectory`. Changes to Feishu callbacks, cards, or app-server protocol also require manual Feishu validation against the installed CLI version.
-
-## Commit & Pull Request Guidelines
-
-Follow the established Conventional Commit-like style: `feat:`, `fix:`, `test:`, and `docs:` with a concise imperative summary. Keep commits scoped. PRs should explain behavior changes, list validation commands, link relevant issues, and include screenshots or card captures for Feishu UI changes. Update README and relevant `docs/` when commands, architecture, deployment, or operations change. Never include credentials, tokens, logs, session files, or downloaded attachments.
+Update README, relevant `docs/`, and `PLAN.md` when behavior, commands, architecture, deployment, or operational status changes. Use scoped Conventional Commit-like summaries: `feat:`, `fix:`, `test:`, and `docs:`.

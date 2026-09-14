@@ -113,13 +113,6 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), Sto
 
 impl JsonStore {
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
-        if directory.join("migration-in-progress").exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "上次迁移未完成；请使用新的目标目录重新导入",
-            )
-            .into());
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;

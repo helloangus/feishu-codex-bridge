@@ -93,7 +93,6 @@ pub fn decode_action(json: &str) -> Result<bridge_core::view::ButtonAction, Deco
 pub mod ingress;
 
 pub mod proxy;
-pub mod sidecar;
 pub mod websocket;
 /// Decode media without downloading or trusting remote filenames as paths.
 pub fn attachments(

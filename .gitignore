@@ -2,8 +2,6 @@
 .feishu-codex-session
 .feishu-codex-settings
 .feishu-codex-seen-messages
-__pycache__/
-*.pyc
 .runtime/
 
 target/
@@ -11,5 +9,4 @@ target/
 feishu-inbox/
 bridge.toml
 .bridge-state/
-.venv/
 dist/

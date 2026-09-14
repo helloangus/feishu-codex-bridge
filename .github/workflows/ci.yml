@@ -26,10 +26,10 @@ jobs:
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Python compatibility regressions
+      - name: Repository has no Python implementation or tooling
         run: |
-          python3 -m venv .venv
-          .venv/bin/python -m pip install -r requirements-test.txt
-          .venv/bin/python -m unittest discover -s tests -v
-          .venv/bin/python -m py_compile bridge.py service.py
+          test -z "$(git ls-files '*.py' '*.pyi' '*.pyc' 'requirements*.txt')"
+          ! rg -n 'python3|python -m|pip install' --glob '!*.yml'
+      - name: Shell syntax
+        run: bash -n setup.sh start.sh package.sh
       - run: git diff --check

@@ -1,149 +1,150 @@
-#!/data/data/com.termux/files/usr/bin/bash
-# Guided first-run setup for a freshly cloned bridge on Termux.
+#!/usr/bin/env bash
 set -euo pipefail
+# Do not inherit shell tracing into a setup that may later start the service.
+set +x
+bridge_repo="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+bridge_mode="${1:-}"
+bridge_no_start=0
+bridge_requires_pairing=0
+bridge_pairing_code_prompted=0
+case "$bridge_mode" in
+  --help|-h)
+    printf '%s\n' \
+      '用法：./setup.sh [--check|--no-start]' \
+      '默认：必要时引导安装 Rust/C 工具链，生成配置、收集飞书凭据并启动服务。' \
+      '--no-start：只完成构建和配置，不提示飞书凭据，也不启动服务。' \
+      '--check：只检查现有二进制和配置。' \
+      '可选环境变量：BRIDGE_RUST_ROOT、BRIDGE_RUST_CWD、BRIDGE_RUST_STATE_DIR、BRIDGE_RUST_ALLOWED_USERS、BRIDGE_RUST_SANDBOX、BRIDGE_RUST_AUTO_INSTALL。'
+    exit 0
+    ;;
+  --check)
+    command -v codex >/dev/null || { printf '%s\n' '未找到 codex，请先安装并登录。' >&2; exit 1; }
+    exec "${BRIDGE_RUST_BIN:-$bridge_repo/target/debug/bridge}" config check --file "${BRIDGE_RUST_CONFIG:-$bridge_repo/bridge.toml}" ;;
+  --no-start) bridge_no_start=1 ;;
+  '') ;;
+  *) printf '%s\n' '未知参数，请使用 --help。' >&2; exit 2 ;;
+esac
 
-BRIDGE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-ENV_FILE="$BRIDGE_DIR/.env"
-MODE="${1:-}"
-
-usage() {
-  cat <<'EOF'
-用法：./setup.sh [--check|--no-start]
-
-  （无参数）  安装 Python 依赖、引导填写 .env，并启动服务。
-  --no-start  完成检查和配置，但不启动服务。
-  --check     只检查本机依赖、配置和服务状态，不修改任何内容。
-EOF
-}
-
-say() { printf '\n==> %s\n' "$*"; }
-fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
-
-if [[ "$MODE" == "-h" || "$MODE" == "--help" ]]; then
-  usage
-  exit 0
-fi
-if [[ -n "$MODE" && "$MODE" != "--check" && "$MODE" != "--no-start" ]]; then
-  usage
-  exit 2
-fi
-
-check_python() {
-  if command -v python >/dev/null 2>&1; then
-    return
+install_rust_toolchain() {
+  local bridge_answer
+  if [[ "${BRIDGE_RUST_AUTO_INSTALL:-}" != "1" ]]; then
+    if [[ ! -t 0 ]]; then
+      printf '%s\n' '未找到完整 Rust/C 工具链。请在交互终端重新运行，或设置 BRIDGE_RUST_AUTO_INSTALL=1 自动安装。' >&2
+      return 1
+    fi
+    read -r -p '未找到完整 Rust/C 工具链，是否立即安装？[Y/n]：' bridge_answer || true
+    case "${bridge_answer:-Y}" in
+      Y|y|yes|YES) ;;
+      *) printf '%s\n' '已取消安装；安装工具链后可重新运行 ./setup.sh。' >&2; return 1 ;;
+    esac
   fi
-  if [[ "$MODE" == "--check" ]]; then
-    fail "未找到 python；请在 Termux 中执行 pkg install python"
+  command -v apt-get >/dev/null || { printf '%s\n' '默认按 Ubuntu 环境安装；未找到 apt-get。请在 Ubuntu/Debian 中运行此脚本。' >&2; return 1; }
+  local -a bridge_apt=(apt-get)
+  if [[ "$(id -u)" != "0" ]]; then
+    command -v sudo >/dev/null || { printf '%s\n' '需要 sudo 安装 Ubuntu 工具链；请安装 sudo 或以 root 身份重试。' >&2; return 1; }
+    bridge_apt=(sudo apt-get)
   fi
-  command -v pkg >/dev/null 2>&1 || fail "未找到 pkg；请在 Termux 环境运行本脚本"
-  say "正在安装 Termux Python"
-  pkg install -y python
-}
-
-check_codex() {
-  if command -v codex >/dev/null 2>&1; then
-    return
+  printf '%s\n' '正在安装 Ubuntu 编译依赖…'
+  "${bridge_apt[@]}" update
+  "${bridge_apt[@]}" install -y build-essential curl
+  if ! command -v rustup >/dev/null; then
+    printf '%s\n' '正在通过 Rust 官网 rustup 脚本安装 Rust…'
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   fi
-  cat >&2 <<'EOF'
-错误：未找到 Codex CLI。
-
-请先按官方 Codex CLI 安装与登录流程完成本机配置，确保下面命令能成功执行后再重新运行本脚本：
-  codex --version
-  codex app-server
-EOF
-  exit 1
 }
 
-config_present() {
-  [[ -f "$ENV_FILE" ]] || return 1
-  # Use the same shell parsing model as start.sh, but never print values.
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
-  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" && -n "${CODEX_BRIDGE_CWD:-}" && -n "${CODEX_WORKSPACE_ROOT:-}" ]] || return 1
-  [[ -z "${CODEX_SANDBOX_MODE:-}" || "${CODEX_SANDBOX_MODE}" == "workspaceWrite" || "${CODEX_SANDBOX_MODE}" == "dangerFullAccess" ]]
-}
-
-write_config() {
-  local app_id app_secret allowed cwd workspace_root sandbox_mode
-  say "首次配置飞书机器人"
-  printf '飞书 App ID（例如 cli_xxx）：'
-  read -r app_id
-  [[ -n "$app_id" ]] || fail "App ID 不能为空"
-  printf '飞书 App Secret（输入不回显）：'
-  read -r -s app_secret
-  printf '\n'
-  [[ -n "$app_secret" ]] || fail "App Secret 不能为空"
-  printf '允许使用的飞书 open_id（多个用逗号分隔；留空=任何能私聊机器人的人）：'
-  read -r allowed
-  printf 'Codex 工作目录 [%s]：' "$(pwd -P)"
-  read -r cwd
-  cwd="${cwd:-$(pwd -P)}"
-  [[ -d "$cwd" ]] || fail "工作目录不存在：$cwd"
-  cwd="$(CDPATH= cd -- "$cwd" && pwd -P)"
-  printf '允许切换的工作区根目录 [%s]：' "$(dirname -- "$cwd")"
-  read -r workspace_root
-  workspace_root="${workspace_root:-$(dirname -- "$cwd")}"
-  [[ -d "$workspace_root" ]] || fail "工作区根目录不存在：$workspace_root"
-  workspace_root="$(CDPATH= cd -- "$workspace_root" && pwd -P)"
-  [[ "$cwd" == "$workspace_root" || "$cwd" == "$workspace_root"/* ]] || fail "Codex 工作目录必须位于工作区根目录内"
-  printf 'Termux 是否使用 dangerFullAccess（关闭 Codex sandbox，目录权限由本机用户负责）？[y/N]：'
-  read -r sandbox_mode
-  if [[ "$sandbox_mode" =~ ^[Yy]$ ]]; then sandbox_mode="dangerFullAccess"; else sandbox_mode="workspaceWrite"; fi
-
-  umask 077
-  {
-    printf '# Generated by setup.sh. Keep this file private.\n'
-    printf 'FEISHU_APP_ID=%q\n' "$app_id"
-    printf 'FEISHU_APP_SECRET=%q\n' "$app_secret"
-    printf 'FEISHU_ALLOWED_OPEN_IDS=%q\n' "$allowed"
-    printf 'CODEX_BRIDGE_CWD=%q\n' "$cwd"
-    printf 'CODEX_WORKSPACE_ROOT=%q\n' "$workspace_root"
-    printf 'CODEX_MODEL=\n'
-    printf 'CODEX_APP_SERVER=%q\n' 'codex app-server --enable collaboration_modes'
-    printf 'CODEX_SANDBOX_MODE=%q\n' "$sandbox_mode"
-    printf 'CODEX_MAX_ATTACHMENT_BYTES=20971520\n'
-    printf 'CODEX_APPROVAL_TIMEOUT_SECONDS=600\n'
-  } > "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  say "已创建受保护配置：$ENV_FILE"
-}
-
-check_python
-check_codex
-
-if [[ "$MODE" == "--check" ]]; then
-  say "Python: $(python --version 2>&1)"
-  say "Codex: $(codex --version 2>&1)"
-  # Avoid importing the full SDK here: on a fresh Termux install that can spend
-  # a long time compiling bytecode, while package metadata is enough to tell
-  # the user whether setup installed both required distributions.
-  python -c 'from importlib.metadata import version; version("httpx"); version("lark-oapi")' \
-    || fail "缺少 Python 依赖；请执行 ./setup.sh"
-  config_present || fail "配置不完整；已有部署请在 .env 中补充 CODEX_WORKSPACE_ROOT，再重新检查"
-  say "配置：已找到 .env（不会显示凭据）"
-  "$BRIDGE_DIR/start.sh" status
-  exit 0
+if ! command -v cargo >/dev/null && [[ -x "${HOME:-}/.cargo/bin/cargo" ]]; then
+  # A non-login shell often does not load rustup's PATH setup.
+  PATH="${HOME}/.cargo/bin:$PATH"
 fi
-
-say "安装或校验 Python 依赖"
-python -m pip install -r "$BRIDGE_DIR/requirements.txt"
-
-if [[ ! -f "$ENV_FILE" ]]; then
-  write_config
-elif ! config_present; then
-  fail ".env 已存在但配置不完整；请补充 CODEX_WORKSPACE_ROOT（且须包含 CODEX_BRIDGE_CWD），或手动删除后重新执行 ./setup.sh"
+if ! command -v cargo >/dev/null || ! command -v rustup >/dev/null || ! command -v cc >/dev/null; then
+  install_rust_toolchain || exit 1
+  if ! command -v cargo >/dev/null && [[ -x "${HOME:-}/.cargo/bin/cargo" ]]; then
+    PATH="${HOME}/.cargo/bin:$PATH"
+  fi
+fi
+command -v cargo >/dev/null || { printf '%s\n' 'Rust 安装后仍未找到 cargo；请重新打开终端后再运行。' >&2; exit 1; }
+command -v rustup >/dev/null || { printf '%s\n' 'Rust 安装后仍未找到 rustup；请重新打开终端后再运行。' >&2; exit 1; }
+command -v cc >/dev/null || { printf '%s\n' '未找到 C 编译器；请安装 clang 或 build-essential 后重试。' >&2; exit 1; }
+command -v codex >/dev/null || { printf '%s\n' '请先安装并登录 Codex CLI。' >&2; exit 1; }
+(cd -- "$bridge_repo" && cargo build -p bridge-cli --bin bridge --locked)
+bridge_binary="${BRIDGE_RUST_BIN:-$bridge_repo/target/debug/bridge}"
+bridge_config="${BRIDGE_RUST_CONFIG:-$bridge_repo/bridge.toml}"
+if [[ -e "$bridge_config" || -L "$bridge_config" ]]; then
+  "$bridge_binary" config check --file "$bridge_config"
+  printf '%s\n' '已有配置已保留；如需修改，请编辑该文件。'
 else
-  say "检测到已有 .env，保留现有配置"
+  # Defaults make a fresh clone usable immediately.  An interactive terminal can
+  # override them; automated invocations keep the same safe home-directory values.
+  bridge_home="${HOME:-$bridge_repo}"
+  bridge_root="${BRIDGE_RUST_ROOT:-$bridge_home}"
+  bridge_cwd="${BRIDGE_RUST_CWD:-$bridge_home}"
+  bridge_state="${BRIDGE_RUST_STATE_DIR:-$bridge_home/.local/state/feishu-codex-bridge}"
+  bridge_users="${BRIDGE_RUST_ALLOWED_USERS:-}"
+  bridge_sandbox="${BRIDGE_RUST_SANDBOX:-workspaceWrite}"
+  if [[ -t 0 ]]; then
+    read -r -e -p "允许工作的根目录 [$bridge_root]：" bridge_answer || true
+    bridge_root="${bridge_answer:-$bridge_root}"
+    read -r -e -p "初始工作目录 [$bridge_cwd]：" bridge_answer || true
+    bridge_cwd="${bridge_answer:-$bridge_cwd}"
+    read -r -e -p "状态目录 [$bridge_state]：" bridge_answer || true
+    bridge_state="${bridge_answer:-$bridge_state}"
+    read -r -p '允许使用的飞书 open_id（逗号分隔；留空使用配对码）：' bridge_answer || true
+    bridge_users="${bridge_answer:-$bridge_users}"
+  fi
+  [[ -d "$bridge_root" ]] || { printf '工作区根目录不存在：%s\n' "$bridge_root" >&2; exit 1; }
+  [[ -d "$bridge_cwd" ]] || { printf '初始工作目录不存在：%s\n' "$bridge_cwd" >&2; exit 1; }
+  bridge_root="$(CDPATH= cd -- "$bridge_root" && pwd -P)"
+  bridge_cwd="$(CDPATH= cd -- "$bridge_cwd" && pwd -P)"
+  case "$bridge_state" in
+    /*) ;;
+    *) printf '状态目录必须为绝对路径：%s\n' "$bridge_state" >&2; exit 1 ;;
+  esac
+  bridge_args=(config init --output "$bridge_config" --root "$bridge_root" --cwd "$bridge_cwd" --state-dir "$bridge_state")
+  if [[ -n "$bridge_users" ]]; then
+    IFS=',' read -r -a bridge_user_list <<< "$bridge_users"
+    for bridge_user in "${bridge_user_list[@]}"; do
+      [[ -n "${bridge_user//[[:space:]]/}" ]] || { printf '%s\n' '白名单不能包含空用户 ID。' >&2; exit 1; }
+      bridge_args+=(--allowed-user "$bridge_user")
+    done
+  else
+    bridge_requires_pairing=1
+  fi
+  case "$bridge_sandbox" in
+    dangerFullAccess) bridge_args+=(--danger-full-access) ;;
+    workspaceWrite) ;;
+    *) printf '%s\n' 'BRIDGE_RUST_SANDBOX 只能是 workspaceWrite 或 dangerFullAccess；未生成配置。' >&2; exit 2 ;;
+  esac
+  "$bridge_binary" "${bridge_args[@]}"
 fi
-
-if [[ "$MODE" == "--no-start" ]]; then
-  say "配置完成。随后可执行：$BRIDGE_DIR/start.sh start"
+if [[ "$bridge_no_start" == "1" ]]; then
+  printf '%s\n' '准备完成。启动：./start.sh start；状态：./start.sh status。'
   exit 0
 fi
-
-say "启动飞书 Codex Bridge"
-"$BRIDGE_DIR/start.sh" start
-"$BRIDGE_DIR/start.sh" status
-printf '\n完成。请在飞书私聊机器人发送 /help。\n'
+if [[ ! -t 0 ]]; then
+  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" ]] || { printf '%s\n' '非交互启动需要设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET。' >&2; exit 1; }
+else
+  if [[ -z "${FEISHU_APP_ID:-}" ]]; then read -r -p '飞书 App ID：' FEISHU_APP_ID; fi
+  if [[ -z "${FEISHU_APP_SECRET:-}" ]]; then read -r -s -p '飞书 App Secret：' FEISHU_APP_SECRET; printf '\n'; fi
+  if [[ -z "${FEISHU_PAIRING_CODE:-}" ]]; then
+    printf '%s\n' '可在另一个终端生成配对码：openssl rand -hex 16'
+    read -r -s -p '配对码（首次或无白名单时必填，16–256 字节且不能含空白；已有白名单/已配对用户可留空）：' FEISHU_PAIRING_CODE
+    printf '\n'
+    bridge_pairing_code_prompted=1
+  fi
+fi
+[[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" ]] || { printf '%s\n' '飞书 App ID 和 App Secret 不能为空。' >&2; exit 1; }
+bridge_pairing_bytes="$(printf '%s' "${FEISHU_PAIRING_CODE:-}" | LC_ALL=C wc -c)"
+if [[ -n "${FEISHU_PAIRING_CODE:-}" && ( "$bridge_pairing_bytes" -lt 16 || "$bridge_pairing_bytes" -gt 256 || "$FEISHU_PAIRING_CODE" =~ [[:space:]] ) ]]; then
+  printf '%s\n' '配对码无效：必须为 16–256 字节且不能包含空白。' >&2
+  exit 1
+fi
+if [[ "$bridge_requires_pairing" == "1" && -z "${FEISHU_PAIRING_CODE:-}" ]]; then
+  printf '%s\n' '未设置白名单时，配对码不能为空。' >&2
+  exit 1
+fi
+export FEISHU_APP_ID FEISHU_APP_SECRET FEISHU_PAIRING_CODE
+if [[ "$bridge_pairing_code_prompted" == "1" ]]; then
+  export BRIDGE_RUST_PAIRING_CODE_PROMPTED=1
+fi
+exec "$bridge_repo/start.sh" start

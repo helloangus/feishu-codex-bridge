@@ -9,6 +9,11 @@ publish.workspace = true
 name = "bridge"
 path = "src/main.rs"
 
+[[bin]]
+name = "fake-codex-runtime"
+path = "tests/support/fake_codex.rs"
+test = false
+
 [dependencies]
 tempfile.workspace = true
 bridge-core.workspace = true
