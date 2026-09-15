@@ -37,30 +37,26 @@
 - 验证:fmt、clippy -D warnings、226 个 workspace 测试(串行)、产品 debug 构建、
   rustdoc、依赖边界、shell 语法、git diff --check 全部通过。
 
-### B `refactor/runtime-flow` — 进行中(检查点提交)
+### B `refactor/runtime-flow` — 已完成，待合入汇总分支
 
-- 已完成:
-  - `bridge-app/src/interactions.rs` 重写为唯一交互管理实现:吸收原 runtime 内部
-    `PendingApproval` 流程与 `reply_approval`;提供 insert(容量 32 + 同 turn/item
-    去重)、stale/unsent 审查、逐题文本/按钮答案、审批消费、过期、drain 与
-    `deliver_reply`(不完整答案禁止提交、结果未知返回 Uncertain)。
-    旧 `interactions::Registry` 已删除;30 个单测覆盖归属校验、旧连接 epoch、
-    重复点击、逐题答案、过期、不完整答案、结果未知等约束。
-  - 1515 行 `runtime.rs` 拆分为 `runtime/` 目录模块:`mod.rs`(公共 API、run 主循环、
-    关停序列)、`state.rs`(Runtime 状态结构、Done、FileDelivery 枚举、maintain)、
-    `flow.rs`(tell/send_panel/finish/event/can_spawn/spawn_reply/spawn_interrupt)、
-    `input.rs`(输入处理:配对/授权/卡片/命令/答案/任务准入)、`jobs.rs`(后台完成)、
-    `protocol.rs`(通知与请求)、`timers.rs`(tick)。`runtime::run` 外部签名不变。
-  - 编译零警告,bridge-app 30 个单测全部通过。
-- 待完成(下次继续):
-  - 跑通 `bridge-cli` 全部行为测试套件(approval/card/directory/session/files/
-    minimal 等,约 3400 行)并修复偏差——这是本次重构的安全网,尚未执行;
-  - 资源上限改造收尾:后台任务容量预检已铺开(`can_spawn` + `CONTROL_RESERVE=16`),
-    需复查所有 spawn 点分类(用户路径返回繁忙、控制路径用保留容量、结果未知仍停止);
-  - 将原 runtime.rs 中 compact 终态测试迁入 `flow.rs` 或新 `runtime_` 前缀测试;
-  - 过渡期文案清理("最小运行版/最小版"等)已在拆分中顺带完成,需复查;
-  - 全量验证后提交、合并到汇总分支。
-- 注意:本检查点提交为 WIP,CLI 行为测试未跑,不得据此认为 B 包已交付。
+- 交付提交:`d7fcf8e`（基于检查点 `6f5a8e2`）。
+- `bridge-app::interactions` 是审批和逐题问答的唯一状态机；删除已无调用方的
+  `bridge-core::interaction` 及旧 Registry。覆盖归属、epoch、重复点击、逐题答案、
+  过期、未完成答案不提交、结果未知与 32 项审批风暴上限。
+- 运行时维持 `runtime::run` 的外部签名，并按输入、协议、后台完成、计时器和关闭
+  拆分。`ActiveKind` 明确区分普通任务与压缩任务，避免原 compact 布尔值和多个
+  `Option` 组合形成非法阶段。
+- 新增 `runtime::limits` 集中运行时容量和超时。普通后台工作最多使用 112 个槽位，
+  为停止、审批回传和关闭保留 16 个；用户侧饱和返回繁忙，协议结果未知和无法安全
+  回传的控制失败仍停止。卡片、刷新、文件交付、归档同步和任务准备均在创建前检查。
+- 删除测试说明中的过时 minimal 文案；公共端口、持久化格式和 `runtime::run` 外部
+  契约未变。
+- 验证: `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked --
+  -D warnings`、`cargo test --workspace --locked -- --test-threads=1`、`cargo build -p
+  bridge-cli --bin bridge --locked`、`RUSTDOCFLAGS='-D warnings' cargo doc --workspace
+  --no-deps --locked`、`cargo xtask check-boundaries`、`bash -n setup.sh start.sh package.sh`
+  和 `git diff --check` 全部通过。CLI 行为测试的 approval/card/directory/session/files/
+  minimal 套件包含在 workspace 串行测试中并全部通过。
 
 ### C `test/protocol-contracts` — 未开始
 ### D `build/tooling` — 未开始
