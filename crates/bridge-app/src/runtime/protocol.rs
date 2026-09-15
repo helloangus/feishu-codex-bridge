@@ -1,7 +1,8 @@
 //! Backend protocol event handling: notifications fold into the active
 //! execution; requests become interactions or immediate denials.
 use super::flow::tell;
-use super::state::{Done, Runtime};
+use super::limits;
+use super::state::{ActiveKind, Done, Runtime};
 use crate::{
     events::{AgentEvent, Incoming},
     interactions::Pending,
@@ -9,7 +10,6 @@ use crate::{
     requests::{ApprovalKind, RequestKind},
     sessions,
 };
-use std::time::Duration;
 use tokio::{task::JoinSet, time::timeout};
 
 impl Runtime {
@@ -19,7 +19,9 @@ impl Runtime {
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), String> {
         match incoming {
-            Incoming::Notification(notification) => self.handle_notification(notification, jobs).await,
+            Incoming::Notification(notification) => {
+                self.handle_notification(notification, jobs).await
+            }
             Incoming::Request { mut request, reply } => {
                 if let RequestKind::Questions { questions, .. } = &request.kind {
                     crate::diagnostics::emit(
@@ -77,7 +79,8 @@ impl Runtime {
                 let valid_question_count = matches!(
                     &request.kind,
                     RequestKind::Questions { questions, .. }
-                        if questions.is_empty() || questions.len() > 32
+                        if questions.is_empty()
+                            || questions.len() > limits::QUESTIONS_PER_REQUEST
                 );
                 if !valid_question_count {
                     let live_active = self
@@ -92,17 +95,16 @@ impl Runtime {
                         })
                         .map(|active| (active.spec.id.clone(), active.spec.chat.clone()));
                     if let Some((task_id, chat)) = live_active {
-                        let can_register = !self.approvals.item_is_open(&request.turn, &request.item)
-                            && self.approvals.len() < 32;
+                        let can_register =
+                            !self.approvals.item_is_open(&request.turn, &request.item)
+                                && self.approvals.len() < limits::INTERACTIONS;
                         if can_register {
                             self.next_approval = self
                                 .next_approval
                                 .checked_add(1)
                                 .ok_or("审批编号耗尽".to_owned())?;
-                            let token = format!(
-                                "approval-{}-{}",
-                                self.settings.epoch, self.next_approval
-                            );
+                            let token =
+                                format!("approval-{}-{}", self.settings.epoch, self.next_approval);
                             let owner = crate::cards::Owner {
                                 user: self
                                     .active
@@ -123,7 +125,9 @@ impl Runtime {
                                     .active
                                     .as_ref()
                                     .and_then(|active| {
-                                        self.card_generations.get(&active.spec.session.user).copied()
+                                        self.card_generations
+                                            .get(&active.spec.session.user)
+                                            .copied()
                                     })
                                     .unwrap_or(0),
                                 stop_snapshot: self.card_snapshot(),
@@ -136,8 +140,8 @@ impl Runtime {
                                 reply,
                                 task: task_id,
                                 owner,
-                                deadline: tokio::time::Instant::now() + Duration::from_secs(600),
-                                sending: false,
+                                deadline: tokio::time::Instant::now() + limits::INTERACTION_TIMEOUT,
+                                card_dispatched: false,
                                 source: None,
                             };
                             let registered = self.approvals.insert(token, pending);
@@ -165,12 +169,12 @@ impl Runtime {
                         return Err("问答请求无效或数量超过上限，未提交空答案".into());
                     }
                 };
-                if jobs.len() >= super::state::BACKGROUND_LIMIT {
+                if jobs.len() >= limits::BACKGROUND_JOBS {
                     return Err("控制回传容量耗尽，停止运行".into());
                 }
                 jobs.spawn(async move {
                     Done::Control {
-                        result: timeout(Duration::from_secs(10), reply.reply(response))
+                        result: timeout(limits::BACKEND_REPLY_TIMEOUT, reply.reply(response))
                             .await
                             .unwrap_or(Err(BackendError::Uncertain)),
                     }
@@ -192,23 +196,35 @@ impl Runtime {
             if !sessions::valid_thread_id(thread) {
                 return Err("归档通知会话 ID 无效".into());
             }
-            if !self.archived_threads.contains(thread) && self.archived_threads.len() >= 128 {
+            if !self.archived_threads.contains(thread)
+                && self.archived_threads.len() >= limits::ARCHIVED_THREADS
+            {
                 return Err("待同步归档通知超过上限，停止运行".into());
             }
             self.archived_threads.insert(thread.clone());
             self.plan_offer = None;
             return Ok(());
         }
-        if let AgentEvent::FileChanges { turn, item, changes } = &notification {
+        if let AgentEvent::FileChanges {
+            turn,
+            item,
+            changes,
+        } = &notification
+        {
             if self.turn_is_live(turn) {
-                let key = (turn.epoch, turn.thread_id.clone(), turn.turn_id.clone(), item.clone());
+                let key = (
+                    turn.epoch,
+                    turn.thread_id.clone(),
+                    turn.turn_id.clone(),
+                    item.clone(),
+                );
                 // Duplicate item snapshots are ambiguous: revoke pending approvals.
                 if self.file_changes.contains_key(&key) || self.approvals.item_is_open(turn, item) {
                     self.approvals.expire_turn(turn, item);
                     if let Some(recorded) = self.file_changes.get_mut(&key) {
                         recorded.clear();
                     }
-                } else if self.file_changes.len() < 32 {
+                } else if self.file_changes.len() < limits::FILE_CHANGE_ITEMS {
                     self.file_changes.insert(key, changes.clone());
                 }
             }
@@ -216,17 +232,16 @@ impl Runtime {
         }
         if let AgentEvent::Started { turn } = &notification {
             let compacting = self.active.as_mut().filter(|active| {
-                active.compact
-                    && active.gate.is_some()
+                let expected = match &active.kind {
+                    ActiveKind::Compact { thread, .. } => thread.as_ref(),
+                    ActiveKind::Task => None,
+                };
+                active.gate.is_some()
                     && turn.epoch == self.settings.epoch
-                    && active.compact_thread.as_ref() == Some(&turn.thread_id)
+                    && expected == Some(&turn.thread_id)
             });
             if let Some(active) = compacting {
-                if active
-                    .turn
-                    .as_ref()
-                    .is_some_and(|current| current != turn)
-                {
+                if active.turn.as_ref().is_some_and(|current| current != turn) {
                     return Err("压缩期间出现其他执行，停止运行".into());
                 }
                 if active.turn.is_none() {
@@ -241,7 +256,7 @@ impl Runtime {
                     if stopping {
                         let backend = self.backend.clone();
                         let stop_turn = turn.clone();
-                        if jobs.len() >= super::state::BACKGROUND_LIMIT {
+                        if jobs.len() >= limits::BACKGROUND_JOBS {
                             return Err("控制容量耗尽，无法停止压缩".into());
                         }
                         jobs.spawn(async move {
@@ -270,8 +285,10 @@ impl Runtime {
             .active
             .as_mut()
             .and_then(|active| active.gate.as_mut())
-            .map(|gate| gate.event(notification).map_err(|_| "Codex 提前事件过多".to_owned()))
-        {
+            .map(|gate| {
+                gate.event(notification)
+                    .map_err(|_| "Codex 提前事件过多".to_owned())
+            }) {
             Some(result) => result?,
             None => return Ok(()),
         };

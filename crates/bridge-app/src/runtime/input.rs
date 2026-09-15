@@ -1,16 +1,15 @@
 //! User input handling: pairing, authorization, card clicks, commands,
 //! answers and task admission. Every path acknowledges the input exactly once.
 use super::flow::{can_spawn, send_panel, spawn_interrupt, spawn_reply, tell};
+use super::limits;
 use super::state::{Done, FileDelivery, Runtime};
-use crate::{interactions::{Choice, TextOutcome, Pending}, sessions};
-use bridge_core::{command::Command, task::TaskSpec, ExecutionMode, SessionKey};
-use std::{collections::BTreeMap, path::PathBuf};
-use tokio::{
-    task::JoinSet,
-    time::{Duration, Instant},
+use crate::{
+    interactions::{Choice, Claim, Pending, TextOutcome},
+    sessions,
 };
-
-const ANSWER_LIMIT_BYTES: usize = 16 * 1024;
+use bridge_core::{ExecutionMode, SessionKey, command::Command, task::TaskSpec};
+use std::{collections::BTreeMap, path::PathBuf};
+use tokio::{task::JoinSet, time::Instant};
 
 /// Whether a pending interaction still belongs to the running task turn.
 /// Stopping tasks and finished turns revoke their open interactions.
@@ -57,7 +56,7 @@ impl Runtime {
             .get(&input.user)
             .unwrap_or(&self.settings.directory)
             .clone();
-        if input.attachments.len() > 10 {
+        if input.attachments.len() > limits::ATTACHMENTS_PER_MESSAGE {
             tell(&self.delivery, &input.chat, "单条消息最多接收 10 个附件。")?;
             (input.accept)(true);
             return Ok(());
@@ -115,8 +114,15 @@ impl Runtime {
             && text.starts_with('/')
             && !matches!(
                 text.as_str(),
-                "/status" | "/help" | "/stop" | "/model" | "/models" | "/resume" | "/archived"
-                    | "/plan" | "/cd"
+                "/status"
+                    | "/help"
+                    | "/stop"
+                    | "/model"
+                    | "/models"
+                    | "/resume"
+                    | "/archived"
+                    | "/plan"
+                    | "/cd"
             )
         {
             tell(
@@ -141,7 +147,13 @@ impl Runtime {
         if text.starts_with('/')
             && !matches!(
                 text.as_str(),
-                "/help" | "/status" | "/models" | "/model" | "/plan" | "/cd" | "/resume"
+                "/help"
+                    | "/status"
+                    | "/models"
+                    | "/model"
+                    | "/plan"
+                    | "/cd"
+                    | "/resume"
                     | "/archived"
             )
         {
@@ -221,7 +233,7 @@ impl Runtime {
         }
         if let Ok(Command::ChangeDirectory(target)) = &command {
             if let Some(target) = target {
-                if target.len() > 4096 || target.chars().any(char::is_control) {
+                if target.len() > limits::PATH_BYTES || target.chars().any(char::is_control) {
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -325,7 +337,10 @@ impl Runtime {
         }
         if matches!(
             &command,
-            Ok(Command::Resume(_) | Command::Archive(_) | Command::Unarchive(_) | Command::Archived)
+            Ok(Command::Resume(_)
+                | Command::Archive(_)
+                | Command::Unarchive(_)
+                | Command::Archived)
         ) {
             return self
                 .handle_threads(input, command, refresh, session, current, jobs)
@@ -367,7 +382,7 @@ impl Runtime {
                 .await?;
             return Ok(());
         }
-        if text.len() > 32 * 1024 {
+        if text.len() > limits::INPUT_BYTES {
             tell(&self.delivery, &input.chat, "输入超过 32 KiB 上限。")?;
             (input.accept)(true);
             return Ok(());
@@ -376,11 +391,11 @@ impl Runtime {
     }
 
     async fn handle_pairing(&mut self, input: super::Input) -> Result<(), String> {
-        if self.pairing_window.elapsed() >= Duration::from_secs(60) {
+        if self.pairing_window.elapsed() >= limits::PAIRING_WINDOW {
             self.pairing_window = Instant::now();
             self.pairing_attempts = 0;
         }
-        if self.pairing_attempts >= 10 {
+        if self.pairing_attempts >= limits::PAIRING_ATTEMPTS {
             (input.accept)(true);
             return Ok(());
         }
@@ -391,7 +406,10 @@ impl Runtime {
             .unwrap_or_default()
             .split_whitespace()
             .collect();
-        let code = if parts.len() == 2 && parts[1].len() <= 256 && input.attachments.is_empty() {
+        let code = if parts.len() == 2
+            && parts[1].len() <= limits::PAIRING_CODE_BYTES
+            && input.attachments.is_empty()
+        {
             parts[1].to_owned()
         } else {
             String::new()
@@ -454,7 +472,8 @@ impl Runtime {
             (input.accept)(true);
             return Ok(());
         }
-        if matches!(self.files, FileDelivery::Delivering) || !self.scheduler.begin_session_mutation()
+        if matches!(self.files, FileDelivery::Delivering)
+            || !self.scheduler.begin_session_mutation()
         {
             tell(
                 &self.delivery,
@@ -466,7 +485,11 @@ impl Runtime {
         }
         if !can_spawn(jobs, false) {
             self.scheduler.end_session_mutation();
-            tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新生成计划。")?;
+            tell(
+                &self.delivery,
+                &input.chat,
+                "系统繁忙，请稍后重新生成计划。",
+            )?;
             (input.accept)(true);
             return Ok(());
         }
@@ -540,7 +563,11 @@ impl Runtime {
                 Ok(true)
             }
             .await;
-            Done::PlanAction { input, task, result }
+            Done::PlanAction {
+                input,
+                task,
+                result,
+            }
         });
         Ok(())
     }
@@ -565,7 +592,7 @@ impl Runtime {
             && ((skipping && answer.is_empty())
                 || (!skipping
                     && !answer.trim().is_empty()
-                    && answer.len() <= ANSWER_LIMIT_BYTES
+                    && answer.len() <= limits::ANSWER_BYTES
                     && !answer
                         .chars()
                         .any(|c| c.is_control() && c != '\n' && c != '\t')))
@@ -574,10 +601,12 @@ impl Runtime {
                 let active = self.active.as_ref();
                 outcome = self.approvals.answer_text(
                     &token,
-                    &input.user,
-                    &input.chat,
-                    &current,
-                    Instant::now(),
+                    Claim {
+                        user: &input.user,
+                        chat: &input.chat,
+                        directory: &current,
+                        now: Instant::now(),
+                    },
                     index,
                     &answer,
                     skipping,
@@ -620,11 +649,13 @@ impl Runtime {
             if let Some(source) = &approval_source {
                 let active = self.active.as_ref();
                 outcome = self.approvals.answer_choice(
-                    &parts[1],
-                    &input.user,
-                    &input.chat,
-                    &current,
-                    Instant::now(),
+                    parts[1],
+                    Claim {
+                        user: &input.user,
+                        chat: &input.chat,
+                        directory: &current,
+                        now: Instant::now(),
+                    },
                     source,
                     parts[2].parse::<usize>().unwrap_or(usize::MAX),
                     parts[3],
@@ -634,12 +665,11 @@ impl Runtime {
         }
         match outcome {
             Choice::Recorded { complete, finished } => {
-                self.card_actions.invalidate_approval(&parts[1]);
+                self.card_actions.invalidate_approval(parts[1]);
                 // The click source equals the entry source whenever the
                 // recording was accepted, so the note uses the click.
                 if let Some(source) = &approval_source {
-                    self.card_views
-                        .note(source, "本题已记录，其他按钮已失效。");
+                    self.card_views.note(source, "本题已记录，其他按钮已失效。");
                 }
                 if complete {
                     if let Some(pending) = finished {
@@ -648,14 +678,14 @@ impl Runtime {
                 }
             }
             Choice::WaitingText => {
-                self.card_actions.invalidate_approval(&parts[1]);
+                self.card_actions.invalidate_approval(parts[1]);
                 if let Some(source) = &approval_source {
                     self.card_views
                         .note(source, "已进入自行回答，请按单独提示发送答案。");
                 }
                 let question = self
                     .approvals
-                    .get(&parts[1])
+                    .get(parts[1])
                     .map(|pending| pending.question)
                     .unwrap_or_default();
                 tell(
@@ -690,15 +720,16 @@ impl Runtime {
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), String> {
-        let source = approval_source.clone();
         let active = self.active.as_ref();
-        let pending = source.as_deref().and_then(|source| {
+        let pending = approval_source.as_deref().and_then(|source| {
             self.approvals.approve(
                 token,
-                &input.user,
-                &input.chat,
-                &current,
-                Instant::now(),
+                Claim {
+                    user: &input.user,
+                    chat: &input.chat,
+                    directory: &current,
+                    now: Instant::now(),
+                },
                 source,
                 |pending| turn_is_live(active, pending),
             )
@@ -734,9 +765,13 @@ impl Runtime {
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), String> {
         let change = match &command {
-            Ok(Command::Model(Some(model))) => Some(sessions::PreferenceChange::Model(
-                if model == "default" { None } else { Some(model.clone()) },
-            )),
+            Ok(Command::Model(Some(model))) => {
+                Some(sessions::PreferenceChange::Model(if model == "default" {
+                    None
+                } else {
+                    Some(model.clone())
+                }))
+            }
             Ok(Command::Plan(Some(value))) => Some(sessions::PreferenceChange::Plan(*value)),
             _ => None,
         };
@@ -792,17 +827,21 @@ impl Runtime {
                                         ),
                                     })
                                 }
-                                Ok(Command::Model(None)) => Ok(
-                                    super::state::ListedContent::Text(format!(
+                                Ok(Command::Model(None)) => {
+                                    Ok(super::state::ListedContent::Text(format!(
                                         "当前模型：{}",
                                         preferences
                                             .model
                                             .unwrap_or_else(|| sessions::DEFAULT_MODEL.into())
-                                    )),
-                                ),
+                                    )))
+                                }
                                 _ => Ok(super::state::ListedContent::Text(format!(
                                     "Plan 模式：{}。使用 /plan on 或 /plan off 切换。",
-                                    if preferences.plan { "已开启" } else { "已关闭" }
+                                    if preferences.plan {
+                                        "已开启"
+                                    } else {
+                                        "已关闭"
+                                    }
                                 ))),
                             }
                         }
@@ -931,9 +970,17 @@ impl Runtime {
                         .map(|active| {
                             format!(
                                 "{}，已用 {} 秒{}",
-                                if active.compact { "上下文压缩中" } else { "运行中" },
+                                if active.is_compact() {
+                                    "上下文压缩中"
+                                } else {
+                                    "运行中"
+                                },
                                 active.started.elapsed().as_secs(),
-                                if active.stopping { "，正在停止" } else { "" }
+                                if active.stopping {
+                                    "，正在停止"
+                                } else {
+                                    ""
+                                }
                             )
                         })
                         .unwrap_or_else(|| "空闲".into());
@@ -951,15 +998,11 @@ impl Runtime {
                 "/stop" => {
                     let removed = self.scheduler.cancel_queued(&session);
                     let mut stopping = false;
-                    if let Some(active) = self
-                        .active
-                        .as_mut()
-                        .filter(|active| {
-                            active.spec.session == session
-                                && active.spec.chat == input.chat
-                                && active.compact_outcome.is_none()
-                        })
-                    {
+                    if let Some(active) = self.active.as_mut().filter(|active| {
+                        active.spec.session == session
+                            && active.spec.chat == input.chat
+                            && !active.compact_is_terminal()
+                    }) {
                         stopping = true;
                         if !active.stopping {
                             active.stopping = true;
@@ -1022,8 +1065,12 @@ impl Runtime {
             Ok(ticket) => {
                 if !can_spawn(jobs, false) {
                     self.scheduler.abort_admission(ticket);
-                    self.resources.remove(&input.id);
-                    tell(&self.delivery, &input.chat, "任务队列繁忙，请稍后重新发送。")?;
+                    self.resources.retain(|id, _| self.scheduler.has_task(id));
+                    tell(
+                        &self.delivery,
+                        &input.chat,
+                        "任务队列繁忙，请稍后重新发送。",
+                    )?;
                     (input.accept)(false);
                     return Ok(());
                 }
@@ -1038,7 +1085,11 @@ impl Runtime {
                 });
             }
             Err(_) => {
-                tell(&self.delivery, &input.chat, "任务队列繁忙，请稍后重新发送。")?;
+                tell(
+                    &self.delivery,
+                    &input.chat,
+                    "任务队列繁忙，请稍后重新发送。",
+                )?;
                 (input.accept)(false);
             }
         }
@@ -1047,14 +1098,11 @@ impl Runtime {
 }
 
 /// Record a command id once, clearing old entries when the bound is hit.
-pub(crate) fn seen_insert(
-    seen: &mut BTreeMap<String, Instant>,
-    id: &str,
-) -> bool {
+pub(crate) fn seen_insert(seen: &mut BTreeMap<String, Instant>, id: &str) -> bool {
     if seen.contains_key(id) {
         return false;
     }
-    if seen.len() >= 1000 {
+    if seen.len() >= limits::SEEN_COMMANDS {
         seen.clear();
     }
     seen.insert(id.to_owned(), Instant::now());

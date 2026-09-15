@@ -1,6 +1,7 @@
 //! Shared flow helpers: delivery of text and panels, task completion and
 //! protocol event folding, plus the bounded background-job policy.
-use super::state::{BACKGROUND_LIMIT, CONTROL_RESERVE, Done, Active};
+use super::limits;
+use super::state::{Active, ActiveKind, Done};
 use crate::{
     Scheduler,
     events::{AgentEvent, TurnOutcome},
@@ -8,8 +9,8 @@ use crate::{
     ports::TurnRef,
     presentation::Request as DeliveryRequest,
 };
-use bridge_core::{view::Panel, ExecutionMode};
-use std::{sync::Arc, time::Duration};
+use bridge_core::{ExecutionMode, view::Panel};
+use std::sync::Arc;
 use tokio::{
     sync::mpsc,
     task::JoinSet,
@@ -29,9 +30,9 @@ pub(crate) fn tell(
 /// it. Beyond the hard limit nothing is spawned and the run stops instead.
 pub(crate) fn can_spawn(jobs: &JoinSet<Done>, control: bool) -> bool {
     if control {
-        jobs.len() < BACKGROUND_LIMIT
+        jobs.len() < limits::BACKGROUND_JOBS
     } else {
-        jobs.len() + CONTROL_RESERVE <= BACKGROUND_LIMIT
+        jobs.len() + limits::CONTROL_JOB_RESERVE < limits::BACKGROUND_JOBS
     }
 }
 
@@ -42,7 +43,7 @@ pub(crate) fn spawn_reply(
     pending: crate::interactions::Pending,
     allow: bool,
 ) -> Result<(), String> {
-    if jobs.len() >= BACKGROUND_LIMIT {
+    if jobs.len() >= limits::BACKGROUND_JOBS {
         return Err("控制回传容量耗尽，停止运行".into());
     }
     jobs.spawn(async move {
@@ -63,7 +64,7 @@ pub(crate) fn send_panel(
     if !can_spawn(jobs, false) {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + limits::INTERACTION_TIMEOUT;
     jobs.spawn(async move {
         let fallback = if commands
             .iter()
@@ -85,7 +86,7 @@ pub(crate) fn send_panel(
                     .join("\n")
             )
         };
-        let result = match timeout(Duration::from_secs(45), async {
+        let result = match timeout(limits::MESSAGE_TIMEOUT, async {
             if let Some(source) = &source {
                 let id = MessageId(source.clone());
                 messenger.update_panel(id.clone(), panel.clone()).await?;
@@ -104,7 +105,7 @@ pub(crate) fn send_panel(
         if result.is_err()
             && !matches!(
                 timeout(
-                    Duration::from_secs(45),
+                    limits::MESSAGE_TIMEOUT,
                     messenger.send_text(owner.chat.clone(), fallback)
                 )
                 .await,
@@ -163,7 +164,7 @@ pub(crate) fn finish(
             Some(&active.spec.id),
             active.output.len(),
         );
-        if active.compact {
+        if active.is_compact() {
             scheduler.end_session_mutation();
             return tell(delivery, &active.spec.chat, outcome);
         }
@@ -211,10 +212,12 @@ pub(crate) fn event(
     ) {
         active
             .as_ref()
-            .filter(|active| !active.compact && !active.stopping && active.spec.mode == ExecutionMode::Plan)
+            .filter(|active| {
+                !active.is_compact() && !active.stopping && active.spec.mode == ExecutionMode::Plan
+            })
             .and_then(|active| {
                 let (text, truncated) = active.plan.as_ref()?;
-                if *truncated || text.trim().is_empty() || text.len() > 16000 {
+                if *truncated || text.trim().is_empty() || text.len() > limits::PLAN_BYTES {
                     return None;
                 }
                 Some(crate::plans::Offer {
@@ -223,7 +226,7 @@ pub(crate) fn event(
                     text: text.clone(),
                     token: format!("plan-{}", active.spec.id),
                     sent: false,
-                    deadline: Instant::now() + Duration::from_secs(600),
+                    deadline: Instant::now() + limits::INTERACTION_TIMEOUT,
                 })
             })
     } else {
@@ -232,7 +235,7 @@ pub(crate) fn event(
     match event {
         AgentEvent::Plan { text, .. } => {
             if let Some(active) = active {
-                let mut end = text.len().min(32 * 1024);
+                let mut end = text.len().min(limits::OUTPUT_BYTES);
                 while !text.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -241,7 +244,7 @@ pub(crate) fn event(
         }
         AgentEvent::Output { delta, .. } => {
             if let Some(active) = active {
-                let available = (32 * 1024_usize).saturating_sub(active.output.len());
+                let available = limits::OUTPUT_BYTES.saturating_sub(active.output.len());
                 let mut end = delta.len().min(available);
                 while !delta.is_char_boundary(end) {
                     end -= 1;
@@ -251,7 +254,7 @@ pub(crate) fn event(
             }
         }
         AgentEvent::Finished { outcome, .. } => {
-            if let Some(current) = active.as_mut().filter(|active| active.compact) {
+            if let Some(current) = active.as_mut().filter(|active| active.is_compact()) {
                 let label = match outcome {
                     TurnOutcome::Completed => "上下文压缩完成。".into(),
                     TurnOutcome::Interrupted => "上下文压缩已停止。".into(),
@@ -260,13 +263,20 @@ pub(crate) fn event(
                         message
                             .unwrap_or_else(|| "Codex 未返回原因".into())
                             .chars()
-                            .take(1000)
+                            .take(limits::PREVIEW_CHARS)
                             .collect::<String>()
                     ),
                 };
-                if !current.compact_ack {
-                    current.compact_outcome = Some(label);
-                    return Ok(None);
+                if let ActiveKind::Compact {
+                    acknowledged,
+                    terminal,
+                    ..
+                } = &mut current.kind
+                {
+                    if !*acknowledged {
+                        *terminal = Some(label);
+                        return Ok(None);
+                    }
                 }
                 return finish(active, scheduler, delivery, label).map(|_| None);
             }
@@ -278,7 +288,7 @@ pub(crate) fn event(
                     message
                         .unwrap_or_else(|| "Codex 未返回原因".into())
                         .chars()
-                        .take(1000)
+                        .take(limits::PREVIEW_CHARS)
                         .collect::<String>()
                 ),
             };
@@ -295,11 +305,104 @@ pub(crate) fn spawn_interrupt(
     backend: Arc<dyn crate::ports::AgentBackend>,
     turn: TurnRef,
 ) -> Result<(), String> {
-    if jobs.len() >= BACKGROUND_LIMIT {
+    if jobs.len() >= limits::BACKGROUND_JOBS {
         return Err("控制容量耗尽，无法回传停止请求".into());
     }
-    jobs.spawn(async move { Done::Control {
-        result: backend.interrupt(turn).await,
-    } });
+    jobs.spawn(async move {
+        Done::Control {
+            result: backend.interrupt(turn).await,
+        }
+    });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bridge_core::task::TaskSpec;
+    use bridge_core::{ExecutionMode, SessionKey};
+    use tokio::sync::mpsc;
+
+    fn compact_active(turn: TurnRef) -> Active {
+        Active {
+            kind: ActiveKind::Compact {
+                acknowledged: false,
+                terminal: None,
+                thread: Some(turn.thread_id.clone()),
+            },
+            spec: TaskSpec {
+                id: "request".into(),
+                session: SessionKey::new("user", "/project"),
+                chat: "chat".into(),
+                prompt: String::new(),
+                model: None,
+                mode: ExecutionMode::Execute,
+            },
+            gate: None,
+            turn: Some(turn.clone()),
+            stopping: false,
+            output: String::new(),
+            plan: None,
+            truncated: false,
+            started: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_user_jobs_leave_the_control_reserve_available() {
+        let mut jobs = JoinSet::new();
+        for _ in 0..(limits::BACKGROUND_JOBS - limits::CONTROL_JOB_RESERVE) {
+            jobs.spawn(std::future::pending::<Done>());
+        }
+        assert!(!can_spawn(&jobs, false));
+        assert!(can_spawn(&jobs, true));
+
+        for _ in 0..limits::CONTROL_JOB_RESERVE {
+            assert!(can_spawn(&jobs, true));
+            jobs.spawn(std::future::pending::<Done>());
+        }
+        assert!(!can_spawn(&jobs, false));
+        assert!(!can_spawn(&jobs, true));
+
+        jobs.abort_all();
+        while jobs.join_next().await.is_some() {}
+    }
+
+    #[test]
+    fn compact_terminal_before_ack_keeps_mutation_gate_and_sends_no_success() -> Result<(), String>
+    {
+        let mut scheduler = Scheduler::new(1);
+        assert!(scheduler.begin_session_mutation());
+        let (delivery, mut messages) = mpsc::channel(4);
+        let turn = TurnRef {
+            epoch: 1,
+            thread_id: "thread".into(),
+            turn_id: "compact".into(),
+        };
+        let mut active = Some(compact_active(turn.clone()));
+        event(
+            &mut active,
+            &mut scheduler,
+            &delivery,
+            AgentEvent::Finished {
+                turn,
+                outcome: TurnOutcome::Completed,
+            },
+        )?;
+        assert!(messages.try_recv().is_err());
+        assert!(!scheduler.begin_session_mutation());
+        let label = match active.as_mut().map(|active| &mut active.kind) {
+            Some(ActiveKind::Compact { terminal, .. }) => {
+                terminal.take().ok_or("missing terminal")?
+            }
+            _ => return Err("missing compact state".into()),
+        };
+        finish(&mut active, &mut scheduler, &delivery, label)?;
+        assert!(active.is_none());
+        assert!(scheduler.begin_session_mutation());
+        assert!(
+            matches!(messages.try_recv().map_err(|e| e.to_string())?, DeliveryRequest::Text(_, text) if text=="上下文压缩完成。")
+        );
+        Ok(())
+    }
 }

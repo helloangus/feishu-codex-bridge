@@ -1,4 +1,4 @@
-//! Full minimal actor with fake stdio app-server, real store and fake delivery.
+//! Full runtime actor with fake stdio app-server, real store and fake delivery.
 use bridge_app::{
     messaging::{DeliveryFuture, MessageId, Messenger, ResourceKind},
     runtime::{self, Input},

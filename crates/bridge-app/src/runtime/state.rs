@@ -1,5 +1,6 @@
 //! Runtime state: execution, interactions, cards and bounded background jobs.
 use super::flow::{can_spawn, spawn_reply, tell};
+use super::limits;
 use crate::{
     Scheduler,
     directories::{Confirmations, DirectoryStore},
@@ -16,7 +17,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
 };
 use tokio::{
     sync::mpsc,
@@ -38,16 +38,17 @@ pub struct Settings {
 pub trait Store: SessionStore + DurableJournal + DirectoryStore {}
 impl<T: SessionStore + DurableJournal + DirectoryStore> Store for T {}
 
-/// Total background jobs; beyond this the run stops rather than losing work.
-pub(crate) const BACKGROUND_LIMIT: usize = 128;
-/// Capacity kept aside for stop, denial and shutdown replies.
-pub(crate) const CONTROL_RESERVE: usize = 16;
+pub(crate) enum ActiveKind {
+    Task,
+    Compact {
+        acknowledged: bool,
+        terminal: Option<String>,
+        thread: Option<String>,
+    },
+}
 
 pub(crate) struct Active {
-    pub(crate) compact: bool,
-    pub(crate) compact_ack: bool,
-    pub(crate) compact_outcome: Option<String>,
-    pub(crate) compact_thread: Option<String>,
+    pub(crate) kind: ActiveKind,
     pub(crate) spec: TaskSpec,
     pub(crate) gate: Option<Execution>,
     pub(crate) turn: Option<TurnRef>,
@@ -58,11 +59,34 @@ pub(crate) struct Active {
     pub(crate) started: Instant,
 }
 
+impl Active {
+    pub(crate) fn is_compact(&self) -> bool {
+        matches!(self.kind, ActiveKind::Compact { .. })
+    }
+
+    pub(crate) fn compact_is_terminal(&self) -> bool {
+        matches!(
+            self.kind,
+            ActiveKind::Compact {
+                terminal: Some(_),
+                ..
+            }
+        )
+    }
+}
+
 /// Task files move from the finished task to delivery in one bounded step.
 pub(crate) enum FileDelivery {
     Idle,
     Holding(TaskSpec),
     Delivering,
+}
+
+pub(crate) struct PanelRefresh {
+    pub(crate) source: String,
+    pub(crate) owner: crate::cards::Owner,
+    pub(crate) panel: Panel,
+    pub(crate) commands: Vec<(String, String)>,
 }
 
 pub(crate) enum ListedContent {
@@ -222,7 +246,7 @@ pub(crate) struct Runtime {
     pub(crate) card_actions: crate::cards::Actions,
     pub(crate) card_views: crate::cards::Views,
     pub(crate) updating_panel: bool,
-    pub(crate) refreshes: VecDeque<(String, crate::cards::Owner, Panel, Vec<(String, String)>)>,
+    pub(crate) refreshes: VecDeque<PanelRefresh>,
     pub(crate) card_generations: BTreeMap<String, u64>,
     pub(crate) next_panel: u64,
     pub(crate) approvals: Interactions,
@@ -255,7 +279,7 @@ impl Runtime {
             messenger,
             delivery,
             directories,
-            scheduler: Scheduler::new(64),
+            scheduler: Scheduler::new(limits::SCHEDULED_TASKS),
             active: None,
             next_task: 0,
             resources: BTreeMap::new(),
@@ -290,9 +314,13 @@ impl Runtime {
 
     /// Whether the active task still owns this turn and accepts requests.
     pub(crate) fn turn_is_live(&self, turn: &TurnRef) -> bool {
-        self.active
-            .as_ref()
-            .is_some_and(|active| !active.stopping && active.gate.as_ref().is_some_and(|gate| gate.accepts_request(turn)))
+        self.active.as_ref().is_some_and(|active| {
+            !active.stopping
+                && active
+                    .gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.accepts_request(turn))
+        })
     }
 
     /// The snapshot card actions compare themselves against.
@@ -307,7 +335,10 @@ impl Runtime {
     /// approval card delivery, panel refreshes, file delivery and admission.
     /// Returning `Err` stops the run.
     pub(crate) async fn maintain(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), String> {
-        if !self.archived_threads.is_empty() && self.scheduler.begin_invalidation() {
+        if !self.archived_threads.is_empty()
+            && self.can_spawn(jobs, false)
+            && self.scheduler.begin_invalidation()
+        {
             self.plan_offer = None;
             let thread = self
                 .archived_threads
@@ -389,19 +420,19 @@ impl Runtime {
 
     fn deliver_approval_cards(&mut self, jobs: &mut JoinSet<Done>) {
         let live = |pending: &Pending| {
-            self.active.as_ref().is_some_and(|active| {
-                active.turn.as_ref() == Some(&pending.request.turn)
-            })
+            self.active
+                .as_ref()
+                .is_some_and(|active| active.turn.as_ref() == Some(&pending.request.turn))
         };
         for token in self.approvals.unsent_tokens(live) {
-            if !self.can_spawn(jobs, true) {
+            if !self.can_spawn(jobs, false) {
                 // Retry on a later loop iteration; nothing was marked sent.
                 break;
             }
             let Some(pending) = self.approvals.get_mut(&token) else {
                 continue;
             };
-            pending.sending = true;
+            pending.card_dispatched = true;
             self.next_panel = match self.next_panel.checked_add(1) {
                 Some(value) => value,
                 None => return,
@@ -421,7 +452,7 @@ impl Runtime {
             let messenger = self.messenger.clone();
             jobs.spawn(async move {
                 let result = timeout(
-                    Duration::from_secs(45),
+                    limits::MESSAGE_TIMEOUT,
                     messenger.send_panel(chat, panel.clone()),
                 )
                 .await
@@ -437,18 +468,17 @@ impl Runtime {
     }
 
     fn refresh_panels(&mut self, jobs: &mut JoinSet<Done>) {
-        if self.updating_panel {
+        if self.updating_panel || !self.can_spawn(jobs, false) {
             return;
         }
-        if let Some((source, owner, panel, commands)) = self.refreshes.pop_front() {
-            self.updating_panel = true;
-            super::flow::send_panel(
-                Some(source),
+        if let Some(refresh) = self.refreshes.pop_front() {
+            self.updating_panel = super::flow::send_panel(
+                Some(refresh.source),
                 jobs,
                 self.messenger.clone(),
-                owner,
-                panel,
-                commands,
+                refresh.owner,
+                refresh.panel,
+                refresh.commands,
             );
             return;
         }
@@ -462,7 +492,7 @@ impl Runtime {
             jobs.spawn(async move {
                 if !matches!(
                     timeout(
-                        Duration::from_secs(45),
+                        limits::MESSAGE_TIMEOUT,
                         messenger.update_panel(MessageId(source), panel)
                     )
                     .await,
@@ -479,43 +509,44 @@ impl Runtime {
         if self.active.is_some() {
             return;
         }
-        if let FileDelivery::Holding(spec) =
-            std::mem::replace(&mut self.files, FileDelivery::Delivering)
-        {
-            if !self.can_spawn(jobs, true) {
-                self.files = FileDelivery::Holding(spec);
-                return;
-            }
-            let messenger = self.messenger.clone();
-            jobs.spawn(async move {
-                let result = timeout(
-                    Duration::from_secs(180),
-                    messenger.finish_files(spec.id.clone(), spec.chat.clone(), spec.session.workspace),
+        let FileDelivery::Holding(spec) = &self.files else {
+            return;
+        };
+        let spec = spec.clone();
+        self.files = FileDelivery::Delivering;
+        if !self.can_spawn(jobs, false) {
+            self.files = FileDelivery::Holding(spec);
+            return;
+        }
+        let messenger = self.messenger.clone();
+        jobs.spawn(async move {
+            let result = timeout(
+                limits::FILE_FINISH_TIMEOUT,
+                messenger.finish_files(spec.id.clone(), spec.chat.clone(), spec.session.workspace),
+            )
+            .await;
+            crate::diagnostics::emit(
+                crate::diagnostics::Event::FilesFinished,
+                if matches!(&result, Ok(Ok(()))) {
+                    crate::diagnostics::Status::Ok
+                } else {
+                    crate::diagnostics::Status::Failed
+                },
+                Some(&spec.id),
+                0,
+            );
+            if !matches!(result, Ok(Ok(()))) {
+                let _ = timeout(
+                    limits::BACKEND_REPLY_TIMEOUT,
+                    messenger.send_text(
+                        spec.chat.clone(),
+                        "成果物处理失败或超时，未自动重试；请检查工作目录。".into(),
+                    ),
                 )
                 .await;
-                crate::diagnostics::emit(
-                    crate::diagnostics::Event::FilesFinished,
-                    if matches!(&result, Ok(Ok(()))) {
-                        crate::diagnostics::Status::Ok
-                    } else {
-                        crate::diagnostics::Status::Failed
-                    },
-                    Some(&spec.id),
-                    0,
-                );
-                if !matches!(result, Ok(Ok(()))) {
-                    let _ = timeout(
-                        Duration::from_secs(10),
-                        messenger.send_text(
-                            spec.chat.clone(),
-                            "成果物处理失败或超时，未自动重试；请检查工作目录。".into(),
-                        ),
-                    )
-                    .await;
-                }
-                Done::FilesDelivered
-            });
-        }
+            }
+            Done::FilesDelivered
+        });
     }
 
     fn deliver_plan_offer(&mut self, jobs: &mut JoinSet<Done>) {
@@ -546,8 +577,10 @@ impl Runtime {
             Some(value) => value,
             None => return,
         };
-        let (panel, commands) =
-            crate::plans::panel(offer, &format!("panel-{}-{}", self.settings.epoch, self.next_panel));
+        let (panel, commands) = crate::plans::panel(
+            offer,
+            &format!("panel-{}-{}", self.settings.epoch, self.next_panel),
+        );
         let owner = crate::cards::Owner {
             user: offer.task.session.user.clone(),
             chat: offer.task.chat.clone(),
@@ -565,6 +598,9 @@ impl Runtime {
         if self.active.is_some() || !matches!(self.files, FileDelivery::Idle) {
             return;
         }
+        if !self.can_spawn(jobs, false) {
+            return;
+        }
         let Some(spec) = self.scheduler.start_next().cloned() else {
             return;
         };
@@ -578,10 +614,7 @@ impl Runtime {
             "已开始执行；可发送 /status 或 /stop。",
         );
         self.active = Some(Active {
-            compact: false,
-            compact_ack: false,
-            compact_outcome: None,
-            compact_thread: None,
+            kind: ActiveKind::Task,
             spec: spec.clone(),
             gate: None,
             turn: None,
@@ -591,11 +624,6 @@ impl Runtime {
             truncated: false,
             started: Instant::now(),
         });
-        if !self.can_spawn(jobs, true) {
-            // The task stays active; preparation retries through the normal
-            // completion flow once capacity frees up.
-            return;
-        }
         let backend = self.backend.clone();
         let store = self.store.clone();
         let sandbox = self.settings.sandbox;
@@ -606,11 +634,18 @@ impl Runtime {
                 store
                     .validate_directory(root, spec.session.workspace.clone())
                     .await
-                    .map_err(|_| "当前目录已失效或越出工作区，请使用 /cd <绝对路径> 重新选择目录。".to_owned())?;
+                    .map_err(|_| {
+                        "当前目录已失效或越出工作区，请使用 /cd <绝对路径> 重新选择目录。"
+                            .to_owned()
+                    })?;
                 let count = attachments.len();
                 let prepared = timeout(
-                    Duration::from_secs(120),
-                    messenger.prepare_files(spec.id.clone(), spec.session.workspace.clone(), attachments),
+                    limits::FILE_PREPARE_TIMEOUT,
+                    messenger.prepare_files(
+                        spec.id.clone(),
+                        spec.session.workspace.clone(),
+                        attachments,
+                    ),
                 )
                 .await;
                 crate::diagnostics::emit(
@@ -628,12 +663,17 @@ impl Runtime {
                     .map_err(|e| format!("附件或快照准备失败：{e}"))?;
                 let mut configured = spec.clone();
                 configured.prompt.push_str(&files.prompt);
-                let mut turn = sessions::prepare_configured(backend.as_ref(), store.as_ref(), &configured, sandbox)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let mut turn = sessions::prepare_configured(
+                    backend.as_ref(),
+                    store.as_ref(),
+                    &configured,
+                    sandbox,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 turn.images = files.images;
                 timeout(
-                    Duration::from_secs(60),
+                    limits::FILE_BIND_TIMEOUT,
                     messenger.bind_files(spec.id.clone(), turn.thread_id.clone()),
                 )
                 .await
@@ -642,9 +682,10 @@ impl Runtime {
                 Ok(turn)
             }
             .await;
-            Done::Prepared { id: spec.id, result }
+            Done::Prepared {
+                id: spec.id,
+                result,
+            }
         });
     }
-
-
 }

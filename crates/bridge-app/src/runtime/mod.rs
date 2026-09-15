@@ -1,12 +1,13 @@
 //! Serial runtime: text, help, status and owner-scoped stop.
 //!
 //! The `run` loop only selects events and delegates to handlers; state lives
-//! in [`state::Runtime`], input handling in [`input`], protocol events in
-//! [`protocol`], background completion in [`jobs`] and timers in [`timers`].
+//! in `state::Runtime`, input handling in `input`, protocol events in
+//! `protocol`, background completion in `jobs` and timers in `timers`.
 //! Serial admission, ownership checks and bounded channels are preserved.
 mod flow;
 mod input;
 mod jobs;
+pub(crate) mod limits;
 mod protocol;
 mod state;
 mod timers;
@@ -18,7 +19,7 @@ use crate::{
     messaging::Messenger,
     ports::{AgentBackend, BackendError},
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -52,7 +53,8 @@ pub async fn run(
         .directory_preferences()
         .await
         .map_err(|_| "无法读取用户目录设置".to_owned())?;
-    let (delivery, mut deliveries) = mpsc::channel::<crate::presentation::Request>(128);
+    let (delivery, mut deliveries) =
+        mpsc::channel::<crate::presentation::Request>(limits::DELIVERY_QUEUE);
     let text_messenger = messenger.clone();
     let progress_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let busy = progress_busy.clone();
@@ -60,22 +62,24 @@ pub async fn run(
         let mut presentation = crate::presentation::Presentation::default();
         while let Some(request) = deliveries.recv().await {
             let result = match request {
-                crate::presentation::Request::Text(chat, text) => timeout(
-                    Duration::from_secs(45),
-                    text_messenger.send_text(chat, text),
-                )
-                .await,
+                crate::presentation::Request::Text(chat, text) => {
+                    timeout(
+                        limits::MESSAGE_TIMEOUT,
+                        text_messenger.send_text(chat, text),
+                    )
+                    .await
+                }
                 crate::presentation::Request::Answer { task, chat, text } => {
                     let id = task.clone();
                     let result = if text_messenger.rich_output() {
                         timeout(
-                            Duration::from_secs(180),
+                            limits::ANSWER_DELIVERY_TIMEOUT,
                             presentation.answer(text_messenger.as_ref(), task, chat, text),
                         )
                         .await
                     } else {
                         timeout(
-                            Duration::from_secs(45),
+                            limits::MESSAGE_TIMEOUT,
                             text_messenger.send_text(chat, text),
                         )
                         .await
@@ -118,7 +122,7 @@ pub async fn run(
         progress_busy,
     );
     let mut jobs = JoinSet::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(limits::TICK);
     let result = async {
         loop {
             state.maintain(&mut jobs).await?;
@@ -149,13 +153,19 @@ pub async fn run(
     .await;
     if let Some(active) = state.active.take() {
         if let Some(turn) = active.turn {
-            let _ = timeout(Duration::from_secs(3), shutdown_backend.interrupt(turn)).await;
+            let _ = timeout(
+                limits::SHUTDOWN_INTERRUPT_TIMEOUT,
+                shutdown_backend.interrupt(turn),
+            )
+            .await;
         }
-        let _ = state.delivery.try_send(crate::presentation::Request::Answer {
-            task: active.spec.id,
-            chat: active.spec.chat,
-            text: "桥接已停止；未完成任务不会自动重跑。".into(),
-        });
+        let _ = state
+            .delivery
+            .try_send(crate::presentation::Request::Answer {
+                task: active.spec.id,
+                chat: active.spec.chat,
+                text: "桥接已停止；未完成任务不会自动重跑。".into(),
+            });
     }
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
@@ -166,14 +176,18 @@ pub async fn run(
             break;
         }
     }
-    let _ = timeout(Duration::from_secs(3), async {
+    let _ = timeout(limits::SHUTDOWN_REPLY_TIMEOUT, async {
         while jobs.join_next().await.is_some() {}
     })
     .await;
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
     drop(state.delivery);
-    if !sender.is_finished() && timeout(Duration::from_secs(5), &mut sender).await.is_err() {
+    if !sender.is_finished()
+        && timeout(limits::SHUTDOWN_SENDER_TIMEOUT, &mut sender)
+            .await
+            .is_err()
+    {
         sender.abort();
         let _ = sender.await;
     }

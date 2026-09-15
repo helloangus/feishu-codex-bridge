@@ -2,10 +2,11 @@
 //! flow it belongs to or reports a failure to the user; results unknown to the
 //! protocol stop the run instead of retrying.
 use super::flow::{can_spawn, send_panel, spawn_interrupt, spawn_reply, tell};
-use super::state::{Active, Done, FileDelivery, ListedContent, Runtime};
+use super::limits;
+use super::state::{Active, ActiveKind, Done, FileDelivery, ListedContent, PanelRefresh, Runtime};
 use crate::{execution::Execution, ports::BackendError, sessions};
 use bridge_core::{ExecutionMode, task::TaskSpec};
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 use tokio::{task::JoinSet, time::Instant};
 
 impl Runtime {
@@ -15,7 +16,11 @@ impl Runtime {
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), String> {
         match done {
-            Done::PlanAction { input, task, result } => {
+            Done::PlanAction {
+                input,
+                task,
+                result,
+            } => {
                 self.scheduler.end_session_mutation();
                 (input.accept)(true);
                 match result {
@@ -40,7 +45,11 @@ impl Runtime {
                         }
                     }
                     Ok(false) => {
-                        tell(&self.delivery, &input.chat, "此计划选择已处理，不会重复执行。")?;
+                        tell(
+                            &self.delivery,
+                            &input.chat,
+                            "此计划选择已处理，不会重复执行。",
+                        )?;
                     }
                     Err(error) => tell(
                         &self.delivery,
@@ -83,7 +92,12 @@ impl Runtime {
                     }
                 }
             }
-            Done::ApprovalSent { token, panel, commands, result } => {
+            Done::ApprovalSent {
+                token,
+                panel,
+                commands,
+                result,
+            } => {
                 if panel.title == "Codex 问答" {
                     crate::diagnostics::emit(
                         crate::diagnostics::Event::QuestionSent,
@@ -92,7 +106,9 @@ impl Runtime {
                         } else {
                             crate::diagnostics::Status::Failed
                         },
-                        self.approvals.get(&token).map(|pending| pending.task.as_str()),
+                        self.approvals
+                            .get(&token)
+                            .map(|pending| pending.task.as_str()),
                         panel.buttons.len(),
                     );
                 }
@@ -101,14 +117,11 @@ impl Runtime {
                 }
                 if let Some(pending) = self.approvals.get_mut(&token) {
                     let valid = Instant::now() < pending.deadline
-                        && self
-                            .active
-                            .as_ref()
-                            .is_some_and(|active| {
-                                !active.stopping
-                                    && active.spec.id == pending.task
-                                    && active.turn.as_ref() == Some(&pending.request.turn)
-                            });
+                        && self.active.as_ref().is_some_and(|active| {
+                            !active.stopping
+                                && active.spec.id == pending.task
+                                && active.turn.as_ref() == Some(&pending.request.turn)
+                        });
                     let registered = if let Ok(id) = result {
                         pending.source = Some(id.0.clone());
                         valid
@@ -160,7 +173,12 @@ impl Runtime {
             Done::PanelUpdated => {
                 self.updating_panel = false;
             }
-            Done::PanelSent { refreshed, panel, mut entries, result } => {
+            Done::PanelSent {
+                refreshed,
+                panel,
+                mut entries,
+                result,
+            } => {
                 if refreshed {
                     self.updating_panel = false;
                 }
@@ -177,10 +195,15 @@ impl Runtime {
                     }
                 }
             }
-            Done::DirectoryClaim { input, current, target, result } => match result {
+            Done::DirectoryClaim {
+                input,
+                current,
+                target,
+                result,
+            } => match result {
                 Ok(true) => {
                     (input.accept)(true);
-                    if !can_spawn(jobs, true) {
+                    if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                         return Ok(());
@@ -191,7 +214,9 @@ impl Runtime {
                     let chat = input.chat.clone();
                     jobs.spawn(async move {
                         Done::DirectoryProposed {
-                            result: store.propose_directory(root, current.clone(), target.clone()).await,
+                            result: store
+                                .propose_directory(root, current.clone(), target.clone())
+                                .await,
                             user,
                             chat,
                             current,
@@ -213,9 +238,15 @@ impl Runtime {
                     )?;
                 }
             },
-            Done::DirectoryProposed { user, chat, current, target, result } => match result {
+            Done::DirectoryProposed {
+                user,
+                chat,
+                current,
+                target,
+                result,
+            } => match result {
                 Ok(None) => {
-                    if !can_spawn(jobs, true) {
+                    if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &chat, "系统繁忙，请稍后重新发送。")?;
                         return Ok(());
@@ -224,7 +255,9 @@ impl Runtime {
                     let root = self.settings.root.clone();
                     jobs.spawn(async move {
                         Done::DirectoryChanged {
-                            result: store.change_directory(user.clone(), root, current, target).await,
+                            result: store
+                                .change_directory(user.clone(), root, current, target)
+                                .await,
                             user,
                             chat,
                         }
@@ -247,11 +280,15 @@ impl Runtime {
                         current: current.clone(),
                         input: target,
                         target: path,
-                        deadline: Instant::now() + Duration::from_secs(600),
+                        deadline: Instant::now() + limits::INTERACTION_TIMEOUT,
                     };
                     if self.confirmations.insert(token.clone(), entry) {
                         if !self.can_spawn(jobs, false) {
-                            tell(&self.delivery, &chat, "系统繁忙，请稍后重新发送 /cd <路径>。")?;
+                            tell(
+                                &self.delivery,
+                                &chat,
+                                "系统繁忙，请稍后重新发送 /cd <路径>。",
+                            )?;
                             return Ok(());
                         }
                         self.next_panel = self
@@ -289,10 +326,14 @@ impl Runtime {
                     )?;
                 }
             },
-            Done::CreationClaim { input, creation, result } => match result {
+            Done::CreationClaim {
+                input,
+                creation,
+                result,
+            } => match result {
                 Ok(true) if Instant::now() < creation.deadline => {
                     (input.accept)(true);
-                    if !can_spawn(jobs, true) {
+                    if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                         return Ok(());
@@ -388,16 +429,21 @@ impl Runtime {
                     "当前目录已失效或无法读取；请使用 /cd <工作区内绝对路径> 重新选择。".into()
                 }),
             )?,
-            Done::CompactClaim { input, session, result } => match result {
+            Done::CompactClaim {
+                input,
+                session,
+                result,
+            } => match result {
                 Ok(true) => {
                     (input.accept)(true);
                     let id = input.id;
                     let chat = input.chat.clone();
                     self.active = Some(Active {
-                        compact: true,
-                        compact_ack: false,
-                        compact_outcome: None,
-                        compact_thread: None,
+                        kind: ActiveKind::Compact {
+                            acknowledged: false,
+                            terminal: None,
+                            thread: None,
+                        },
                         spec: TaskSpec {
                             id: id.clone(),
                             session: session.clone(),
@@ -419,8 +465,14 @@ impl Runtime {
                         &input.chat,
                         "正在准备压缩上下文；可发送 /status 或 /stop。",
                     )?;
-                    if !can_spawn(jobs, true) {
-                        return Err("控制容量耗尽，压缩无法继续".into());
+                    if !can_spawn(jobs, false) {
+                        super::flow::finish(
+                            &mut self.active,
+                            &mut self.scheduler,
+                            &self.delivery,
+                            "系统繁忙，压缩未启动；请稍后重试。".into(),
+                        )?;
+                        return Ok(());
                     }
                     let backend = self.backend.clone();
                     let store = self.store.clone();
@@ -429,9 +481,15 @@ impl Runtime {
                         Done::CompactPrepared {
                             id,
                             result: async {
-                                store.validate_directory(root, session.workspace.clone()).await?;
-                                sessions::prepare_compaction(backend.as_ref(), store.as_ref(), session)
-                                    .await
+                                store
+                                    .validate_directory(root, session.workspace.clone())
+                                    .await?;
+                                sessions::prepare_compaction(
+                                    backend.as_ref(),
+                                    store.as_ref(),
+                                    session,
+                                )
+                                .await
                             }
                             .await,
                         }
@@ -452,10 +510,24 @@ impl Runtime {
                 }
             },
             Done::CompactPrepared { id, result } => {
+                if !can_spawn(jobs, false)
+                    && self
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.is_compact() && active.spec.id == id)
+                {
+                    super::flow::finish(
+                        &mut self.active,
+                        &mut self.scheduler,
+                        &self.delivery,
+                        "系统繁忙，压缩未提交；请稍后重试。".into(),
+                    )?;
+                    return Ok(());
+                }
                 let compacting = self
                     .active
                     .as_mut()
-                    .filter(|active| active.compact && active.spec.id == id);
+                    .filter(|active| active.is_compact() && active.spec.id == id);
                 if let Some(active) = compacting {
                     if active.stopping {
                         super::flow::finish(
@@ -468,10 +540,18 @@ impl Runtime {
                     }
                     match result {
                         Ok(thread) => {
-                            active.gate =
-                                Some(Execution::starting(self.settings.epoch, thread.clone(), 64));
+                            active.gate = Some(Execution::starting(
+                                self.settings.epoch,
+                                thread.clone(),
+                                limits::EARLY_PROTOCOL_EVENTS,
+                            ));
                             // Record the expected thread before the request can emit notifications.
-                            active.compact_thread = Some(thread.clone());
+                            if let ActiveKind::Compact {
+                                thread: expected, ..
+                            } = &mut active.kind
+                            {
+                                *expected = Some(thread.clone());
+                            }
                             let backend = self.backend.clone();
                             let id = active.spec.id.clone();
                             jobs.spawn(async move {
@@ -494,12 +574,22 @@ impl Runtime {
                 let compacting = self
                     .active
                     .as_mut()
-                    .filter(|active| active.compact && active.spec.id == id);
+                    .filter(|active| active.is_compact() && active.spec.id == id);
                 if let Some(active) = compacting {
                     match result {
                         Ok(()) => {
-                            active.compact_ack = true;
-                            if let Some(label) = active.compact_outcome.take() {
+                            let terminal = match &mut active.kind {
+                                ActiveKind::Compact {
+                                    acknowledged,
+                                    terminal,
+                                    ..
+                                } => {
+                                    *acknowledged = true;
+                                    terminal.take()
+                                }
+                                ActiveKind::Task => None,
+                            };
+                            if let Some(label) = terminal {
                                 super::flow::finish(
                                     &mut self.active,
                                     &mut self.scheduler,
@@ -535,10 +625,15 @@ impl Runtime {
                     }
                 }
             }
-            Done::PreferenceClaim { input, session, change, result } => match result {
+            Done::PreferenceClaim {
+                input,
+                session,
+                change,
+                result,
+            } => match result {
                 Ok(true) => {
                     (input.accept)(true);
-                    if !can_spawn(jobs, true) {
+                    if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                         return Ok(());
@@ -550,9 +645,16 @@ impl Runtime {
                         Done::PreferenceChanged {
                             chat: input.chat,
                             result: async {
-                                store.validate_directory(root, session.workspace.clone()).await?;
-                                sessions::change_preference(backend.as_ref(), store.as_ref(), session, change)
-                                    .await
+                                store
+                                    .validate_directory(root, session.workspace.clone())
+                                    .await?;
+                                sessions::change_preference(
+                                    backend.as_ref(),
+                                    store.as_ref(),
+                                    session,
+                                    change,
+                                )
+                                .await
                             }
                             .await,
                         }
@@ -565,7 +667,11 @@ impl Runtime {
                 Err(()) => {
                     self.scheduler.end_session_mutation();
                     (input.accept)(false);
-                    tell(&self.delivery, &input.chat, "设置请求保存失败，请重新发送。")?;
+                    tell(
+                        &self.delivery,
+                        &input.chat,
+                        "设置请求保存失败，请重新发送。",
+                    )?;
                 }
             },
             Done::PreferenceChanged { chat, result } => {
@@ -582,13 +688,21 @@ impl Runtime {
                 )?;
             }
             Done::ArchiveSynced { result } => {
-                result.map_err(|_| "归档通知同步失败，已停止运行；需核对本地绑定，不会自动重跑任务".to_owned())?;
+                result.map_err(|_| {
+                    "归档通知同步失败，已停止运行；需核对本地绑定，不会自动重跑任务".to_owned()
+                })?;
                 self.scheduler.end_session_mutation();
             }
-            Done::ThreadClaim { input, session, thread, action, result } => match result {
+            Done::ThreadClaim {
+                input,
+                session,
+                thread,
+                action,
+                result,
+            } => match result {
                 Ok(true) => {
                     (input.accept)(true);
-                    if !can_spawn(jobs, true) {
+                    if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                         return Ok(());
@@ -601,9 +715,17 @@ impl Runtime {
                             chat: input.chat,
                             action,
                             result: async {
-                                store.validate_directory(root, session.workspace.clone()).await?;
-                                sessions::change_thread(backend.as_ref(), store.as_ref(), session, thread, action)
-                                    .await
+                                store
+                                    .validate_directory(root, session.workspace.clone())
+                                    .await?;
+                                sessions::change_thread(
+                                    backend.as_ref(),
+                                    store.as_ref(),
+                                    session,
+                                    thread,
+                                    action,
+                                )
+                                .await
                             }
                             .await,
                         }
@@ -623,7 +745,11 @@ impl Runtime {
                     )?;
                 }
             },
-            Done::SessionChanged { chat, action, result } => {
+            Done::SessionChanged {
+                chat,
+                action,
+                result,
+            } => {
                 self.scheduler.end_session_mutation();
                 let recovery = matches!(&result, Err(sessions::StartError::Reconcile));
                 let text = match result {
@@ -637,44 +763,50 @@ impl Runtime {
                     return Err("归档结果不确定，已停止运行，需核对本地绑定和远端状态".into());
                 }
             }
-            Done::Listed { refresh, chat, user, directory, generation, stop_snapshot, result } => {
-                match result {
-                    Ok(ListedContent::Text(text)) => tell(&self.delivery, &chat, text)?,
-                    Ok(ListedContent::Threads { entries, archived }) => {
-                        self.deliver_list(
-                            jobs,
-                            refresh,
-                            chat,
-                            user,
-                            directory,
-                            generation,
-                            stop_snapshot,
-                            crate::cards::threads(
-                                &entries,
-                                archived,
-                                &format!("panel-{}-{}", self.settings.epoch, self.next_panel + 1),
-                            ),
-                        )?;
-                    }
-                    Ok(ListedContent::Models { entries, current }) => {
-                        self.deliver_list(
-                            jobs,
-                            refresh,
-                            chat,
-                            user,
-                            directory,
-                            generation,
-                            stop_snapshot,
-                            crate::cards::models(
-                                &entries,
-                                current.as_deref(),
-                                &format!("panel-{}-{}", self.settings.epoch, self.next_panel + 1),
-                            ),
-                        )?;
-                    }
-                    Err(error) => tell(&self.delivery, &chat, format!("读取会话列表失败：{error}"))?,
+            Done::Listed {
+                refresh,
+                chat,
+                user,
+                directory,
+                generation,
+                stop_snapshot,
+                result,
+            } => match result {
+                Ok(ListedContent::Text(text)) => tell(&self.delivery, &chat, text)?,
+                Ok(ListedContent::Threads { entries, archived }) => {
+                    self.deliver_list(
+                        jobs,
+                        refresh,
+                        chat,
+                        user,
+                        directory,
+                        generation,
+                        stop_snapshot,
+                        crate::cards::threads(
+                            &entries,
+                            archived,
+                            &format!("panel-{}-{}", self.settings.epoch, self.next_panel + 1),
+                        ),
+                    )?;
                 }
-            }
+                Ok(ListedContent::Models { entries, current }) => {
+                    self.deliver_list(
+                        jobs,
+                        refresh,
+                        chat,
+                        user,
+                        directory,
+                        generation,
+                        stop_snapshot,
+                        crate::cards::models(
+                            &entries,
+                            current.as_deref(),
+                            &format!("panel-{}-{}", self.settings.epoch, self.next_panel + 1),
+                        ),
+                    )?;
+                }
+                Err(error) => tell(&self.delivery, &chat, format!("读取会话列表失败：{error}"))?,
+            },
             Done::Reset { input, result } => {
                 self.scheduler.end_session_mutation();
                 match result {
@@ -698,7 +830,11 @@ impl Runtime {
                     }
                 }
             }
-            Done::Admission { ticket, input, result } => match result {
+            Done::Admission {
+                ticket,
+                input,
+                result,
+            } => match result {
                 Ok(new) => {
                     let queued = self.scheduler.commit_admission(ticket, new);
                     (input.accept)(true);
@@ -709,7 +845,11 @@ impl Runtime {
                 Err(_) => {
                     self.scheduler.abort_admission(ticket);
                     (input.accept)(false);
-                    tell(&self.delivery, &input.chat, "接收状态保存失败，未启动任务。")?;
+                    tell(
+                        &self.delivery,
+                        &input.chat,
+                        "接收状态保存失败，未启动任务。",
+                    )?;
                 }
             },
             Done::Prepared { id, result } => {
@@ -723,10 +863,21 @@ impl Runtime {
                     Some(&id),
                     0,
                 );
-                let preparing = self
-                    .active
-                    .as_mut()
-                    .filter(|active| active.spec.id == id);
+                if !can_spawn(jobs, false)
+                    && self
+                        .active
+                        .as_ref()
+                        .is_some_and(|active| active.spec.id == id)
+                {
+                    super::flow::finish(
+                        &mut self.active,
+                        &mut self.scheduler,
+                        &self.delivery,
+                        "系统繁忙，任务未启动；请稍后重试。".into(),
+                    )?;
+                    return Ok(());
+                }
+                let preparing = self.active.as_mut().filter(|active| active.spec.id == id);
                 if let Some(active) = preparing {
                     if active.stopping {
                         super::flow::finish(
@@ -845,10 +996,19 @@ impl Runtime {
             stop_snapshot,
         };
         if let Some(source) = refresh {
-            if self.refreshes.len() >= 128 {
-                tell(&self.delivery, &chat, "卡片刷新队列已满，请重新发送列表命令。")?;
+            if self.refreshes.len() >= limits::PANEL_REFRESHES {
+                tell(
+                    &self.delivery,
+                    &chat,
+                    "卡片刷新队列已满，请重新发送列表命令。",
+                )?;
             } else {
-                self.refreshes.push_back((source, owner, panel, commands));
+                self.refreshes.push_back(PanelRefresh {
+                    source,
+                    owner,
+                    panel,
+                    commands,
+                });
             }
         } else {
             if !self.can_spawn(jobs, false) {
