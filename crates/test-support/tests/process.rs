@@ -1,20 +1,17 @@
 //! A disposable Rust protocol fake; no Codex login, network or working tree.
 use bridge_app::ports::AgentBackend;
 use bridge_codex::process::AppServer;
-use std::{path::Path, time::Duration};
+use std::time::Duration;
+use test_support::fake_codex_process;
 
 #[tokio::test]
 async fn initializes_uses_port_and_reaps_fake_child() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let args = vec!["simple".into()];
+    let executable = fake_codex_process!();
     let mut server = tokio::time::timeout(
         Duration::from_secs(5),
-        AppServer::spawn(
-            Path::new(env!("CARGO_BIN_EXE_fake-codex-process")),
-            &args,
-            temp.path(),
-            42,
-        ),
+        AppServer::spawn(&executable, &args, temp.path(), 42),
     )
     .await??;
     let models = server.backend().models().await?;
@@ -31,13 +28,8 @@ async fn child_requests_and_notifications_cross_only_typed_boundary()
     tokio::time::timeout(Duration::from_secs(5), async {
         let temp = tempfile::tempdir()?;
         let args = vec!["events".into()];
-        let mut server = AppServer::spawn(
-            Path::new(env!("CARGO_BIN_EXE_fake-codex-process")),
-            &args,
-            temp.path(),
-            8,
-        )
-        .await?;
+        let executable = fake_codex_process!();
+        let mut server = AppServer::spawn(&executable, &args, temp.path(), 8).await?;
         let bridge_app::events::Incoming::Request { request, reply } = server.next_event().await?
         else {
             return Err("expected request".into());
@@ -70,13 +62,8 @@ async fn shutdown_terminates_tools_in_owned_process_group() -> Result<(), Box<dy
         let temp = tempfile::tempdir()?;
         let pid_file = temp.path().join("tool.pid");
         let args = vec!["parent".into(), pid_file.to_string_lossy().into_owned()];
-        let mut server = AppServer::spawn(
-            Path::new(env!("CARGO_BIN_EXE_fake-codex-process")),
-            &args,
-            temp.path(),
-            7,
-        )
-        .await?;
+        let executable = fake_codex_process!();
+        let mut server = AppServer::spawn(&executable, &args, temp.path(), 7).await?;
         let pid = std::fs::read_to_string(pid_file)?.parse::<i32>()?;
         let pid = rustix::process::Pid::from_raw(pid).ok_or("invalid tool pid")?;
         assert!(rustix::process::test_kill_process(pid).is_ok());

@@ -5,10 +5,10 @@
 //! per-package allowlists; renamed dependencies are keyed by their real
 //! package name (`dep["name"]`), not the local alias.
 
-/// Development tools; production packages must not depend on these in any
-/// dependency kind. Future non-production test-support packages must be
-/// registered here as well.
-pub const DEV_TOOLS: &[&str] = &["xtask"];
+/// Development tools; production packages must not depend on these with
+/// normal or build dependencies. Test tooling may be used through
+/// dev-dependencies (see the per-kind rule in `check_dependency`).
+pub const DEV_TOOLS: &[&str] = &["xtask", "test-support"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
@@ -117,6 +117,24 @@ const RULES: &[(&str, Class, Allowlist, Allowlist, Allowlist)] = &[
         &["tokio"],
     ),
     ("xtask", Class::DevTool, &["serde_json", "sha2"], &[], &[]),
+    (
+        "test-support",
+        Class::DevTool,
+        &[
+            "bridge-app",
+            "bridge-codex",
+            "bridge-core",
+            "bridge-local",
+            "rustix",
+            "serde_json",
+            "sha2",
+            "tempfile",
+            "tokio",
+            "tokio-util",
+        ],
+        &[],
+        &[],
+    ),
 ];
 
 fn find_rule(
@@ -345,5 +363,6 @@ mod tests {
     #[test]
     fn dev_tools_are_listed() {
         assert!(DEV_TOOLS.contains(&"xtask"));
+        assert!(DEV_TOOLS.contains(&"test-support"));
     }
 }
