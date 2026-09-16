@@ -2,22 +2,15 @@
 use bridge_app::sessions::SessionStore;
 use bridge_app::{
     events::{AgentEvent, Incoming, TurnOutcome},
-    messaging::{DeliveryError, DeliveryFuture, MessageId, Messenger, ResourceKind},
     ports::{BackendError, TurnRef},
     runtime::{self, Input},
 };
 use bridge_core::view::{Button, Panel};
 use bridge_local::{async_state::AsyncState, state::JsonStore};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeSet,
-    error::Error,
-    fs::File,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
+use std::{collections::BTreeSet, error::Error, sync::Arc, time::Duration};
+use test_support::messenger::{
+    MessengerHandles, MessengerOptions, RecordingMessenger, expect_card, expect_text_within,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -26,47 +19,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-struct Messages {
-    text: mpsc::Sender<String>,
-    cards: mpsc::Sender<(String, Panel)>,
-    updates: mpsc::Sender<(String, Panel)>,
-    fail: Arc<AtomicBool>,
-    sequence: AtomicU64,
-}
-impl Messenger for Messages {
-    fn send_text(&self, _: String, text: String) -> DeliveryFuture<'_, ()> {
-        Box::pin(async move {
-            self.text
-                .send(text)
-                .await
-                .map_err(|_| DeliveryError::Transport)
-        })
-    }
-    fn send_panel(&self, _: String, panel: Panel) -> DeliveryFuture<'_, MessageId> {
-        Box::pin(async move {
-            if self.fail.load(Ordering::Relaxed) {
-                return Err(DeliveryError::Transport);
-            }
-            let id = format!("card-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
-            self.cards
-                .send((id.clone(), panel))
-                .await
-                .map_err(|_| DeliveryError::Transport)?;
-            Ok(MessageId(id))
-        })
-    }
-    fn update_panel(&self, id: MessageId, panel: Panel) -> DeliveryFuture<'_, ()> {
-        Box::pin(async move {
-            self.updates
-                .send((id.0, panel))
-                .await
-                .map_err(|_| DeliveryError::Transport)
-        })
-    }
-    fn upload(&self, _: String, _: String, _: File, _: ResourceKind) -> DeliveryFuture<'_, ()> {
-        Box::pin(async { Err(DeliveryError::Transport) })
-    }
-}
 
 struct Harness {
     store: Arc<AsyncState>,
@@ -75,11 +27,9 @@ struct Harness {
     root: std::path::PathBuf,
     input: mpsc::Sender<Input>,
     events: mpsc::Sender<Result<Incoming, BackendError>>,
-    text: mpsc::Receiver<String>,
-    cards: mpsc::Receiver<(String, Panel)>,
-    updates: mpsc::Receiver<(String, Panel)>,
+    messenger: MessengerHandles,
+    card_messenger: Arc<RecordingMessenger>,
     replies: mpsc::Receiver<Value>,
-    fail: Arc<AtomicBool>,
     cancel: CancellationToken,
     worker: tokio::task::JoinHandle<Result<(), String>>,
     remote: tokio::task::JoinHandle<Result<(), String>>,
@@ -162,10 +112,7 @@ impl Harness {
         });
         let (input, inputs) = mpsc::channel(32);
         let (events, event_rx) = mpsc::channel(32);
-        let (text_tx, text) = mpsc::channel(64);
-        let (cards_tx, cards) = mpsc::channel(32);
-        let (updates_tx, updates) = mpsc::channel(32);
-        let fail = Arc::new(AtomicBool::new(false));
+        let (messenger, handles) = RecordingMessenger::recorded("card", MessengerOptions::new());
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(runtime::run(
             runtime::Settings {
@@ -180,13 +127,7 @@ impl Harness {
                 connection.client.clone(),
             )),
             store.clone(),
-            Arc::new(Messages {
-                text: text_tx,
-                cards: cards_tx,
-                updates: updates_tx,
-                fail: fail.clone(),
-                sequence: AtomicU64::new(1),
-            }),
+            messenger.clone(),
             inputs,
             event_rx,
             cancel.clone(),
@@ -198,11 +139,9 @@ impl Harness {
             root,
             input,
             events,
-            text,
-            cards,
-            updates,
+            messenger: handles,
+            card_messenger: messenger,
             replies,
-            fail,
             cancel,
             worker,
             remote,
@@ -243,16 +182,8 @@ impl Harness {
         Ok(())
     }
     async fn until(&mut self, pattern: &str) -> TestResult {
-        loop {
-            if tokio::time::timeout(Duration::from_secs(3), self.text.recv())
-                .await
-                .map_err(|_| format!("waiting for text: {pattern}"))?
-                .ok_or("text closed")?
-                .contains(pattern)
-            {
-                return Ok(());
-            }
-        }
+        expect_text_within(&mut self.messenger, Duration::from_secs(3), pattern).await?;
+        Ok(())
     }
     async fn barrier(&mut self) -> TestResult {
         self.send("owner", "chat", Some("/model".into()), None)
@@ -279,10 +210,7 @@ impl Harness {
         Ok(())
     }
     async fn card(&mut self) -> TestResult<(String, Panel)> {
-        let card = tokio::time::timeout(Duration::from_secs(3), self.cards.recv())
-            .await
-            .map_err(|_| "waiting for card")?
-            .ok_or("missing card")?;
+        let card = expect_card(&mut self.messenger).await?;
         self.barrier().await?;
         Ok(card)
     }
@@ -503,7 +431,7 @@ async fn failed_oversized_or_non_plan_turns_never_offer_implementation() -> Test
             )
             .await?;
             h.until("计划操作无效").await?;
-            assert!(h.cards.try_recv().is_err());
+            assert!(h.messenger.panels.try_recv().is_err());
             h.close().await
         })
         .await??;
@@ -552,11 +480,11 @@ async fn failed_plan_card_delivery_only_falls_back_to_non_executable_text() -> T
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut h = Harness::configured(None, true).await?;
         let _ = h.turns.recv().await;
-        h.fail.store(true, Ordering::Relaxed);
+        h.card_messenger.set_panels_failed(true);
         h.complete_plan("exact plan".into(), TurnOutcome::Completed)
             .await?;
         h.until("计划确认卡片发送失败").await?;
-        assert!(h.cards.try_recv().is_err());
+        assert!(h.messenger.panels.try_recv().is_err());
         assert!(h.turns.try_recv().is_err());
         h.close().await
     })
@@ -615,7 +543,7 @@ async fn new_task_or_reset_revokes_all_plan_buttons() -> TestResult {
             }
             h.click("owner", "chat", &source, &card.buttons[0]).await?;
             h.until("卡片操作无效").await?;
-            let (id, updated) = h.updates.recv().await.ok_or("plan update")?;
+            let (id, updated) = h.messenger.updates.recv().await.ok_or("plan update")?;
             assert_eq!(id, source);
             assert!(updated.buttons.is_empty());
             assert!(h.turns.try_recv().is_err());
@@ -633,7 +561,7 @@ async fn early_plan_completion_waits_for_rpc_identity_before_offering_buttons() 
         let mut h = Harness::configured(Some(wait), true).await?;
         h.complete_plan("early exact plan".into(), TurnOutcome::Completed)
             .await?;
-        assert!(h.cards.try_recv().is_err());
+        assert!(h.messenger.panels.try_recv().is_err());
         release.send(()).map_err(|_| "release")?;
         let (_, card) = h.card().await?;
         assert_eq!(card.buttons.len(), 3);
@@ -657,7 +585,7 @@ async fn free_answers_bind_owner_question_and_preserve_multiline_without_echo() 
             let button = card.buttons.iter().find(|b| b.label.contains("自行回答")).ok_or("missing free answer")?;
             h.click("owner", "chat", &source, button).await?;
             let prompt = loop {
-                let text = h.text.recv().await.ok_or("missing prompt")?;
+                let (_, text) = h.messenger.text.recv().await.ok_or("missing prompt")?;
                 if text.contains("/answer ") { break text; }
             };
             let command = prompt.split("/answer ").nth(1).ok_or("missing command")?.split(" <答案>").next().ok_or("missing token")?;
@@ -678,7 +606,7 @@ async fn free_answers_bind_owner_question_and_preserve_multiline_without_echo() 
         let button = card.buttons.iter().find(|b| b.label.contains("自行回答")).ok_or("missing free answer")?;
         h.click("owner","chat",&source,button).await?;
         let prompt = loop {
-            let text=h.text.recv().await.ok_or("missing prompt")?;
+            let (_, text)=h.messenger.text.recv().await.ok_or("missing prompt")?;
             if text.contains("/answer ") {break text;}
         };
         let command = prompt.split("/answer ").nth(1).ok_or("missing command")?.split(" <答案>").next().ok_or("missing token")?;
@@ -711,7 +639,7 @@ async fn questions_collect_options_require_answer_without_disclosure() -> TestRe
         assert!(h.replies.try_recv().is_err());
         h.click("owner","chat",&second_source,&second.buttons[0]).await?;
         let prompt = loop {
-            let text = h.text.recv().await.ok_or("missing answer prompt")?;
+            let (_, text) = h.messenger.text.recv().await.ok_or("missing answer prompt")?;
             if text.contains("/answer ") { break text; }
         };
         let command = prompt.split("/answer ").nth(1).ok_or("missing answer command")?.split(" <答案>").next().ok_or("missing answer token")?;
@@ -748,7 +676,7 @@ async fn question_failure_paths_never_submit_empty_answers() -> TestResult {
     for scenario in ["execute", "delivery", "oversized", "shutdown"] {
         tokio::time::timeout(Duration::from_secs(20), async {
             let mut h=Harness::configured(None, scenario!="execute").await?;
-            h.fail.store(scenario=="delivery", Ordering::Relaxed);
+            h.card_messenger.set_panels_failed(scenario=="delivery");
             h.request("required", "item/tool/requestUserInput", json!({"isBlocking":true,"questions":[
                 {"id":"q","header":"Choice","question":if scenario=="oversized" {"x".repeat(16001)} else {"Choose".into()},"options":[{"label":"yes","description":"confirm"}]}
             ]})).await?;
@@ -759,7 +687,7 @@ async fn question_failure_paths_never_submit_empty_answers() -> TestResult {
             let result=tokio::time::timeout(Duration::from_secs(10), &mut h.worker).await??;
             assert_eq!(result.is_ok(),scenario=="shutdown");
             assert!(h.replies.try_recv().is_err());
-            if scenario!="shutdown" {assert!(h.cards.try_recv().is_err());}
+            if scenario!="shutdown" {assert!(h.messenger.panels.try_recv().is_err());}
             h.worker=tokio::spawn(async {Ok(())});
             h.close().await
         }).await??;
@@ -790,7 +718,7 @@ async fn option_text_in_plan_output_never_opens_question_card() -> TestResult {
             })))
             .await?;
         h.until("咖啡").await?;
-        assert!(h.cards.try_recv().is_err());
+        assert!(h.messenger.panels.try_recv().is_err());
         assert!(h.replies.try_recv().is_err());
         h.close().await
     })
@@ -858,7 +786,7 @@ async fn request_before_start_response_waits_for_matching_identity() -> TestResu
             .await
             .map_err(|_| "events closed")?;
         received.await?;
-        assert!(h.cards.try_recv().is_err());
+        assert!(h.messenger.panels.try_recv().is_err());
         release.send(()).map_err(|_| "release closed")?;
         let (source, card) = h.card().await?;
         h.click("owner", "chat", &source, &card.buttons[0]).await?;
@@ -936,7 +864,12 @@ async fn approval_is_owner_source_bound_one_use_and_replies_over_rpc() -> TestRe
         h.click("owner", "chat", &source, &card.buttons[1]).await?;
         h.until("卡片操作无效").await?;
         assert!(h.replies.try_recv().is_err());
-        let (id, updated) = h.updates.recv().await.ok_or("missing terminal card")?;
+        let (id, updated) = h
+            .messenger
+            .updates
+            .recv()
+            .await
+            .ok_or("missing terminal card")?;
         assert_eq!(id, source);
         assert!(updated.buttons.is_empty());
         h.request("deny", COMMAND, json!({})).await?;
@@ -952,14 +885,14 @@ async fn approval_is_owner_source_bound_one_use_and_replies_over_rpc() -> TestRe
 async fn failed_delivery_and_unrelated_request_are_declined() -> TestResult {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut h = Harness::new().await?;
-        h.fail.store(true, Ordering::Relaxed);
+        h.card_messenger.set_panels_failed(true);
         h.request("failure", COMMAND, json!({})).await?;
         h.decision("failure", "decline").await?;
-        assert!(h.cards.try_recv().is_err());
+        assert!(h.messenger.panels.try_recv().is_err());
         h.request("foreign", COMMAND, json!({"threadId":"foreign"}))
             .await?;
         h.decision("foreign", "decline").await?;
-        h.fail.store(false, Ordering::Relaxed);
+        h.card_messenger.set_panels_failed(false);
         h.request("file", "item/fileChange/requestApproval", json!({}))
             .await?;
         let (source, card) = h.card().await?;

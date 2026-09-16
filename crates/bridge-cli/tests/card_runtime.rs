@@ -1,80 +1,22 @@
 //! Rendered card actions cross the gateway and real runtime without network.
-use bridge_app::{
-    messaging::{DeliveryFuture, MessageId, Messenger, ResourceKind},
-    runtime::{self, Input},
-    sessions::SessionStore,
-};
-use bridge_core::{
-    SessionKey,
-    view::{Button, Panel},
-};
+use bridge_app::{ports::Sandbox, runtime, sessions::SessionStore};
+use bridge_core::SessionKey;
+use bridge_core::view::Button;
 use bridge_local::{async_state::AsyncState, state::JsonStore};
-use std::{
-    collections::BTreeSet,
-    error::Error,
-    fs::File,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::BTreeSet, error::Error, sync::Arc, time::Duration};
+use test_support::messenger::{MessengerOptions, RecordingMessenger, expect_text};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-struct Messages {
-    text: mpsc::Sender<String>,
-    panels: mpsc::Sender<(String, Panel)>,
-    updates: mpsc::Sender<(String, Panel)>,
-    sequence: AtomicU64,
-    fail_updates: Arc<AtomicBool>,
-}
-impl Messenger for Messages {
-    fn send_text(&self, _: String, text: String) -> DeliveryFuture<'_, ()> {
-        Box::pin(async move {
-            self.text
-                .send(text)
-                .await
-                .map_err(|_| bridge_app::messaging::DeliveryError::Transport)
-        })
-    }
-    fn send_panel(&self, _: String, panel: Panel) -> DeliveryFuture<'_, MessageId> {
-        Box::pin(async move {
-            let id = format!("message-{}", self.sequence.fetch_add(1, Ordering::Relaxed));
-            self.panels
-                .send((id.clone(), panel))
-                .await
-                .map_err(|_| bridge_app::messaging::DeliveryError::Transport)?;
-            Ok(MessageId(id))
-        })
-    }
-    fn update_panel(&self, id: MessageId, panel: Panel) -> DeliveryFuture<'_, ()> {
-        Box::pin(async move {
-            self.updates
-                .send((id.0, panel))
-                .await
-                .map_err(|_| bridge_app::messaging::DeliveryError::Transport)?;
-            // A failed visual update must not replay or undo the command.
-            if self.fail_updates.load(Ordering::Relaxed) {
-                Err(bridge_app::messaging::DeliveryError::Transport)
-            } else {
-                Ok(())
-            }
-        })
-    }
-    fn upload(&self, _: String, _: String, _: File, _: ResourceKind) -> DeliveryFuture<'_, ()> {
-        Box::pin(async { panic!("unexpected upload") })
-    }
-}
 async fn submit(
-    tx: &mpsc::Sender<Input>,
+    tx: &mpsc::Sender<runtime::Input>,
     id: &str,
     user: &str,
     text: Option<String>,
     card: Option<bridge_app::cards::Click>,
 ) -> Result<(), Box<dyn Error>> {
     let (ack, wait) = oneshot::channel();
-    tx.send(Input {
+    tx.send(runtime::Input {
         attachments: vec![],
         card,
         id: id.into(),
@@ -89,11 +31,15 @@ async fn submit(
     assert!(wait.await?);
     Ok(())
 }
-async fn send(tx: &mpsc::Sender<Input>, id: &str, text: &str) -> Result<(), Box<dyn Error>> {
+async fn send(
+    tx: &mpsc::Sender<runtime::Input>,
+    id: &str,
+    text: &str,
+) -> Result<(), Box<dyn Error>> {
     submit(tx, id, "owner", Some(text.into()), None).await
 }
 async fn click(
-    tx: &mpsc::Sender<Input>,
+    tx: &mpsc::Sender<runtime::Input>,
     user: &str,
     source: &str,
     button: &Button,
@@ -104,13 +50,6 @@ async fn click(
     )
     .ok_or("invalid callback")?;
     submit(tx, "same-event", user, None, Some(card)).await
-}
-async fn until(rx: &mut mpsc::Receiver<String>, pattern: &str) -> Result<(), Box<dyn Error>> {
-    loop {
-        if rx.recv().await.ok_or("delivery closed")?.contains(pattern) {
-            return Ok(());
-        }
-    }
 }
 #[tokio::test]
 async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
@@ -147,10 +86,15 @@ async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
         ));
         let (tx, inputs) = mpsc::channel(16);
         let (_events, events) = mpsc::channel(8);
-        let (messages, mut output) = mpsc::channel(32);
-        let (panels, mut cards) = mpsc::channel(8);
-        let (updates, mut updated_cards) = mpsc::channel(16);
-        let fail_updates = Arc::new(AtomicBool::new(true));
+        // Card updates are recorded before the delivery result, so a failed
+        // visual update still exercises the one-way update path below.
+        let (messenger, mut handles) = RecordingMessenger::recorded(
+            "message",
+            MessengerOptions {
+                updates_fail: true,
+                ..MessengerOptions::new()
+            },
+        );
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(runtime::run(
             runtime::Settings {
@@ -158,36 +102,30 @@ async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
                 directory: root.clone(),
                 allowed: BTreeSet::from(["owner".into(), "other".into()]),
                 open_access: false,
-                sandbox: bridge_app::ports::Sandbox::WorkspaceWrite,
+                sandbox: Sandbox::WorkspaceWrite,
                 epoch: 71,
             },
             backend,
             store.clone(),
-            Arc::new(Messages {
-                text: messages,
-                panels,
-                updates,
-                sequence: AtomicU64::new(1),
-                fail_updates: fail_updates.clone(),
-            }),
+            messenger.clone(),
             inputs,
             events,
             cancel.clone(),
         ));
         send(&tx, "help", "/help").await?;
-        let (source, panel) = cards.recv().await.ok_or("missing help")?;
+        let (source, panel) = handles.panels.recv().await.ok_or("missing help")?;
         assert_eq!(panel.title, "Codex 控制面板");
         assert_eq!(panel.buttons.len(), 9);
         // A local asynchronous query provides a barrier after send_panel returns.
         send(&tx, "barrier", "/model").await?;
-        until(&mut output, "当前模型").await?;
+        expect_text(&mut handles, "当前模型").await?;
         click(&tx, "other", &source, &panel.buttons[0]).await?;
-        until(&mut output, "卡片操作无效").await?;
+        expect_text(&mut handles, "卡片操作无效").await?;
         click(&tx, "owner", "wrong-source", &panel.buttons[0]).await?;
-        until(&mut output, "卡片操作无效").await?;
+        expect_text(&mut handles, "卡片操作无效").await?;
         click(&tx, "owner", &source, &panel.buttons[0]).await?;
-        until(&mut output, "当前目录").await?;
-        let (updated_source, updated) = updated_cards.recv().await.ok_or("missing update")?;
+        expect_text(&mut handles, "当前目录").await?;
+        let (updated_source, updated) = handles.updates.recv().await.ok_or("missing update")?;
         assert_eq!(updated_source, source);
         assert_eq!(updated.buttons.len(), 8);
         assert!(
@@ -197,68 +135,68 @@ async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
                 .any(|button| button.action == panel.buttons[0].action)
         );
         click(&tx, "owner", &source, &panel.buttons[0]).await?;
-        until(&mut output, "卡片操作无效").await?;
+        expect_text(&mut handles, "卡片操作无效").await?;
         click(&tx, "owner", &source, &panel.buttons[3]).await?;
-        until(&mut output, "已切换到新会话").await?;
+        expect_text(&mut handles, "已切换到新会话").await?;
         assert!(store.thread(key).await?.is_none());
         send(&tx, "propose-card", "/cd card-created").await?;
-        let (creation_source, creation) = cards.recv().await.ok_or("missing creation card")?;
+        let (creation_source, creation) = handles.panels.recv().await.ok_or("missing creation card")?;
         assert!(creation.body.contains("/cd-confirm"));
         assert!(!root.join("card-created").exists());
         send(&tx, "barrier2", "/model").await?;
-        until(&mut output, "当前模型").await?;
+        expect_text(&mut handles, "当前模型").await?;
         click(&tx, "owner", &creation_source, &creation.buttons[0]).await?;
-        until(&mut output, "目录已创建并切换").await?;
+        expect_text(&mut handles, "目录已创建并切换").await?;
         assert!(root.join("card-created").is_dir());
         loop {
-            let (id, updated) = updated_cards.recv().await.ok_or("missing invalidation")?;
+            let (id, updated) = handles.updates.recv().await.ok_or("missing invalidation")?;
             if id == source && updated.buttons.is_empty() {
                 assert!(updated.body.contains("均已使用或失效"));
                 break;
             }
         }
         click(&tx, "owner", &source, &panel.buttons[1]).await?;
-        until(&mut output, "卡片操作无效").await?;
-        fail_updates.store(false, Ordering::Relaxed);
+        expect_text(&mut handles, "卡片操作无效").await?;
+        messenger.set_updates_failed(false);
         send(&tx, "models", "/models").await?;
-        let (model_source, models) = cards.recv().await.ok_or("missing models")?;
+        let (model_source, models) = handles.panels.recv().await.ok_or("missing models")?;
         send(&tx, "model-barrier", "/model").await?;
-        until(&mut output, "当前模型").await?;
+        expect_text(&mut handles, "当前模型").await?;
         click(&tx, "owner", &model_source, models.buttons.last().ok_or("refresh button")?).await?;
         let refreshed = loop {
-            let (id, panel) = updated_cards.recv().await.ok_or("missing refresh")?;
+            let (id, panel) = handles.updates.recv().await.ok_or("missing refresh")?;
             if id == model_source && panel.buttons.iter().any(|b| b.label.contains("model-2")) { break panel; }
         };
         send(&tx, "refresh-barrier", "/model").await?;
-        until(&mut output, "当前模型").await?;
-        assert!(cards.try_recv().is_err(), "refresh must reuse the message");
+        expect_text(&mut handles, "当前模型").await?;
+        assert!(handles.panels.try_recv().is_err(), "refresh must reuse the message");
         click(&tx, "owner", &model_source, &models.buttons[1]).await?;
-        until(&mut output, "卡片操作无效").await?;
+        expect_text(&mut handles, "卡片操作无效").await?;
         click(&tx, "owner", &model_source, &refreshed.buttons[1]).await?;
-        until(&mut output, "设置已保存").await?;
-        fail_updates.store(true, Ordering::Relaxed);
+        expect_text(&mut handles, "设置已保存").await?;
+        messenger.set_updates_failed(true);
         click(&tx, "owner", &model_source, refreshed.buttons.last().ok_or("refresh button")?).await?;
-        until(&mut output, "/model model-3").await?;
+        expect_text(&mut handles, "/model model-3").await?;
         let failed = loop {
-            let (id, panel) = updated_cards.recv().await.ok_or("missing failed refresh")?;
+            let (id, panel) = handles.updates.recv().await.ok_or("missing failed refresh")?;
             if id == model_source && panel.buttons.iter().any(|b| b.label.contains("model-3")) { break panel; }
         };
         click(&tx, "owner", &model_source, &failed.buttons[0]).await?;
-        until(&mut output, "卡片操作无效").await?;
-        fail_updates.store(false, Ordering::Relaxed);
+        expect_text(&mut handles, "卡片操作无效").await?;
+        messenger.set_updates_failed(false);
         send(&tx, "threads", "/resume").await?;
-        let (thread_source, threads) = cards.recv().await.ok_or("missing threads")?;
+        let (thread_source, threads) = handles.panels.recv().await.ok_or("missing threads")?;
         send(&tx, "thread-barrier", "/model").await?;
-        until(&mut output, "当前模型").await?;
+        expect_text(&mut handles, "当前模型").await?;
         click(&tx, "owner", &thread_source, threads.buttons.last().ok_or("archive navigation")?).await?;
         loop {
-            let (id, panel) = updated_cards.recv().await.ok_or("missing archive navigation update")?;
+            let (id, panel) = handles.updates.recv().await.ok_or("missing archive navigation update")?;
             if id == thread_source && panel.title == "已归档会话" {
                 assert!(panel.body.contains("没有已归档会话"));
                 break;
             }
         }
-        assert!(cards.try_recv().is_err());
+        assert!(handles.panels.try_recv().is_err());
         assert!(
             bridge_cli::bootstrap::decode_card_click(
                 source,

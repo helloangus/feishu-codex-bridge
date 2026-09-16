@@ -161,6 +161,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "test-support",
  "tokio",
  "tokio-util",
  "toml",

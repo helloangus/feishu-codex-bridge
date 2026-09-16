@@ -31,6 +31,7 @@ rustix = { workspace = true, features = ["fs", "process", "termios"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+test-support.workspace = true
 
 [lints]
 workspace = true
