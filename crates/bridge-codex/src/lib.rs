@@ -1,4 +1,5 @@
-//! JSON-RPC envelope boundary. Process execution is intentionally not wired yet.
+//! JSON-RPC envelope boundary, owned app-server process transport, and the
+//! pinned protocol snapshot shared by the mappings.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -113,6 +114,7 @@ mod tests {
 
 pub mod backend;
 pub mod process;
+pub mod protocol;
 pub mod transport;
 
 pub mod events;
