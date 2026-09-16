@@ -37,7 +37,7 @@
 - 验证:fmt、clippy -D warnings、226 个 workspace 测试(串行)、产品 debug 构建、
   rustdoc、依赖边界、shell 语法、git diff --check 全部通过。
 
-### B `refactor/runtime-flow` — 已完成，待合入汇总分支
+### B `refactor/runtime-flow` — 已完成并合入汇总分支
 
 - 交付提交:`d7fcf8e`（基于检查点 `6f5a8e2`）。
 - `bridge-app::interactions` 是审批和逐题问答的唯一状态机；删除已无调用方的
@@ -66,6 +66,7 @@
 
 1. `4283bb3` merge: rustix termios feature prerequisite for work package A
 2. `d363708` merge: work package A fix/cli-lifecycle
+3. `844ebbf` merge: work package B refactor/runtime-flow
 
 ## 待人工确认/授权事项(统一留到最后)
 
