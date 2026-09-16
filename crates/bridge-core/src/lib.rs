@@ -1,6 +1,5 @@
 //! Protocol-independent commands, identities and state transitions.
 pub mod command;
-pub mod interaction;
 pub mod task;
 
 use std::path::PathBuf;
