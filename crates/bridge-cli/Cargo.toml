@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+# Declared while transitional test fakes still share the package; the fake
+# binary target is removed together with the test-support migration.
+default-run = "bridge"
 
 [[bin]]
 name = "bridge"
@@ -25,11 +28,11 @@ serde_json.workspace = true
 bridge-app.workspace = true
 bridge-codex.workspace = true
 bridge-feishu.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
 fs2.workspace = true
 sha2.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs", "process", "termios"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
