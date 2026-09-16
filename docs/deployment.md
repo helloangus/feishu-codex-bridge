@@ -53,16 +53,16 @@ For a static allowlist, add `--allowed-user ou_your_open_id` when generating the
 ./bridge service --config ./bridge.toml stop
 ```
 
-For supervised foreground operation, use `./bridge guard --config ./bridge.toml`. A successful start means the guard has started; query status to verify the Feishu connection. Use `service ... status` as shown here: the separate `bridge status` command has a known timer initialization defect awaiting remediation. The current CLI may suggest `./start.sh status`; in a binary package use the equivalent `service ... status` command above.
+For supervised foreground operation, use `./bridge guard --config ./bridge.toml`. A successful start means the guard has started; query status to verify the Feishu connection with `service ... status`, or the equivalent `./bridge status --config ./bridge.toml`.
 
 Configuration generation sets mode `0600`. Runtime state, health and rotating logs reside under the configured state directory; preserve this directory when updating an existing native installation. Stop the old service before switching to a replacement package. Real-platform acceptance still requires pairing, messages/cards, approvals/questions, attachments, reconnect, service lifecycle and a recorded 72-hour stability run; offline checks alone do not establish production readiness.
 
 ## Packaging from a source checkout
 
 ```sh
-bash package.sh
+bash package.sh [输出目录]
 ```
 
-Each invocation creates a new host-native release directory containing the `bridge` binary, example configuration, deployment guide, build information, and `SHA256SUMS`. It contains no credentials, state, logs, attachments, compatibility runtime, or state conversion tools. Verify checksums before deployment.
+`package.sh` forwards to `cargo xtask package`, which builds the host-native release binary and takes the executable path from this build's Cargo messages; it never falls back to a stale artifact, honors custom `CARGO_TARGET_DIR` layouts, and rejects non-host build targets explicitly. The package is assembled and verified in a staging directory, then published atomically to the output directory (default `dist/`, replacing an older package). Publishing a dirty worktree requires an explicit `--allow-dirty` and is recorded in `BUILD-INFO.txt`.
 
-The current script assumes the default Cargo target directory and a host-native build. Custom target-directory handling and atomic package publication are pending remediation. Do not set `CARGO_TARGET_DIR` or a custom build target for this script until that work lands. A packaged build is not evidence that production acceptance has passed.
+Each package contains exactly the `bridge` binary, example configuration, deployment guide, `BUILD-INFO.txt` and `SHA256SUMS`. It contains no credentials, state, logs, attachments, compatibility runtime, or state conversion tools. Verify checksums before deployment. A packaged build is not evidence that production acceptance has passed.

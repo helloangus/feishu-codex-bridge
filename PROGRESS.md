@@ -58,8 +58,59 @@
   和 `git diff --check` 全部通过。CLI 行为测试的 approval/card/directory/session/files/
   minimal 套件包含在 workspace 串行测试中并全部通过。
 
-### C `test/protocol-contracts` — 未开始
-### D `build/tooling` — 未开始
+### C `test/protocol-contracts` — 已完成并合入汇总分支
+
+- 分支 tip:`3dd44c3`;合并 commit:`d101cca`(基于 `d2e1215`,与 A/B 同一汇总基线)。
+- 交付内容:
+  - 新增 `bridge-codex::protocol`:协议基线版本 `CODEX_SCHEMA_BASELINE` 与
+    schema/fixture 路径根集中管理,消除测试中重复的 `"0.153.4"` 路径常量;
+    manifest `cli_version`、快照目录名与常量三方互证。
+  - 新增 `tests/protocol_contract.rs` 五个契约测试:server-requests fixture 驱动
+    真实 `requests::decode` 并逐字段断言类型化应用事件;fixture 派生负例(缺
+    threadId/turnId/itemId/startedAtMs/isBlocking/questions 等)必须被拒绝;
+    真实 `CodexBackend::start_turn` 线上捕获 turn/start 参数与 fixture 等值并过
+    `TurnStartParams` schema;真实审批回复句柄线上捕获 result 与
+    `{"decision":"accept"}` 等值并过 Response schema;生产 `payload()` 覆盖
+    accept/decline/writeStdin/fileChange/逐题答案各变体并过 schema。
+  - `acceptForSession` 在 schema 上合法但生产映射按设计不发送,测试钉住该不变量。
+  - `schemas/`、`fixtures/` 内容零改动;生产代码逻辑零变化(仅 `#[cfg(test)]` 与
+    注释);bridge-app 冻结接口未动。
+  - 已交付 schema 维护命令规格(`cargo xtask codex-schema export/check/
+    record-fixtures`),待工作包 E 补接。
+- 验证:fmt、clippy -D warnings、workspace 串行测试 238 通过、产品 debug 构建、
+  rustdoc、依赖边界、git diff --check 全部通过(-j 1;两次 OOM kill 后按预案重试通过)。
+
+### D `build/tooling` — 已完成并合入汇总分支
+
+- 分支 tip:`fe55b7c`;合并 commit:`351cbd5`(基于 `d2e1215`)。
+- 交付内容:
+  - `cargo xtask package [输出目录]`:从本次构建的 Cargo 消息解析 executable 路径
+    (兼容 cargo 1.85 package_id 三种格式),无旧产物回退;非主机 target 明确报错;
+    脏树(含未跟踪文件)默认拒绝,`--allow-dirty` 放行并记录;临时目录组装、
+    五文件清单精确校验、SHA256SUMS 自校验、包内文档相对链接检查后原子发布
+    (覆盖旧包,失败回滚);确定性 `BUILD-INFO.txt`(无时间戳,重复打包幂等)。
+  - `cargo xtask check` 统一验证入口(10 步):fetch(可选)→fmt→clippy→串行测试
+    →产品构建→rustdoc(-D warnings)→边界→卫生(含 .yml/.yaml)→shell 语法
+    →diff 检查→打包结构;失败即停;`--offline` 支持完全离线执行。
+  - 边界门禁强化:每个 package 显式登记(生产 6 crate + 开发工具 xtask),未分类
+    即失败;normal/build/dev 三类依赖分别 allowlist;禁止生产链路依赖开发工具;
+    7 个合成 metadata 门禁测试。
+  - `package.sh` 改为纯转发(`exec cargo xtask package --release "$@"`);
+    Dependabot 删除 pip 块;CI 主入口改为 `cargo xtask fetch` + `cargo xtask check
+    --offline`,新增 release 打包冒烟(包内 `--version`/`--help`/`sha256sum -c`)。
+  - 依赖:仅 xtask 新增 `sha2.workspace = true`(Cargo.lock +1 行,无新外部包)。
+- 验证:xtask 38 测试(28 单元 + 10 集成,覆盖自定义 target 目录、空格路径、
+  重复打包幂等、失败无半成品、旧产物不误用、篡改校验失败、文档链接);dogfood
+  `cargo xtask check` 全绿;两次真实 release 打包端到端(31m46s/25m55s)暴露并修复
+  2 个真实缺陷后,`bash package.sh /tmp/fcb-d-dist` 产物恰五文件、校验和全 OK、
+  包内冒烟通过。CI 变更未在真实 GitHub Actions 运行(本地无法触发),已做 YAML
+  解析级自查,列为遗留验证项。
+
+## 基线记录
+
+- B1:`351cbd5`(2026-09-17,工作包 A–D 全部合入;该 commit 上 `cargo xtask check`
+  全绿,含 workspace 串行测试、边界、卫生与打包结构检查)。其后仅追加文档同步
+  提交,无代码变化。
 ### E/F — 按 PLAN.md 串行化约定,待 A–D 合并后开工
 
 ## 汇总分支合并记录
@@ -67,10 +118,14 @@
 1. `4283bb3` merge: rustix termios feature prerequisite for work package A
 2. `d363708` merge: work package A fix/cli-lifecycle
 3. `844ebbf` merge: work package B refactor/runtime-flow
+4. `d101cca` merge: work package C test/protocol-contracts
+5. `351cbd5` merge: work package D build/tooling
 
 ## 待人工确认/授权事项(统一留到最后)
 
-- 推送各分支到 origin(本次检查点执行)、创建 PR 并审批合并到远程汇总分支;
-- A–D 全部合入后完整验证并记录 B1;E、F 依次开工;
+- 推送各分支到 origin、创建 PR 并审批合并到远程汇总分支;
+- E(`refactor/test-infrastructure`,基于 B1)与 F(`refactor/ports-diagnostics`,
+  基于 B2)按 PLAN.md 串行约定依次开工;
 - 最终验收后由维护者决定合入主分支;不自动部署;
+- CI 变更(D 起引入 xtask 入口与 release 冒烟)在真实 GitHub Actions 上的运行验证;
 - 真实飞书交互、目标主机生命周期、长时间稳定性属于部署验收,本轮不覆盖。

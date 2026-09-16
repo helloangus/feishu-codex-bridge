@@ -11,15 +11,10 @@ This is a Rust workspace. `bridge-cli` assembles configuration, runtime, health,
 ## Validation
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked -- --test-threads=1
-cargo build -p bridge-cli --bin bridge --locked
-cargo doc --workspace --no-deps --locked
-cargo xtask check-boundaries
-bash -n setup.sh start.sh package.sh
-git diff --check
+cargo xtask check
 ```
+
+The unified entry runs fmt, Clippy (`-D warnings`), serial workspace tests, the product build, rustdoc with warnings as errors, dependency boundaries, repository hygiene, shell syntax, diff checks, and package structure checks. `cargo xtask fetch` prefetches dependencies; `cargo xtask check --offline` then runs fully offline. `cargo xtask check-boundaries` and `cargo xtask package [输出目录]` can also be invoked individually.
 
 Tests must stay offline, use temporary directories and fakes, and must not change the user working directory or launch long-running services. The repository must not add Python source, bytecode, dependency manifests, interpreter calls, or test tooling.
 
