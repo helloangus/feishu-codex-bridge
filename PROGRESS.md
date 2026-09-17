@@ -106,15 +106,24 @@
   包内冒烟通过。CI 变更未在真实 GitHub Actions 运行(本地无法触发),已做 YAML
   解析级自查,列为遗留验证项。
 
-### E `refactor/test-infrastructure` — 进行中(未合并;2026-09-17 检查点)
+### E `refactor/test-infrastructure` — 已暂停(未合并;2026-09-17 检查点封存)
 
 - 分支 `refactor/test-infrastructure`,基于 `b075a91`(B1 `351cbd5` + 文档同步,无代码差异)。
-- 已提交(各自可构建):
+- 分支 tip:`63cd66b`,工作树干净。提交序列:
   - `3ec5df8` build: workspace `default-members`、bridge-cli `default-run = "bridge"`、按 crate 收紧依赖 features;
-  - `7892810` test: fake Codex 进程与进程绑定测试迁入新测试支持包 `crates/test-support`(生产包不再含 fake bin 目标);
-  - `21b6bc3` test: 共享测试装配落地,边界规则调整为允许生产 crate 以 dev-dependency 引用测试工具(normal/build 仍禁止)。
-- 进行中(工作区未提交):`cargo xtask codex-schema`(`check`/`export` 子命令,`check` 接入 `cargo xtask check` 管线;`record-fixtures` 为可选项)。
-- 恢复方式:在该分支继续开发;交付前以 `cargo xtask check` 全量验证为准;合入汇总分支后按约定记录 B2,E 交付报告含剩余事项与文档建议。
+  - `7892810` test: fake Codex 进程与进程绑定测试迁入新测试支持包
+    `crates/test-support`(生产包不再含 fake bin 目标);
+  - `21b6bc3` test: 共享测试装配落地,边界规则调整为允许生产 crate 以 dev-dependency
+    引用测试工具(normal/build 仍禁止);
+  - `63cd66b` **wip**(检查点封存,未做任何验证、可能不可构建):`cargo xtask
+    codex-schema` 草稿(`xtask/src/codex_schema.rs`、`codex_schema_tests.rs`,
+    `check.rs`/`lib.rs`/`boundaries.rs` 接线改动)。
+- 未完成:`codex-schema` 子命令完成与测试、全量验证(`cargo xtask check` 等 7 项)、
+  交付报告;前三提交在提交时点经开发者自验,合并前仍须以 `cargo xtask check`
+  在汇总分支重验。
+- 恢复方式:在 `/home/orangepi/dev/fcb-e` worktree(分支 `refactor/test-infrastructure`)
+  从 `63cd66b` 继续:完成 codex-schema(check/export 必做,record-fixtures 可选)、
+  删除或完成草稿中未竟部分,跑全量验证后按交付流程合并并记录 B2。
 
 ## 基线记录
 
