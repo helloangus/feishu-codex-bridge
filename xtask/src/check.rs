@@ -3,7 +3,7 @@
 //! Covers every command listed in AGENTS.md plus packaging structure checks.
 //! Dependency fetching is a separate explicit action (`fetch`); check itself
 //! always passes `--locked` and optionally `--offline` to cargo.
-use crate::{boundaries, cargo_cli, hygiene, package};
+use crate::{boundaries, cargo_cli, codex_schema, hygiene, package};
 use std::path::Path;
 
 pub struct CheckOptions {
@@ -170,6 +170,7 @@ pub fn run_check(repo: &Path, options: &CheckOptions) -> Result<(), String> {
         )
     })?;
     step("boundaries", || boundaries_step(repo))?;
+    step("codex-schema", || codex_schema::run_check(repo))?;
     step("hygiene", || hygiene::run(repo))?;
     step("shell-syntax", || shell_syntax_step(repo))?;
     step("git-diff-check", || {
@@ -230,8 +231,9 @@ fn print_usage() {
         "usage: cargo xtask check [--fetch] [--offline]\n\
          \n\
          Runs: fmt, clippy, workspace tests (serial), product debug build,\n\
-         rustdoc (warnings as errors), dependency boundaries, repository\n\
-         hygiene, shell syntax, git diff --check and packaging structure.\n\
+         rustdoc (warnings as errors), codex protocol snapshot verification,\n\
+         dependency boundaries, repository hygiene, shell syntax, git diff\n\
+         --check and packaging structure.\n\
          \n\
          Options:\n\
          \x20 --fetch     run 'cargo fetch --locked' before the checks\n\

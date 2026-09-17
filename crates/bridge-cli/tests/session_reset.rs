@@ -1,37 +1,16 @@
 //! Reset uses the durable journal and local store; it must not call Codex.
 use bridge_app::{
-    messaging::{DeliveryError, DeliveryFuture, MessageId, Messenger, ResourceKind},
     ports::Sandbox,
     runtime::{self, Input},
     sessions::SessionStore,
 };
 use bridge_codex::{backend::CodexBackend, transport::Connection};
-use bridge_core::{SessionKey, view::Panel};
+use bridge_core::SessionKey;
 use bridge_local::{async_state::AsyncState, state::JsonStore};
-use std::{collections::BTreeSet, error::Error, fs::File, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, error::Error, sync::Arc, time::Duration};
+use test_support::messenger::{MessengerOptions, RecordingMessenger};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-
-struct Delivery(mpsc::Sender<String>);
-impl Messenger for Delivery {
-    fn send_text(&self, _: String, text: String) -> DeliveryFuture<'_, ()> {
-        Box::pin(async move {
-            self.0
-                .send(text)
-                .await
-                .map_err(|_| DeliveryError::Transport)
-        })
-    }
-    fn send_panel(&self, _: String, _: Panel) -> DeliveryFuture<'_, MessageId> {
-        Box::pin(async { Err(bridge_app::messaging::DeliveryError::Transport) })
-    }
-    fn update_panel(&self, _: MessageId, _: Panel) -> DeliveryFuture<'_, ()> {
-        Box::pin(async { Err(bridge_app::messaging::DeliveryError::Transport) })
-    }
-    fn upload(&self, _: String, _: String, _: File, _: ResourceKind) -> DeliveryFuture<'_, ()> {
-        Box::pin(async { panic!("unexpected upload") })
-    }
-}
 
 async fn send(tx: &mpsc::Sender<Input>, id: &str, text: &str) -> Result<bool, Box<dyn Error>> {
     let (ack, wait) = oneshot::channel();
@@ -75,7 +54,14 @@ async fn scenario(fail_at: Option<&str>) -> Result<(), Box<dyn Error>> {
             let backend = Arc::new(CodexBackend::new(connection.client.clone()));
             let (tx, inputs) = mpsc::channel(8);
             let (_events, events) = mpsc::channel(8);
-            let (delivery, mut replies) = mpsc::channel(8);
+            let (messenger, mut handles) = RecordingMessenger::recorded(
+                "",
+                MessengerOptions {
+                    panels_fail: true,
+                    upload_panics: true,
+                    ..MessengerOptions::new()
+                },
+            );
             let cancel = CancellationToken::new();
             let worker = tokio::spawn(runtime::run(
                 runtime::Settings {
@@ -88,7 +74,7 @@ async fn scenario(fail_at: Option<&str>) -> Result<(), Box<dyn Error>> {
                 },
                 backend,
                 store.clone(),
-                Arc::new(Delivery(delivery)),
+                messenger.clone(),
                 inputs,
                 events,
                 cancel.clone(),
@@ -96,19 +82,23 @@ async fn scenario(fail_at: Option<&str>) -> Result<(), Box<dyn Error>> {
             assert_eq!(send(&tx, "same-reset", "/new").await?, fail_at.is_none());
             if fail_at.is_some() {
                 assert!(
-                    replies
+                    handles
+                        .text
                         .recv()
                         .await
                         .ok_or("missing failure")?
+                        .1
                         .contains("新建会话失败")
                 );
                 assert_eq!(store.thread(owner.clone()).await?, Some("old".into()));
             } else if round == 0 {
                 assert!(
-                    replies
+                    handles
+                        .text
                         .recv()
                         .await
                         .ok_or("missing success")?
+                        .1
                         .contains("下次提问时自动创建")
                 );
                 assert_eq!(store.thread(owner.clone()).await?, None);
@@ -117,10 +107,12 @@ async fn scenario(fail_at: Option<&str>) -> Result<(), Box<dyn Error>> {
                 assert_eq!(store.thread(owner.clone()).await?, Some("newer".into()));
                 assert!(send(&tx, "status", "/status").await?);
                 assert!(
-                    replies
+                    handles
+                        .text
                         .recv()
                         .await
                         .ok_or("missing status")?
+                        .1
                         .contains("空闲")
                 );
             }
@@ -179,7 +171,14 @@ async fn archive_notification_scenario(fail: bool) -> Result<(), Box<dyn Error>>
         let backend = Arc::new(CodexBackend::new(connection.client.clone()));
         let (_tx, inputs) = mpsc::channel(8);
         let (events_tx, events) = mpsc::channel(8);
-        let (delivery, _replies) = mpsc::channel(8);
+        let (messenger, _handles) = RecordingMessenger::recorded(
+            "",
+            MessengerOptions {
+                panels_fail: true,
+                upload_panics: true,
+                ..MessengerOptions::new()
+            },
+        );
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(runtime::run(
             runtime::Settings {
@@ -192,7 +191,7 @@ async fn archive_notification_scenario(fail: bool) -> Result<(), Box<dyn Error>>
             },
             backend,
             store.clone(),
-            Arc::new(Delivery(delivery)),
+            messenger.clone(),
             inputs,
             events,
             cancel.clone(),

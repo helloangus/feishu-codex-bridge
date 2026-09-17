@@ -5,15 +5,17 @@
 pub mod boundaries;
 pub mod cargo_cli;
 pub mod check;
+pub mod codex_schema;
 pub mod hygiene;
 pub mod package;
 
-const USAGE: &str = "usage: cargo xtask <command> [args]
+const USAGE: &str = "usage: cargo xtask <command>
 
 commands:
   check [--fetch] [--offline]
                             run fmt, clippy, workspace tests (serial), product
-                            debug build, rustdoc (warnings as errors), dependency
+                            debug build, rustdoc (warnings as errors), codex
+                            protocol snapshot verification, dependency
                             boundaries, repository hygiene, shell syntax,
                             git diff --check and packaging structure checks
   check-boundaries          dependency boundary gate (same check as in 'check')
@@ -22,6 +24,9 @@ commands:
                             build the host release binary and publish a verified
                             package (bridge, bridge.example.toml, DEPLOYMENT.md,
                             BUILD-INFO.txt, SHA256SUMS); default dir: dist/
+  codex-schema <subcommand>
+                            pinned Codex protocol snapshot maintenance:
+                            check (offline), export (explicit, --codex <path>)
   help                      print this message";
 
 fn print_usage() {
@@ -47,6 +52,7 @@ where
         Some("check-boundaries") => boundaries::run_command(),
         Some("fetch") => check::run_fetch_command(&args[1..]),
         Some("package") => package::run_command(&args[1..]),
+        Some("codex-schema") => codex_schema::run_command(&args[1..]),
         Some(other) => {
             print_usage();
             Err(format!("unknown command '{other}'"))

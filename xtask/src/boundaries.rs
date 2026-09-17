@@ -5,10 +5,10 @@
 //! per-package allowlists; renamed dependencies are keyed by their real
 //! package name (`dep["name"]`), not the local alias.
 
-/// Development tools; production packages must not depend on these in any
-/// dependency kind. Future non-production test-support packages must be
-/// registered here as well.
-pub const DEV_TOOLS: &[&str] = &["xtask"];
+/// Development tools; production packages must not depend on these with
+/// normal or build dependencies. Test tooling may be used through
+/// dev-dependencies (see the per-kind rule in `check_dependency`).
+pub const DEV_TOOLS: &[&str] = &["xtask", "test-support"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Class {
@@ -114,9 +114,33 @@ const RULES: &[(&str, Class, Allowlist, Allowlist, Allowlist)] = &[
             "toml",
         ],
         &[],
-        &["tokio"],
+        &["test-support", "tokio"],
     ),
-    ("xtask", Class::DevTool, &["serde_json", "sha2"], &[], &[]),
+    (
+        "xtask",
+        Class::DevTool,
+        &["jsonschema", "serde_json", "sha2", "tempfile"],
+        &[],
+        &[],
+    ),
+    (
+        "test-support",
+        Class::DevTool,
+        &[
+            "bridge-app",
+            "bridge-codex",
+            "bridge-core",
+            "bridge-local",
+            "rustix",
+            "serde_json",
+            "sha2",
+            "tempfile",
+            "tokio",
+            "tokio-util",
+        ],
+        &[],
+        &[],
+    ),
 ];
 
 fn find_rule(
@@ -176,9 +200,10 @@ fn check_dependency(
             }
         },
     };
-    if rule.1 == Class::Production && DEV_TOOLS.contains(&real_name) {
+    if rule.1 == Class::Production && DEV_TOOLS.contains(&real_name) && kind != "dev" {
         return Err(format!(
-            "production package '{package}' must not depend on development tool '{real_name}' ({kind} dependency)"
+            "production package '{package}' must not depend on development tool '{real_name}' \
+             ({kind} dependency); only dev-dependencies may use test tooling"
         ));
     }
     let allowed: Allowlist = match kind {
@@ -264,16 +289,49 @@ mod tests {
     }
 
     #[test]
-    fn production_dev_dependency_on_dev_tool_is_forbidden() {
-        let metadata = metadata_for(json!([package(
+    fn production_dev_dependency_on_dev_tool_is_allowed_but_gated() {
+        // Test tooling through dev-dependencies is the supported direction.
+        let allowed = metadata_for(json!([package(
+            "bridge-cli",
+            vec![dep("test-support", json!("dev"))]
+        ),]));
+        assert!(check_metadata(&allowed).is_ok());
+        // The dev allowlist still applies: an unlisted dev tool is rejected.
+        let unlisted = metadata_for(json!([package(
             "bridge-core",
             vec![dep("xtask", json!("dev"))]
         ),]));
-        let error = check_metadata(&metadata).expect_err("must fail");
+        let error = check_metadata(&unlisted).expect_err("must fail");
         assert!(
-            error.contains("development tool 'xtask' (dev dependency)"),
+            error.contains("dev dependency 'xtask' is not in the allowlist"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn production_build_dependency_on_dev_tool_is_forbidden() {
+        let metadata = metadata_for(json!([package(
+            "bridge-core",
+            vec![dep("test-support", json!("build"))]
+        ),]));
+        let error = check_metadata(&metadata).expect_err("must fail");
+        assert!(
+            error.contains("must not depend on development tool 'test-support'"),
+            "{error}"
+        );
+        assert!(error.contains("build dependency"), "{error}");
+    }
+
+    #[test]
+    fn dev_tools_may_depend_on_production_crates() {
+        let metadata = metadata_for(json!([package(
+            "test-support",
+            vec![
+                dep("bridge-app", serde_json::Value::Null),
+                dep("bridge-codex", serde_json::Value::Null),
+            ]
+        ),]));
+        assert!(check_metadata(&metadata).is_ok());
     }
 
     #[test]
@@ -345,5 +403,6 @@ mod tests {
     #[test]
     fn dev_tools_are_listed() {
         assert!(DEV_TOOLS.contains(&"xtask"));
+        assert!(DEV_TOOLS.contains(&"test-support"));
     }
 }

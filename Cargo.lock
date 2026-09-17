@@ -161,6 +161,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "test-support",
  "tokio",
  "tokio-util",
  "toml",
@@ -178,7 +179,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1699,6 +1699,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-support"
+version = "0.1.0"
+dependencies = [
+ "bridge-app",
+ "bridge-codex",
+ "bridge-core",
+ "bridge-local",
+ "rustix",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1824,7 +1840,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -2331,8 +2346,10 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "jsonschema",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

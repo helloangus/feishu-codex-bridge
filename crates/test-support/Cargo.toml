@@ -1,0 +1,40 @@
+[package]
+name = "test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Offline test tooling. Never published and never referenced by production
+# normal/build dependencies; production crates may use it as a dev-dependency
+# only (enforced by the xtask boundary gate).
+#
+# The fake Codex processes live in this package so the integration tests that
+# spawn them can address the executables through `CARGO_BIN_EXE_*`, which cargo
+# only provides for binaries inside the same package. Tests therefore never
+# invoke cargo recursively.
+
+[[bin]]
+name = "fake-codex-process"
+path = "src/bin/fake_codex_process.rs"
+test = false
+
+[[bin]]
+name = "fake-codex-runtime"
+path = "src/bin/fake_codex_runtime.rs"
+test = false
+
+[dependencies]
+bridge-app.workspace = true
+bridge-core.workspace = true
+bridge-codex.workspace = true
+bridge-local.workspace = true
+rustix = { workspace = true, features = ["process"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

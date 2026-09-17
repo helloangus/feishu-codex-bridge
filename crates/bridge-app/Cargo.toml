@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 bridge-core.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util.workspace = true
 
 [lints]
