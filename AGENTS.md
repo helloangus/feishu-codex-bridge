@@ -6,7 +6,7 @@ Read [PLAN.md](PLAN.md) for the active remediation backlog and its acceptance cr
 
 ## Structure
 
-This is a Rust workspace. `bridge-cli` assembles configuration, runtime, health, and supervision; `bridge-app` owns application behavior; `bridge-codex` owns app-server JSON-RPC; `bridge-feishu` owns native Feishu WebSocket/REST; `bridge-local` owns state and workspace access. Use `setup.sh`, `start.sh`, and `package.sh` for lifecycle and packaging. Never commit `bridge.toml`, credentials, state, logs, sessions, or downloaded attachments.
+This is a Rust workspace. `bridge-cli` assembles configuration, runtime, health, and supervision; `bridge-app` owns application behavior; `bridge-codex` owns app-server JSON-RPC; `bridge-feishu` owns native Feishu WebSocket/REST; `bridge-local` owns state and workspace access. `crates/test-support` holds the fake processes and shared test assembly; production crates may reference it only as a dev-dependency, enforced by the boundary gate. Use `setup.sh`, `start.sh`, and `package.sh` for lifecycle and packaging. Never commit `bridge.toml`, credentials, state, logs, sessions, or downloaded attachments.
 
 ## Validation
 
@@ -14,7 +14,7 @@ This is a Rust workspace. `bridge-cli` assembles configuration, runtime, health,
 cargo xtask check
 ```
 
-The unified entry runs fmt, Clippy (`-D warnings`), serial workspace tests, the product build, rustdoc with warnings as errors, dependency boundaries, repository hygiene, shell syntax, diff checks, and package structure checks. `cargo xtask fetch` prefetches dependencies; `cargo xtask check --offline` then runs fully offline. `cargo xtask check-boundaries` and `cargo xtask package [输出目录]` can also be invoked individually.
+The unified entry runs fmt, Clippy (`-D warnings`), serial workspace tests, the product build, rustdoc with warnings as errors, dependency boundaries, Codex protocol snapshot checks, repository hygiene, shell syntax, diff checks, and package structure checks. `cargo xtask fetch` prefetches dependencies; `cargo xtask check --offline` then runs fully offline. `cargo xtask check-boundaries`, `cargo xtask codex-schema check`, and `cargo xtask package [输出目录]` can also be invoked individually.
 
 Tests must stay offline, use temporary directories and fakes, and must not change the user working directory or launch long-running services. The repository must not add Python source, bytecode, dependency manifests, interpreter calls, or test tooling.
 

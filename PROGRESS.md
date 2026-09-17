@@ -106,31 +106,48 @@
   包内冒烟通过。CI 变更未在真实 GitHub Actions 运行(本地无法触发),已做 YAML
   解析级自查,列为遗留验证项。
 
-### E `refactor/test-infrastructure` — 已暂停(未合并;2026-09-17 检查点封存)
+### E `refactor/test-infrastructure` — 已完成并合入汇总分支
 
-- 分支 `refactor/test-infrastructure`,基于 `b075a91`(B1 `351cbd5` + 文档同步,无代码差异)。
-- 分支 tip:`63cd66b`,工作树干净。提交序列:
-  - `3ec5df8` build: workspace `default-members`、bridge-cli `default-run = "bridge"`、按 crate 收紧依赖 features;
-  - `7892810` test: fake Codex 进程与进程绑定测试迁入新测试支持包
-    `crates/test-support`(生产包不再含 fake bin 目标);
-  - `21b6bc3` test: 共享测试装配落地,边界规则调整为允许生产 crate 以 dev-dependency
-    引用测试工具(normal/build 仍禁止);
-  - `63cd66b` **wip**(检查点封存,未做任何验证、可能不可构建):`cargo xtask
-    codex-schema` 草稿(`xtask/src/codex_schema.rs`、`codex_schema_tests.rs`,
-    `check.rs`/`lib.rs`/`boundaries.rs` 接线改动)。
-- 未完成:`codex-schema` 子命令完成与测试、全量验证(`cargo xtask check` 等 7 项)、
-  交付报告;前三提交在提交时点经开发者自验,合并前仍须以 `cargo xtask check`
-  在汇总分支重验。
-- 恢复方式:在 `/home/orangepi/dev/fcb-e` worktree(分支 `refactor/test-infrastructure`)
-  从 `63cd66b` 继续:完成 codex-schema(check/export 必做,record-fixtures 可选)、
-  删除或完成草稿中未竟部分,跑全量验证后按交付流程合并并记录 B2。
+- 分支 tip:`02a37cf`;合并 commit:`3471bde`(基于 `b075a91` = B1 + 文档同步)。
+  前一开发者交付 3 个提交后被暂停封存(`63cd66b` WIP),续作者审阅后保留前 3 个、
+  重作 WIP 为 `02a37cf`。
+- 交付内容:
+  - 新增非发布测试支持包 `crates/test-support`:两个 fake 进程 bin(自
+    bridge-cli/bridge-codex 迁出,生产包不再含 fake bin 目标)、共享测试装配
+    (Input 构造、RecordingMessenger 端口 fake、进程绑定 runtime harness);
+    原 minimal_runtime/directory_switch 的 runtime 场景 1:1 迁入,bridge-cli
+    审批/卡片/会话套件改用共享装配,断言不减;生产 crate 仅允许 dev-dependency
+    引用,由边界门禁强制。
+  - workspace `default-members`(6 个生产 crate)、bridge-cli `default-run = "bridge"`;
+    tokio/tokio-util/rustix 转为无默认 features 的工作区条目,各 crate 按需启用
+    (CLI 保留 rustix `termios`)。
+  - `cargo xtask codex-schema`:xtask 仅新增已在 lock 中的 `jsonschema`/`tempfile`,
+    对生产 crate 零依赖。`check` 目录驱动校验全部快照(manifest 摘要、版本互证、
+    必需 9 文件、schema 合法性、fixtures 过对应 schema),接入 `cargo xtask check`
+    管线(11 步);`export` 按规格实现七步流程(版本发现/冲突、临时目录生成、
+    兼容预检、staging 原子发布、失败清理、stderr 脱敏、不插值),绝不进 CI,
+    不自动改 Rust 源码。`record-fixtures` 裁剪:驱动生产序列化必然要求 xtask
+    依赖生产 crate,与依赖约束冲突;其保障已由 bridge-codex 契约测试在同管线
+    强制,替代路径为 export 后按打印指引人工重录 + 契约测试验证。
+  - 冻结接口零改动(bridge-app 全分支仅 Cargo.toml 一行 features);bridge-cli/
+    bridge-codex/bridge-local/bridge-feishu 生产源码零改动;发布包内容不变。
+- 验证:workspace 串行测试 290 通过(无预设环境变量);`cargo xtask check` 11 步
+  全绿(含新 codex-schema 步骤);`bash -n`、`git diff --check` 通过。合并后在汇总
+  分支 `3471bde` 重跑 `cargo xtask check` 全绿。遗留:CI 运行时验证(本地无法触发
+  GitHub Actions);`export` 对真实 Codex 的端到端(机器无 codex,已用 stub 覆盖)。
 
 ## 基线记录
 
 - B1:`351cbd5`(2026-09-17,工作包 A–D 全部合入;该 commit 上 `cargo xtask check`
   全绿,含 workspace 串行测试、边界、卫生与打包结构检查)。其后仅追加文档同步
   提交,无代码变化。
-### E/F — 按 PLAN.md 串行化约定,待 A–D 合并后开工
+- B2:`3471bde`(2026-09-18,工作包 A–E 全部合入;该 commit 上 `cargo xtask check`
+  11 步全绿)。其后仅追加文档同步提交,无代码变化。工作包 F 须从 B2 之后创建分支。
+
+### F `refactor/ports-diagnostics` — 待开工(基于 B2)
+
+- 按 PLAN.md 串行约定:E 合入并记录 B2 后开工;范围与写入边界见 PLAN.md
+  「后续工作包」表格 F 行。
 
 ## 汇总分支合并记录
 
@@ -139,11 +156,15 @@
 3. `844ebbf` merge: work package B refactor/runtime-flow
 4. `d101cca` merge: work package C test/protocol-contracts
 5. `351cbd5` merge: work package D build/tooling
+6. `3471bde` merge: work package E refactor/test-infrastructure
 
 ## 待人工确认/授权事项(统一留到最后)
 
-- 推送各分支到 origin、创建 PR 并审批合并到远程汇总分支;
-- E(`refactor/test-infrastructure`)已开工,状态见上;F(`refactor/ports-diagnostics`)待 E 合入并记录 B2 后开工;
-- 最终验收后由维护者决定合入主分支;不自动部署;
-- CI 变更(D 起引入 xtask 入口与 release 冒烟)在真实 GitHub Actions 上的运行验证;
+- 2026-09-17 检查点后经授权推送:`integration/rust-remediation` 与工作包分支
+  `test/protocol-contracts`、`build/tooling`、`refactor/test-infrastructure` 推送
+  到 origin;PR 创建与审批合并按需进行;
+- F(`refactor/ports-diagnostics`,基于 B2 `3471bde` 之后的汇总分支)待开工;
+  F 合入并最终验收后,由维护者决定合入主分支;不自动部署;
+- CI 变更(D 起引入 xtask 入口、release 冒烟;E 的 codex-schema 步骤)在真实
+  GitHub Actions 上的运行验证;
 - 真实飞书交互、目标主机生命周期、长时间稳定性属于部署验收,本轮不覆盖。
