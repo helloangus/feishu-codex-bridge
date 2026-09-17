@@ -6,8 +6,14 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Snapshot maintenance validates fixtures against JSON Schema and stages
+# exports in temporary directories. xtask deliberately depends on no
+# production crate: `cargo xtask check` bootstraps through this package and
+# must keep building while production code is refactored.
+jsonschema.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

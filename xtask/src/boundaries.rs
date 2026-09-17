@@ -116,7 +116,13 @@ const RULES: &[(&str, Class, Allowlist, Allowlist, Allowlist)] = &[
         &[],
         &["test-support", "tokio"],
     ),
-    ("xtask", Class::DevTool, &["serde_json", "sha2"], &[], &[]),
+    (
+        "xtask",
+        Class::DevTool,
+        &["jsonschema", "serde_json", "sha2", "tempfile"],
+        &[],
+        &[],
+    ),
     (
         "test-support",
         Class::DevTool,
