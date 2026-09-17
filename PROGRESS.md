@@ -106,6 +106,16 @@
   包内冒烟通过。CI 变更未在真实 GitHub Actions 运行(本地无法触发),已做 YAML
   解析级自查,列为遗留验证项。
 
+### E `refactor/test-infrastructure` — 进行中(未合并;2026-09-17 检查点)
+
+- 分支 `refactor/test-infrastructure`,基于 `b075a91`(B1 `351cbd5` + 文档同步,无代码差异)。
+- 已提交(各自可构建):
+  - `3ec5df8` build: workspace `default-members`、bridge-cli `default-run = "bridge"`、按 crate 收紧依赖 features;
+  - `7892810` test: fake Codex 进程与进程绑定测试迁入新测试支持包 `crates/test-support`(生产包不再含 fake bin 目标);
+  - `21b6bc3` test: 共享测试装配落地,边界规则调整为允许生产 crate 以 dev-dependency 引用测试工具(normal/build 仍禁止)。
+- 进行中(工作区未提交):`cargo xtask codex-schema`(`check`/`export` 子命令,`check` 接入 `cargo xtask check` 管线;`record-fixtures` 为可选项)。
+- 恢复方式:在该分支继续开发;交付前以 `cargo xtask check` 全量验证为准;合入汇总分支后按约定记录 B2,E 交付报告含剩余事项与文档建议。
+
 ## 基线记录
 
 - B1:`351cbd5`(2026-09-17,工作包 A–D 全部合入;该 commit 上 `cargo xtask check`
@@ -124,8 +134,7 @@
 ## 待人工确认/授权事项(统一留到最后)
 
 - 推送各分支到 origin、创建 PR 并审批合并到远程汇总分支;
-- E(`refactor/test-infrastructure`,基于 B1)与 F(`refactor/ports-diagnostics`,
-  基于 B2)按 PLAN.md 串行约定依次开工;
+- E(`refactor/test-infrastructure`)已开工,状态见上;F(`refactor/ports-diagnostics`)待 E 合入并记录 B2 后开工;
 - 最终验收后由维护者决定合入主分支;不自动部署;
 - CI 变更(D 起引入 xtask 入口与 release 冒烟)在真实 GitHub Actions 上的运行验证;
 - 真实飞书交互、目标主机生命周期、长时间稳定性属于部署验收,本轮不覆盖。
