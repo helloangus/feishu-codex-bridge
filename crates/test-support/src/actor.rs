@@ -7,6 +7,7 @@
 
 use bridge_app::{
     events::Incoming,
+    files::TaskFiles,
     messaging::Messenger,
     ports::{BackendError, Sandbox},
     runtime,
@@ -93,6 +94,7 @@ impl Actor {
             backend,
             store,
             messenger,
+            Arc::new(crate::files::IdleFiles) as Arc<dyn TaskFiles>,
             input_rx,
             event_rx,
             cancel.clone(),

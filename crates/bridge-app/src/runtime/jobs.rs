@@ -111,6 +111,13 @@ impl Runtime {
                             .map(|pending| pending.task.as_str()),
                         panel.buttons.len(),
                     );
+                } else if result.is_err() {
+                    crate::diagnostics::emit(
+                        crate::diagnostics::Event::CardFailed,
+                        crate::diagnostics::Status::Failed,
+                        None,
+                        0,
+                    );
                 }
                 if let Ok(id) = &result {
                     self.card_views.insert(id.0.clone(), panel);
@@ -191,7 +198,12 @@ impl Runtime {
                         entry.source = id.0.clone();
                     }
                     if !self.card_actions.insert(entries, Instant::now()) {
-                        eprintln!("{{\"event\":\"card_actions_full\"}}");
+                        crate::diagnostics::emit(
+                            crate::diagnostics::Event::CardFailed,
+                            crate::diagnostics::Status::Rejected,
+                            None,
+                            0,
+                        );
                     }
                 }
             }

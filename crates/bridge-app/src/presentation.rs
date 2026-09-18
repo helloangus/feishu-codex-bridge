@@ -113,7 +113,12 @@ impl Presentation {
             Ok(Ok(id)) => self.preview = Some((task, id)),
             _ => {
                 self.failed_task = Some(task);
-                eprintln!("{{\"event\":\"progress_delivery_failed\"}}");
+                crate::diagnostics::emit(
+                    crate::diagnostics::Event::DeliveryFailed,
+                    crate::diagnostics::Status::Failed,
+                    None,
+                    0,
+                );
             }
         }
     }

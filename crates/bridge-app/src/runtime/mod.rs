@@ -16,6 +16,7 @@ pub use state::{Settings, Store};
 
 use crate::{
     events::Incoming,
+    files::TaskFiles,
     messaging::Messenger,
     ports::{AgentBackend, BackendError},
 };
@@ -24,7 +25,7 @@ use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
 pub struct Input {
-    pub attachments: Vec<crate::messaging::Attachment>,
+    pub attachments: Vec<crate::files::Attachment>,
     pub card: Option<crate::cards::Click>,
     pub id: String,
     pub user: String,
@@ -36,11 +37,13 @@ pub struct Input {
 
 /// All network and persistence work is spawned; the owner remains responsive
 /// to stop/status. Fatal backend failures terminate this run, never replay work.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     settings: Settings,
     backend: Arc<dyn AgentBackend>,
     store: Arc<dyn Store>,
     messenger: Arc<dyn Messenger>,
+    task_files: Arc<dyn TaskFiles>,
     mut inputs: mpsc::Receiver<Input>,
     mut events: mpsc::Receiver<Result<Incoming, BackendError>>,
     cancel: CancellationToken,
@@ -107,7 +110,12 @@ pub async fn run(
                 }
             };
             if !matches!(result, Ok(Ok(()))) {
-                eprintln!("{{\"event\":\"delivery_failed\"}}");
+                crate::diagnostics::emit(
+                    crate::diagnostics::Event::DeliveryFailed,
+                    crate::diagnostics::Status::Failed,
+                    None,
+                    0,
+                );
             }
         }
     });
@@ -117,6 +125,7 @@ pub async fn run(
         backend,
         store,
         messenger,
+        task_files,
         delivery,
         directories,
         progress_busy,

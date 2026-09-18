@@ -3,7 +3,7 @@
 //! Every caller used to re-declare the acknowledgement closure; these helpers
 //! keep one canonical construction and return the admission result receiver.
 
-use bridge_app::{cards::Click, messaging::Attachment, runtime::Input};
+use bridge_app::{cards::Click, files::Attachment, runtime::Input};
 use std::error::Error;
 use tokio::sync::{mpsc, oneshot};
 

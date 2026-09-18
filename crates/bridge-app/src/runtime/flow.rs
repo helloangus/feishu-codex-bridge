@@ -102,6 +102,14 @@ pub(crate) fn send_panel(
             Ok(result) => result,
             Err(_) => Err(DeliveryError::Transport),
         };
+        if result.is_err() {
+            crate::diagnostics::emit(
+                crate::diagnostics::Event::CardFailed,
+                crate::diagnostics::Status::Failed,
+                None,
+                0,
+            );
+        }
         if result.is_err()
             && !matches!(
                 timeout(
@@ -112,7 +120,12 @@ pub(crate) fn send_panel(
                 Ok(Ok(()))
             )
         {
-            eprintln!("{{\"event\":\"delivery_failed\"}}");
+            crate::diagnostics::emit(
+                crate::diagnostics::Event::DeliveryFailed,
+                crate::diagnostics::Status::Failed,
+                None,
+                0,
+            );
         }
         let entries = commands
             .into_iter()

@@ -8,5 +8,6 @@
 
 pub mod actor;
 pub mod fakes;
+pub mod files;
 pub mod input;
 pub mod messenger;

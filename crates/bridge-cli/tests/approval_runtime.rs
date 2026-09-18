@@ -128,6 +128,7 @@ impl Harness {
             )),
             store.clone(),
             messenger.clone(),
+            Arc::new(test_support::files::IdleFiles),
             inputs,
             event_rx,
             cancel.clone(),
@@ -215,7 +216,7 @@ impl Harness {
         Ok(card)
     }
     async fn click(&mut self, user: &str, chat: &str, source: &str, button: &Button) -> TestResult {
-        let click = bridge_cli::bootstrap::decode_card_click(
+        let click = bridge_feishu::ingress::decode_card_click(
             source.into(),
             &bridge_feishu::cards::action_value(&button.action),
         )

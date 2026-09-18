@@ -2,6 +2,7 @@
 pub mod cards;
 pub mod diagnostics;
 pub mod directories;
+pub mod files;
 pub mod plans;
 pub mod presentation;
 use bridge_core::{SessionKey, task::TaskSpec};

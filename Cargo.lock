@@ -140,6 +140,7 @@ name = "bridge-app"
 version = "0.1.0"
 dependencies = [
  "bridge-core",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

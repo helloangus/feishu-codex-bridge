@@ -44,7 +44,7 @@ async fn click(
     source: &str,
     button: &Button,
 ) -> Result<(), Box<dyn Error>> {
-    let card = bridge_cli::bootstrap::decode_card_click(
+    let card = bridge_feishu::ingress::decode_card_click(
         source.into(),
         &bridge_feishu::cards::action_value(&button.action),
     )
@@ -108,6 +108,7 @@ async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
             backend,
             store.clone(),
             messenger.clone(),
+            Arc::new(test_support::files::IdleFiles),
             inputs,
             events,
             cancel.clone(),
@@ -198,7 +199,7 @@ async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
         }
         assert!(handles.panels.try_recv().is_err());
         assert!(
-            bridge_cli::bootstrap::decode_card_click(
+            bridge_feishu::ingress::decode_card_click(
                 source,
                 &serde_json::json!({"command":"/new"})
             )

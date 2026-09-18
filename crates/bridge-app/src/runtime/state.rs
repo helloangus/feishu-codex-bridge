@@ -5,8 +5,9 @@ use crate::{
     Scheduler,
     directories::{Confirmations, DirectoryStore},
     execution::Execution,
+    files::{Attachment, TaskFiles},
     interactions::{Interactions, Pending, ReplyOutcome},
-    messaging::{Attachment, DeliveryError, MessageId, Messenger},
+    messaging::{DeliveryError, MessageId, Messenger},
     ports::{AgentBackend, TurnRef},
     presentation::Request as DeliveryRequest,
     requests::RequestKind,
@@ -232,6 +233,7 @@ pub(crate) struct Runtime {
     pub(crate) backend: Arc<dyn AgentBackend>,
     pub(crate) store: Arc<dyn Store>,
     pub(crate) messenger: Arc<dyn Messenger>,
+    pub(crate) task_files: Arc<dyn TaskFiles>,
     pub(crate) delivery: mpsc::Sender<DeliveryRequest>,
     pub(crate) directories: BTreeMap<String, PathBuf>,
     pub(crate) scheduler: Scheduler,
@@ -262,11 +264,13 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         settings: Settings,
         backend: Arc<dyn AgentBackend>,
         store: Arc<dyn Store>,
         messenger: Arc<dyn Messenger>,
+        task_files: Arc<dyn TaskFiles>,
         delivery: mpsc::Sender<DeliveryRequest>,
         directories: BTreeMap<String, PathBuf>,
         progress_busy: Arc<AtomicBool>,
@@ -277,6 +281,7 @@ impl Runtime {
             backend,
             store,
             messenger,
+            task_files,
             delivery,
             directories,
             scheduler: Scheduler::new(limits::SCHEDULED_TASKS),
@@ -498,7 +503,12 @@ impl Runtime {
                     .await,
                     Ok(Ok(()))
                 ) {
-                    eprintln!("{{\"event\":\"card_update_failed\"}}");
+                    crate::diagnostics::emit(
+                        crate::diagnostics::Event::CardFailed,
+                        crate::diagnostics::Status::Failed,
+                        None,
+                        0,
+                    );
                 }
                 Done::PanelUpdated
             });
@@ -518,11 +528,12 @@ impl Runtime {
             self.files = FileDelivery::Holding(spec);
             return;
         }
+        let task_files = self.task_files.clone();
         let messenger = self.messenger.clone();
         jobs.spawn(async move {
             let result = timeout(
                 limits::FILE_FINISH_TIMEOUT,
-                messenger.finish_files(spec.id.clone(), spec.chat.clone(), spec.session.workspace),
+                task_files.finish_files(spec.id.clone(), spec.chat.clone(), spec.session.workspace),
             )
             .await;
             crate::diagnostics::emit(
@@ -628,7 +639,7 @@ impl Runtime {
         let store = self.store.clone();
         let sandbox = self.settings.sandbox;
         let root = self.settings.root.clone();
-        let messenger = self.messenger.clone();
+        let task_files = self.task_files.clone();
         jobs.spawn(async move {
             let result = async {
                 store
@@ -641,7 +652,7 @@ impl Runtime {
                 let count = attachments.len();
                 let prepared = timeout(
                     limits::FILE_PREPARE_TIMEOUT,
-                    messenger.prepare_files(
+                    task_files.prepare_files(
                         spec.id.clone(),
                         spec.session.workspace.clone(),
                         attachments,
@@ -674,7 +685,7 @@ impl Runtime {
                 turn.images = files.images;
                 timeout(
                     limits::FILE_BIND_TIMEOUT,
-                    messenger.bind_files(spec.id.clone(), turn.thread_id.clone()),
+                    task_files.bind_files(spec.id.clone(), turn.thread_id.clone()),
                 )
                 .await
                 .map_err(|_| "生成图片快照超时".to_owned())?

@@ -1,12 +1,13 @@
 //! Real staging, snapshot delivery and RPC adapter, with in-memory transports.
 use bridge_app::{
     events::{AgentEvent, Incoming, TurnOutcome},
+    files::{Attachment, Deliveries, ResourceFetcher, TaskFiles},
     messaging::*,
     ports::{BackendError, TurnRef},
     runtime::{self, Input},
 };
 use bridge_core::view::Panel;
-use bridge_local::{async_state::AsyncState, delivery::Delivery, state::JsonStore};
+use bridge_local::{async_state::AsyncState, state::JsonStore, workspace_files::WorkspaceFiles};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -30,6 +31,9 @@ struct Messages {
     release: Semaphore,
 }
 impl Messenger for Messages {
+    fn rich_output(&self) -> bool {
+        true
+    }
     fn send_text(&self, _: String, text: String) -> DeliveryFuture<'_, ()> {
         Box::pin(async move {
             self.output
@@ -156,7 +160,12 @@ async fn authorized_attachment_reaches_turn_once_and_delivery_blocks_next_task()
             release: Semaphore::new(0),
         });
         let delivery = Arc::new(
-            Delivery::new(messenger.clone(), messenger.clone()).excluding(vec![root.join("state")]),
+            Deliveries::new(
+                Arc::new(WorkspaceFiles),
+                messenger.clone(),
+                messenger.clone(),
+            )
+            .excluding(vec![root.join("state")]),
         );
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(runtime::run(
@@ -172,7 +181,8 @@ async fn authorized_attachment_reaches_turn_once_and_delivery_blocks_next_task()
                 connection.client.clone(),
             )),
             store,
-            delivery,
+            messenger.clone(),
+            delivery as Arc<dyn TaskFiles>,
             rx,
             event_rx,
             cancel.clone(),

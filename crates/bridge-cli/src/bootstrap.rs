@@ -33,21 +33,6 @@ fn optional_credential(name: &str) -> Result<Option<String>, Box<dyn std::error:
     Ok(std::env::var(name).ok().filter(|value| !value.is_empty()))
 }
 
-/// Only locally registered opaque actions enter the runtime; raw card commands
-/// cannot bypass message/owner validation or become ordinary chat text.
-pub fn decode_card_click(
-    source: String,
-    action: &serde_json::Value,
-) -> Option<bridge_app::cards::Click> {
-    use bridge_core::view::ButtonAction;
-    match bridge_feishu::decode_action(&action.to_string()).ok()? {
-        ButtonAction::Interaction { token, choice } if choice == "run" && !source.is_empty() => {
-            Some(bridge_app::cards::Click { token, source })
-        }
-        _ => None,
-    }
-}
-
 /// Stable App ID-derived lock shared by every native service entry point.
 pub fn app_lock(directory: &Path, app_id: &str) -> Result<File, Box<dyn std::error::Error>> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -157,9 +142,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
     match reconciliation {
-        Ok(Ok(removed)) => {
-            eprintln!("{{\"event\":\"archive_reconciled\",\"removed_bindings\":{removed}}}")
-        }
+        Ok(Ok(removed)) => bridge_app::diagnostics::emit(
+            bridge_app::diagnostics::Event::ArchiveReconciled,
+            bridge_app::diagnostics::Status::Ok,
+            None,
+            removed,
+        ),
         failure => {
             let _ = server.shutdown().await;
             return Err(match failure {
@@ -185,97 +173,64 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let gateway = tokio::spawn(async move {
         let mut healthy = true;
         while let Some(received) = incoming_rx.recv().await {
-            let (id, user, chat, text, card, attachments) = match received.event {
-                Event::Connection { state } => {
-                    eprintln!("{{\"event\":\"feishu_connection\",\"state\":\"{state:?}\"}}");
-                    bridge_app::diagnostics::emit(
-                        match state {
-                            bridge_feishu::ingress::ConnectionState::Starting => {
-                                bridge_app::diagnostics::Event::ConnectionStarting
-                            }
-                            bridge_feishu::ingress::ConnectionState::Connected => {
-                                bridge_app::diagnostics::Event::ConnectionEstablished
-                            }
-                            bridge_feishu::ingress::ConnectionState::Reconnecting => {
-                                bridge_app::diagnostics::Event::ConnectionReconnecting
-                            }
-                        },
-                        bridge_app::diagnostics::Status::Ok,
-                        None,
-                        0,
-                    );
-                    let phase = match state {
-                        bridge_feishu::ingress::ConnectionState::Starting => {
-                            crate::health::Phase::Starting
+            // Feishu payloads become application inputs inside the ingress;
+            // this loop only routes lifecycle state and bounded admission.
+            let connection = match received.event {
+                Event::Connection { state } => state,
+                _ => {
+                    if let Some(input) = received.into_runtime_input() {
+                        if input_tx.try_send(input).is_err() {
+                            bridge_app::diagnostics::emit(
+                                bridge_app::diagnostics::Event::Overloaded,
+                                bridge_app::diagnostics::Status::Overloaded,
+                                None,
+                                0,
+                            );
                         }
-                        bridge_feishu::ingress::ConnectionState::Connected => {
-                            crate::health::Phase::Connected
-                        }
-                        bridge_feishu::ingress::ConnectionState::Reconnecting => {
-                            crate::health::Phase::Reconnecting
-                        }
-                    };
-                    if connection_health
-                        .lock()
-                        .map_err(|_| ())
-                        .and_then(|mut h| h.set(phase).map_err(|_| ()))
-                        .is_err()
-                    {
-                        eprintln!("{{\"event\":\"health_write_failed\"}}");
-                        healthy = false;
-                        stop.cancel();
-                        break;
                     }
                     continue;
                 }
-                Event::Message {
-                    message_id,
-                    user_id,
-                    chat_id,
-                    message_type,
-                    content,
-                    ..
-                } => {
-                    let text = bridge_feishu::message_text(&message_type, &content);
-                    let attachments =
-                        bridge_feishu::attachments(&message_id, &message_type, &content);
-                    (message_id, user_id, chat_id, text, None, attachments)
+            };
+            bridge_app::diagnostics::emit(
+                match connection {
+                    bridge_feishu::ingress::ConnectionState::Starting => {
+                        bridge_app::diagnostics::Event::ConnectionStarting
+                    }
+                    bridge_feishu::ingress::ConnectionState::Connected => {
+                        bridge_app::diagnostics::Event::ConnectionEstablished
+                    }
+                    bridge_feishu::ingress::ConnectionState::Reconnecting => {
+                        bridge_app::diagnostics::Event::ConnectionReconnecting
+                    }
+                },
+                bridge_app::diagnostics::Status::Ok,
+                None,
+                0,
+            );
+            let phase = match connection {
+                bridge_feishu::ingress::ConnectionState::Starting => crate::health::Phase::Starting,
+                bridge_feishu::ingress::ConnectionState::Connected => {
+                    crate::health::Phase::Connected
                 }
-                Event::Card {
-                    message_id,
-                    user_id,
-                    chat_id,
-                    action,
-                } => {
-                    let card = decode_card_click(message_id.clone(), &action);
-                    (
-                        format!("card:{message_id}"),
-                        user_id,
-                        chat_id,
-                        None,
-                        card,
-                        vec![],
-                    )
+                bridge_feishu::ingress::ConnectionState::Reconnecting => {
+                    crate::health::Phase::Reconnecting
                 }
             };
-            let accept = Box::new(move |accepted| {
-                if let Some(receipt) = received.acceptance {
-                    receipt.complete(accepted);
-                }
-            });
-            if input_tx
-                .try_send(runtime::Input {
-                    attachments,
-                    card,
-                    id,
-                    user,
-                    chat,
-                    text,
-                    accept,
-                })
+            if connection_health
+                .lock()
+                .map_err(|_| ())
+                .and_then(|mut h| h.set(phase).map_err(|_| ()))
                 .is_err()
             {
-                eprintln!("{{\"event\":\"input_overloaded\"}}");
+                bridge_app::diagnostics::emit(
+                    bridge_app::diagnostics::Event::HealthWriteFailed,
+                    bridge_app::diagnostics::Status::Failed,
+                    None,
+                    0,
+                );
+                healthy = false;
+                stop.cancel();
+                break;
             }
         }
         stop.cancel();
@@ -311,7 +266,26 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         stop.cancel();
     });
-    eprintln!("{{\"event\":\"rust_runtime_started\"}}");
+    let files = Arc::new(
+        bridge_app::files::Deliveries::new(
+            Arc::new(bridge_local::workspace_files::WorkspaceFiles),
+            messenger.clone(),
+            messenger.clone(),
+        )
+        .excluding(vec![config.workspace.state_dir.clone()])
+        .generated_images(
+            std::env::var_os("CODEX_GENERATED_IMAGES")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("CODEX_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+                        })
+                        .map(|home| home.join("generated_images"))
+                }),
+        ),
+    );
     let result = runtime::run(
         runtime::Settings {
             root,
@@ -323,23 +297,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         },
         backend,
         store,
-        Arc::new(
-            bridge_local::delivery::Delivery::new(messenger.clone(), messenger)
-                .excluding(vec![config.workspace.state_dir.clone()])
-                .generated_images(
-                    std::env::var_os("CODEX_GENERATED_IMAGES")
-                        .map(PathBuf::from)
-                        .or_else(|| {
-                            std::env::var_os("CODEX_HOME")
-                                .map(PathBuf::from)
-                                .or_else(|| {
-                                    std::env::var_os("HOME")
-                                        .map(|home| PathBuf::from(home).join(".codex"))
-                                })
-                                .map(|home| home.join("generated_images"))
-                        }),
-                ),
-        ),
+        messenger,
+        files,
         input_rx,
         event_rx,
         cancel.clone(),
