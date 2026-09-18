@@ -1,6 +1,7 @@
 //! Background job completion handling. Every completion either advances the
 //! flow it belongs to or reports a failure to the user; results unknown to the
 //! protocol stop the run instead of retrying.
+use super::RuntimeError;
 use super::flow::{can_spawn, send_panel, spawn_interrupt, spawn_reply, tell};
 use super::limits;
 use super::state::{Active, ActiveKind, Done, FileDelivery, ListedContent, PanelRefresh, Runtime};
@@ -15,7 +16,7 @@ impl Runtime {
         &mut self,
         done: Done,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         match done {
             Done::PlanAction {
                 input,
@@ -30,7 +31,7 @@ impl Runtime {
                             let ticket = self
                                 .scheduler
                                 .reserve(input.id, task)
-                                .map_err(|_| "计划实施入队失败".to_owned())?;
+                                .map_err(|_| RuntimeError::Interaction("计划实施入队失败"))?;
                             self.scheduler.commit_admission(ticket, true);
                             tell(
                                 &self.delivery,
@@ -88,7 +89,7 @@ impl Runtime {
                                     "审批回传结果不确定，已停止连接，不会自动重试。"
                                 },
                             )?;
-                            return Err("交互回传失败".into());
+                            return Err(RuntimeError::Interaction("交互回传失败"));
                         }
                     }
                 }
@@ -167,7 +168,7 @@ impl Runtime {
                                 &pending.owner.chat,
                                 "问答卡片发送失败或失效，停止本次运行；未提交空答案。",
                             )?;
-                            return Err("问答无法交付".into());
+                            return Err(RuntimeError::Interaction("问答无法交付"));
                         }
                         tell(
                             &self.delivery,
@@ -281,7 +282,7 @@ impl Runtime {
                     self.next_confirmation = self
                         .next_confirmation
                         .checked_add(1)
-                        .ok_or("确认编号耗尽".to_owned())?;
+                        .ok_or(RuntimeError::Capacity("确认编号耗尽"))?;
                     let token = format!("cd-{}-{}", self.settings.epoch, self.next_confirmation);
                     let prompt = format!(
                         "目录不存在：{}\n确认后将创建该目录及缺失的父目录，并切换到此目录。\n\n/cd-confirm {token}\n\n仅限当前用户在此聊天确认，10 分钟内有效；超时或切换目录后失效，不会自动创建。",
@@ -307,7 +308,7 @@ impl Runtime {
                         self.next_panel = self
                             .next_panel
                             .checked_add(1)
-                            .ok_or("卡片编号耗尽".to_owned())?;
+                            .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
                         let (panel, commands) = crate::cards::panel(
                             "创建目录确认",
                             prompt,
@@ -460,7 +461,7 @@ impl Runtime {
                     self.next_task = self
                         .next_task
                         .checked_add(1)
-                        .ok_or("任务标识耗尽".to_owned())?;
+                        .ok_or(RuntimeError::Capacity("任务标识耗尽"))?;
                     let id = bridge_core::task::TaskId::new(self.settings.epoch, self.next_task);
                     let chat = input.chat.clone();
                     self.active = Some(Active {
@@ -651,7 +652,7 @@ impl Runtime {
                                 &chat,
                                 format!("压缩启动结果不确定：{error}；桥接将停止，不会自动重试。"),
                             )?;
-                            return Err("压缩启动结果不确定".into());
+                            return Err(RuntimeError::Maintenance("压缩启动结果不确定"));
                         }
                     }
                 }
@@ -719,9 +720,7 @@ impl Runtime {
                 )?;
             }
             Done::ArchiveSynced { result } => {
-                result.map_err(|_| {
-                    "归档通知同步失败，已停止运行；需核对本地绑定，不会自动重跑任务".to_owned()
-                })?;
+                result.map_err(RuntimeError::from)?;
                 self.scheduler.end_session_mutation();
             }
             Done::ThreadClaim {
@@ -791,7 +790,9 @@ impl Runtime {
                 };
                 tell(&self.delivery, &chat, text)?;
                 if recovery {
-                    return Err("归档结果不确定，已停止运行，需核对本地绑定和远端状态".into());
+                    return Err(RuntimeError::Maintenance(
+                        "归档结果不确定，已停止运行，需核对本地绑定和远端状态",
+                    ));
                 }
             }
             Done::Listed {
@@ -967,9 +968,9 @@ impl Runtime {
                             let early = active
                                 .gate
                                 .as_mut()
-                                .ok_or("缺少执行状态".to_owned())?
+                                .ok_or(RuntimeError::Internal("缺少执行状态"))?
                                 .bind(turn.clone())
-                                .map_err(|_| "执行身份不匹配".to_owned())?;
+                                .map_err(|_| RuntimeError::Interaction("执行身份不匹配"))?;
                             if active.stopping {
                                 spawn_interrupt(jobs, self.backend.clone(), turn.clone())?;
                             }
@@ -993,13 +994,15 @@ impl Runtime {
                                 &self.delivery,
                                 format!("启动结果未知或失败：{error}；不会自动重试。"),
                             )?;
-                            return Err("Codex 启动失败，已停止运行以避免重复执行".into());
+                            return Err(RuntimeError::Backend(
+                                "Codex 启动失败，已停止运行以避免重复执行",
+                            ));
                         }
                     }
                 }
             }
             Done::Control { result } => {
-                result.map_err(|_| "Codex 控制请求失败，需重启连接".to_owned())?;
+                result.map_err(|_| RuntimeError::Backend("Codex 控制请求失败，需重启连接"))?;
             }
         }
         Ok(())
@@ -1021,11 +1024,11 @@ impl Runtime {
             bridge_core::view::Panel,
             Vec<(crate::cards::CardToken, String)>,
         ),
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         self.next_panel = self
             .next_panel
             .checked_add(1)
-            .ok_or("卡片编号耗尽".to_owned())?;
+            .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
         let (panel, commands) = built;
         let owner = crate::cards::Owner {
             user,

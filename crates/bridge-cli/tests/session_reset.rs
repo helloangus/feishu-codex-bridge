@@ -212,7 +212,10 @@ async fn archive_notification_scenario(fail: bool) -> Result<(), Box<dyn Error>>
         if fail {
             let result = worker.await?;
             match result {
-                Err(error) => assert!(error.contains("归档通知同步失败")),
+                Err(error) => assert!(matches!(
+                    error,
+                    bridge_app::runtime::RuntimeError::Storage(_)
+                )),
                 Ok(()) => panic!("archive notification failure unexpectedly completed"),
             }
             assert_eq!(store.thread(owner.clone()).await?, Some("target".into()));

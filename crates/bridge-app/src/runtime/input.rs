@@ -1,5 +1,6 @@
 //! User input handling: pairing, authorization, card clicks, commands,
 //! answers and task admission. Every path acknowledges the input exactly once.
+use super::RuntimeError;
 use super::flow::{can_spawn, send_panel, spawn_interrupt, spawn_reply, tell};
 use super::limits;
 use super::state::{Done, FileDelivery, Runtime};
@@ -29,7 +30,7 @@ impl Runtime {
         &mut self,
         mut input: super::Input,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         if input.id.is_empty() || input.user.is_empty() || input.chat.is_empty() {
             (input.accept)(false);
             return Ok(());
@@ -174,7 +175,7 @@ impl Runtime {
                     self.next_panel = self
                         .next_panel
                         .checked_add(1)
-                        .ok_or("卡片编号耗尽".to_owned())?;
+                        .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
                     let (panel, commands) = crate::cards::help(&format!(
                         "panel-{}-{}",
                         self.settings.epoch, self.next_panel
@@ -398,7 +399,7 @@ impl Runtime {
         self.admit_task(input, text, session, current, jobs).await
     }
 
-    async fn handle_pairing(&mut self, input: super::Input) -> Result<(), String> {
+    async fn handle_pairing(&mut self, input: super::Input) -> Result<(), RuntimeError> {
         if self.pairing_window.elapsed() >= limits::PAIRING_WINDOW {
             self.pairing_window = Instant::now();
             self.pairing_attempts = 0;
@@ -459,7 +460,7 @@ impl Runtime {
         approval_source: Option<String>,
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let parts: Vec<_> = text.split_whitespace().collect();
         let valid = parts.len() == 3
             && matches!(parts[2], "implement" | "fresh" | "stay")
@@ -501,7 +502,10 @@ impl Runtime {
             (input.accept)(true);
             return Ok(());
         }
-        let offer = self.plan_offer.take().ok_or("缺少计划".to_owned())?;
+        let offer = self
+            .plan_offer
+            .take()
+            .ok_or(RuntimeError::Internal("缺少计划"))?;
         let action = parts[2].to_owned();
         if let Some(source) = &approval_source {
             self.card_actions.invalidate_source(source);
@@ -511,7 +515,7 @@ impl Runtime {
         self.next_task = self
             .next_task
             .checked_add(1)
-            .ok_or("任务标识耗尽".to_owned())?;
+            .ok_or(RuntimeError::Capacity("任务标识耗尽"))?;
         let task = if action == "stay" {
             None
         } else {
@@ -553,7 +557,7 @@ impl Runtime {
                         .map_err(|e| e.to_string())?
                         .plan
                 {
-                    return Err("计划所属会话或模式已经变化".into());
+                    return Err("计划所属会话或模式已经变化".to_owned());
                 }
                 sessions::prepare_compaction(backend.as_ref(), store.as_ref(), session.clone())
                     .await
@@ -587,7 +591,7 @@ impl Runtime {
         approval_source: Option<String>,
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let skipping = text.starts_with("/answer-skip ");
         let mut parts = text.splitn(4, char::is_whitespace);
         let _ = parts.next();
@@ -650,7 +654,7 @@ impl Runtime {
         approval_source: Option<String>,
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let parts: Vec<_> = text.split_whitespace().collect();
         let mut outcome = Choice::Invalid;
         if parts.len() == 4 {
@@ -729,7 +733,7 @@ impl Runtime {
         approval_source: Option<String>,
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let active = self.active.as_ref();
         let pending = approval_source.as_deref().and_then(|source| {
             self.approvals.approve(
@@ -774,7 +778,7 @@ impl Runtime {
         session: SessionKey,
         _current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let change = match &command {
             Ok(Command::Model(Some(model))) => {
                 Some(sessions::PreferenceChange::Model(if model == "default" {
@@ -882,7 +886,7 @@ impl Runtime {
         session: SessionKey,
         _current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         let (target, action, archived) = match command {
             Ok(Command::Resume(target)) => (target, sessions::ThreadAction::Resume, false),
             Ok(Command::Archive(id)) => (Some(id), sessions::ThreadAction::Archive, false),
@@ -971,7 +975,7 @@ impl Runtime {
         session: SessionKey,
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         if seen_insert(&mut self.seen_commands, &input.id) {
             match text.as_str() {
                 "/status" => {
@@ -1055,11 +1059,11 @@ impl Runtime {
         session: SessionKey,
         _current: PathBuf,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         self.next_task = self
             .next_task
             .checked_add(1)
-            .ok_or("任务标识耗尽".to_owned())?;
+            .ok_or(RuntimeError::Capacity("任务标识耗尽"))?;
         let spec = TaskSpec {
             id: bridge_core::task::TaskId::new(self.settings.epoch, self.next_task),
             session,

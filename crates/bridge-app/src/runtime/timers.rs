@@ -1,5 +1,6 @@
 //! Periodic maintenance: progress previews, confirmation expiry and the
 //! per-task time budget.
+use super::RuntimeError;
 use super::flow::tell;
 use super::limits;
 use super::state::{Done, Runtime};
@@ -8,7 +9,10 @@ use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
 
 impl Runtime {
-    pub(crate) async fn handle_tick(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), String> {
+    pub(crate) async fn handle_tick(
+        &mut self,
+        jobs: &mut JoinSet<Done>,
+    ) -> Result<(), RuntimeError> {
         let _ = jobs;
         if self.messenger.rich_output() && self.last_progress.elapsed() >= limits::PROGRESS_INTERVAL
         {
@@ -71,7 +75,9 @@ impl Runtime {
             .as_ref()
             .is_some_and(|active| active.started.elapsed() > limits::TASK_TIMEOUT)
         {
-            return Err("任务超过一小时上限，停止本次运行".into());
+            return Err(RuntimeError::Maintenance(
+                "任务超过一小时上限，停止本次运行",
+            ));
         }
         Ok(())
     }

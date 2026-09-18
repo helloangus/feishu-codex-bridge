@@ -43,7 +43,7 @@ pub struct Actor {
     pub events: mpsc::Sender<Result<Incoming, BackendError>>,
     pub cancel: CancellationToken,
     /// Runtime task; joined by the test to assert clean or fatal shutdowns.
-    pub worker: tokio::task::JoinHandle<Result<(), String>>,
+    pub worker: tokio::task::JoinHandle<Result<(), runtime::RuntimeError>>,
     /// Event-forwarding task; owns the fake process and shuts it down.
     pub server: tokio::task::JoinHandle<std::io::Result<()>>,
 }

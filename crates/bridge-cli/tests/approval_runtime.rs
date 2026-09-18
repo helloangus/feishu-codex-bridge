@@ -31,7 +31,7 @@ struct Harness {
     card_messenger: Arc<RecordingMessenger>,
     replies: mpsc::Receiver<Value>,
     cancel: CancellationToken,
-    worker: tokio::task::JoinHandle<Result<(), String>>,
+    worker: tokio::task::JoinHandle<Result<(), bridge_app::runtime::RuntimeError>>,
     remote: tokio::task::JoinHandle<Result<(), String>>,
     connection: bridge_codex::transport::Connection,
     seq: u64,

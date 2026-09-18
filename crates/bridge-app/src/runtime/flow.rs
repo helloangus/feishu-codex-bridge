@@ -1,5 +1,6 @@
 //! Shared flow helpers: delivery of text and panels, task completion and
 //! protocol event folding, plus the bounded background-job policy.
+use super::RuntimeError;
 use super::limits;
 use super::state::{Active, ActiveKind, Done};
 use crate::diagnostics::Diagnostics;
@@ -22,9 +23,9 @@ pub(crate) fn tell(
     tx: &mpsc::Sender<DeliveryRequest>,
     chat: &str,
     text: impl Into<String>,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     tx.try_send(DeliveryRequest::Text(chat.into(), text.into()))
-        .map_err(|_| "回复队列已满或发送器已退出".into())
+        .map_err(|_| RuntimeError::Capacity("回复队列已满或发送器已退出"))
 }
 
 /// User-triggered spawns keep the control reserve free; control spawns may use
@@ -44,9 +45,9 @@ pub(crate) fn spawn_reply(
     jobs: &mut JoinSet<Done>,
     pending: crate::interactions::Pending,
     allow: bool,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     if jobs.len() >= limits::BACKGROUND_JOBS {
-        return Err("控制回传容量耗尽，停止运行".into());
+        return Err(RuntimeError::Capacity("控制回传容量耗尽，停止运行"));
     }
     let handle = diagnostics.clone();
     jobs.spawn(async move {
@@ -172,7 +173,7 @@ pub(crate) fn finish(
     scheduler: &mut Scheduler,
     delivery: &mpsc::Sender<DeliveryRequest>,
     outcome: String,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     if let Some(active) = active.take() {
         diagnostics.emit(
             crate::diagnostics::Event::TaskFinished,
@@ -212,7 +213,7 @@ pub(crate) fn finish(
                     }
                 ),
             })
-            .map_err(|_| "回复队列已满".to_owned())?;
+            .map_err(|_| RuntimeError::Capacity("回复队列已满"))?;
     }
     Ok(())
 }
@@ -223,7 +224,7 @@ pub(crate) fn event(
     scheduler: &mut Scheduler,
     delivery: &mpsc::Sender<DeliveryRequest>,
     event: AgentEvent,
-) -> Result<Option<crate::plans::Offer>, String> {
+) -> Result<Option<crate::plans::Offer>, RuntimeError> {
     let offer = if matches!(
         &event,
         AgentEvent::Finished {
@@ -325,9 +326,9 @@ pub(crate) fn spawn_interrupt(
     jobs: &mut JoinSet<Done>,
     backend: Arc<dyn crate::ports::AgentBackend>,
     turn: TurnRef,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     if jobs.len() >= limits::BACKGROUND_JOBS {
-        return Err("控制容量耗尽，无法回传停止请求".into());
+        return Err(RuntimeError::Capacity("控制容量耗尽，无法回传停止请求"));
     }
     jobs.spawn(async move {
         Done::Control {
@@ -390,8 +391,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_terminal_before_ack_keeps_mutation_gate_and_sends_no_success() -> Result<(), String>
-    {
+    fn compact_terminal_before_ack_keeps_mutation_gate_and_sends_no_success()
+    -> Result<(), RuntimeError> {
         let mut scheduler = Scheduler::new(1);
         assert!(scheduler.begin_session_mutation());
         let (delivery, mut messages) = mpsc::channel(4);
@@ -414,10 +415,10 @@ mod tests {
         assert!(messages.try_recv().is_err());
         assert!(!scheduler.begin_session_mutation());
         let label = match active.as_mut().map(|active| &mut active.kind) {
-            Some(ActiveKind::Compact { terminal, .. }) => {
-                terminal.take().ok_or("missing terminal")?
-            }
-            _ => return Err("missing compact state".into()),
+            Some(ActiveKind::Compact { terminal, .. }) => terminal
+                .take()
+                .ok_or(RuntimeError::Internal("missing terminal"))?,
+            _ => return Err(RuntimeError::Internal("missing compact state")),
         };
         finish(
             &Diagnostics::noop(),
@@ -428,9 +429,10 @@ mod tests {
         )?;
         assert!(active.is_none());
         assert!(scheduler.begin_session_mutation());
-        assert!(
-            matches!(messages.try_recv().map_err(|e| e.to_string())?, DeliveryRequest::Text(_, text) if text=="上下文压缩完成。")
-        );
+        assert!(matches!(
+            messages.try_recv().map_err(|_| RuntimeError::Internal("closed"))?,
+            DeliveryRequest::Text(_, text) if text == "上下文压缩完成。"
+        ));
         Ok(())
     }
 }

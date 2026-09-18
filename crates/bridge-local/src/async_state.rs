@@ -4,7 +4,8 @@ use bridge_app::{
     MessageJournal,
     directories::{DirectoryStore, DirectoryView},
     sessions::{
-        DurableJournal, PreferenceChange, Preferences, SessionStore, SessionStoreError, StoreFuture,
+        DurableJournal, PreferenceChange, Preferences, SessionStore, SessionStoreError,
+        StoreFailureKind, StoreFuture,
     },
 };
 use bridge_core::SessionKey;
@@ -46,7 +47,7 @@ impl AsyncState {
             next.sessions.retain(|_, thread| !archived.contains(thread));
             let removed = before - next.sessions.len();
             if removed > 0 {
-                store.replace(next).map_err(|_| SessionStoreError)?;
+                store.replace(next).map_err(store_failure)?;
             }
             Ok(removed)
         })
@@ -71,32 +72,54 @@ impl AsyncState {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| SessionStoreError)?;
+            .map_err(|_| invalid())?;
         let store = self.store.clone();
         // Cancellation of the caller does not cancel an in-flight durable write.
         // The permit remains owned by this worker until the operation completes.
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut store = store.lock().map_err(|_| SessionStoreError)?;
+            let mut store = store.lock().map_err(|_| invalid())?;
             operation(&mut store)
         })
         .await
-        .map_err(|_| SessionStoreError)?
+        .map_err(|_| invalid())?
     }
 }
 
+/// Preserve the durable-state failure category behind the safe boundary type.
+fn store_failure(error: crate::state::StoreError) -> SessionStoreError {
+    use crate::state::StoreError;
+    let kind = match error {
+        StoreError::Io(_) => StoreFailureKind::Io,
+        StoreError::Json(_) => StoreFailureKind::Format,
+        StoreError::Version(version) => StoreFailureKind::Version(version),
+        StoreError::Locked => StoreFailureKind::Locked,
+        StoreError::Uncertain => StoreFailureKind::Uncertain,
+        StoreError::EmptyMessage => StoreFailureKind::InvalidMessage,
+    };
+    SessionStoreError::new(kind)
+}
+
+fn invalid() -> SessionStoreError {
+    SessionStoreError::new(StoreFailureKind::InvalidMessage)
+}
+
+fn io_failure() -> SessionStoreError {
+    SessionStoreError::new(StoreFailureKind::Io)
+}
+
 fn key(session: &SessionKey) -> Result<String, SessionStoreError> {
-    let cwd = session.workspace.to_str().ok_or(SessionStoreError)?;
+    let cwd = session.workspace.to_str().ok_or_else(invalid)?;
     if session.user.is_empty() || !session.workspace.is_absolute() {
-        return Err(SessionStoreError);
+        return Err(invalid());
     }
     Ok(format!("{}:{cwd}", session.user))
 }
 
 fn workspace(root: &Path) -> Result<crate::workspace::Workspace, SessionStoreError> {
-    let workspace = crate::workspace::Workspace::new(root).map_err(|_| SessionStoreError)?;
+    let workspace = crate::workspace::Workspace::new(root).map_err(|_| io_failure())?;
     if workspace.root() != root {
-        return Err(SessionStoreError);
+        return Err(invalid());
     }
     Ok(workspace)
 }
@@ -104,9 +127,9 @@ fn workspace(root: &Path) -> Result<crate::workspace::Workspace, SessionStoreErr
 fn validate_snapshot(root: &Path, directory: &Path) -> Result<(), SessionStoreError> {
     let resolved = workspace(root)?
         .resolve_existing(root, directory)
-        .map_err(|_| SessionStoreError)?;
+        .map_err(|_| io_failure())?;
     if !directory.is_absolute() || resolved != directory {
-        return Err(SessionStoreError);
+        return Err(invalid());
     }
     Ok(())
 }
@@ -121,7 +144,7 @@ impl DirectoryStore for AsyncState {
         Box::pin(async move {
             self.run(move |_| {
                 if input.is_empty() || input.len() > 4096 || input.chars().any(char::is_control) {
-                    return Err(SessionStoreError);
+                    return Err(invalid());
                 }
                 let workspace = workspace(&root)?;
                 if !Path::new(&input).is_absolute() {
@@ -135,13 +158,13 @@ impl DirectoryStore for AsyncState {
                 }
                 let target = workspace
                     .resolve_proposed(&current, Path::new(&input))
-                    .map_err(|_| SessionStoreError)?;
+                    .map_err(|_| io_failure())?;
                 // Only a missing path can request creation, never files or denied I/O.
                 match std::fs::symlink_metadata(&target) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err(SessionStoreError),
+                    _ => return Err(invalid()),
                 }
-                target.to_str().ok_or(SessionStoreError)?;
+                target.to_str().ok_or_else(invalid)?;
                 Ok(Some(target))
             })
             .await
@@ -163,29 +186,29 @@ impl DirectoryStore for AsyncState {
                     || input.len() > 4096
                     || input.chars().any(char::is_control)
                 {
-                    return Err(SessionStoreError);
+                    return Err(invalid());
                 }
                 let workspace = workspace(&root)?;
                 validate_snapshot(&root, &current)?;
                 if workspace
                     .resolve_proposed(&current, Path::new(&input))
-                    .map_err(|_| SessionStoreError)?
+                    .map_err(|_| io_failure())?
                     != target
                 {
-                    return Err(SessionStoreError);
+                    return Err(invalid());
                 }
                 match std::fs::symlink_metadata(&target) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err(SessionStoreError),
+                    _ => return Err(invalid()),
                 }
-                let value = target.to_str().ok_or(SessionStoreError)?.to_owned();
+                let value = target.to_str().ok_or_else(invalid)?.to_owned();
                 workspace
                     .create_confirmed(&target)
-                    .map_err(|_| SessionStoreError)?;
+                    .map_err(|_| io_failure())?;
                 validate_snapshot(&root, &target)?;
                 let mut next = store.state().clone();
                 next.directories.insert(user, value);
-                store.replace(next).map_err(|_| SessionStoreError)?;
+                store.replace(next).map_err(store_failure)?;
                 Ok(target)
             })
             .await
@@ -220,10 +243,10 @@ impl DirectoryStore for AsyncState {
                 let mut children = Vec::new();
                 // Bound filesystem work even in directories containing many entries.
                 for entry in std::fs::read_dir(&current)
-                    .map_err(|_| SessionStoreError)?
+                    .map_err(|_| io_failure())?
                     .take(1000)
                 {
-                    let entry = entry.map_err(|_| SessionStoreError)?;
+                    let entry = entry.map_err(|_| io_failure())?;
                     let name = entry.file_name();
                     let Some(name) = name.to_str() else {
                         continue;
@@ -263,7 +286,7 @@ impl DirectoryStore for AsyncState {
                     || input.len() > 4096
                     || input.chars().any(char::is_control)
                 {
-                    return Err(SessionStoreError);
+                    return Err(invalid());
                 }
                 let input = Path::new(&input);
                 if !input.is_absolute() {
@@ -271,11 +294,11 @@ impl DirectoryStore for AsyncState {
                 }
                 let path = workspace(&root)?
                     .resolve_existing(&current, input)
-                    .map_err(|_| SessionStoreError)?;
-                let value = path.to_str().ok_or(SessionStoreError)?.to_owned();
+                    .map_err(|_| io_failure())?;
+                let value = path.to_str().ok_or_else(invalid)?.to_owned();
                 let mut next = store.state().clone();
                 next.directories.insert(user, value);
-                store.replace(next).map_err(|_| SessionStoreError)?;
+                store.replace(next).map_err(store_failure)?;
                 Ok(path)
             })
             .await
@@ -308,7 +331,7 @@ impl SessionStore for AsyncState {
                 }
                 let mut next = store.state().clone();
                 next.allowed_open_ids.insert(user);
-                store.replace(next).map_err(|_| SessionStoreError)?;
+                store.replace(next).map_err(store_failure)?;
                 Ok(true)
             })
             .await
@@ -317,12 +340,12 @@ impl SessionStore for AsyncState {
     fn clear_thread(&self, thread: String) -> StoreFuture<'_, ()> {
         Box::pin(async move {
             if thread.is_empty() {
-                return Err(SessionStoreError);
+                return Err(invalid());
             }
             self.run(move |store| {
                 let mut next = store.state().clone();
                 next.clear_thread(&thread);
-                store.replace(next).map_err(|_| SessionStoreError)
+                store.replace(next).map_err(store_failure)
             })
             .await
         })
@@ -347,7 +370,7 @@ impl SessionStore for AsyncState {
                 match change {
                     PreferenceChange::Model(Some(model)) => {
                         if model.is_empty() || model.len() > 256 {
-                            return Err(SessionStoreError);
+                            return Err(invalid());
                         }
                         next.models.insert(key, model);
                     }
@@ -358,7 +381,7 @@ impl SessionStore for AsyncState {
                         next.plan_modes.insert(key, value);
                     }
                 }
-                store.replace(next).map_err(|_| SessionStoreError)
+                store.replace(next).map_err(store_failure)
             })
             .await
         })
@@ -369,7 +392,7 @@ impl SessionStore for AsyncState {
             self.run(move |store| {
                 let mut next = store.state().clone();
                 next.sessions.remove(&key);
-                store.replace(next).map_err(|_| SessionStoreError)
+                store.replace(next).map_err(store_failure)
             })
             .await
         })
@@ -385,12 +408,12 @@ impl SessionStore for AsyncState {
         Box::pin(async move {
             let key = key(&session)?;
             if thread.is_empty() {
-                return Err(SessionStoreError);
+                return Err(invalid());
             }
             self.run(move |store| {
                 let mut next = store.state().clone();
                 next.sessions.insert(key, thread);
-                store.replace(next).map_err(|_| SessionStoreError)
+                store.replace(next).map_err(store_failure)
             })
             .await
         })
@@ -449,7 +472,7 @@ mod pairing_tests {
 impl DurableJournal for AsyncState {
     fn claim(&self, message: String) -> StoreFuture<'_, bool> {
         Box::pin(async move {
-            self.run(move |store| store.claim_message(&message).map_err(|_| SessionStoreError))
+            self.run(move |store| store.claim_message(&message).map_err(store_failure))
                 .await
         })
     }
@@ -599,11 +622,11 @@ mod tests {
                     let _ = started.send(());
                     blocked
                         .recv_timeout(Duration::from_secs(2))
-                        .map_err(|_| SessionStoreError)?;
+                        .map_err(|_| io_failure())?;
                     let mut next = store.state().clone();
                     next.sessions
                         .insert("user:/tmp/project".into(), "thread".into());
-                    store.replace(next).map_err(|_| SessionStoreError)
+                    store.replace(next).map_err(store_failure)
                 })
                 .await
         });

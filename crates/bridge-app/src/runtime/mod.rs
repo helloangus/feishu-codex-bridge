@@ -20,10 +20,43 @@ use crate::{
     files::TaskFiles,
     messaging::Messenger,
     ports::{AgentBackend, BackendError},
+    sessions::SessionStoreError,
 };
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
+
+/// Categorized terminal failure of one serial run. Every message is safe for
+/// delivery to users and logs; the variant is the classification operators
+/// act on.
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    /// The Feishu transport or an internal sender ended mid-run.
+    #[error("{0}")]
+    Connection(&'static str),
+    /// A bounded capacity was exhausted and a control response could be lost.
+    #[error("{0}")]
+    Capacity(&'static str),
+    /// An interaction invariant was violated; answers are never guessed.
+    #[error("{0}")]
+    Interaction(&'static str),
+    /// Compaction, archival or a task limit requires a controlled stop.
+    #[error("{0}")]
+    Maintenance(&'static str),
+    /// The Codex connection or protocol failed beyond recovery.
+    #[error("{0}")]
+    Backend(&'static str),
+    /// Durable state failed; the cause category stays available on the error.
+    #[error("状态保存或读取失败")]
+    Storage(#[from] SessionStoreError),
+    /// The working directory left the workspace or its settings are unreadable.
+    #[error("{0}")]
+    Directory(&'static str),
+    /// An internal invariant was violated; the run cannot continue safely.
+    #[error("{0}")]
+    Internal(&'static str),
+}
 
 pub struct Input {
     pub attachments: Vec<crate::files::Attachment>,
@@ -49,15 +82,12 @@ pub async fn run(
     mut inputs: mpsc::Receiver<Input>,
     mut events: mpsc::Receiver<Result<Incoming, BackendError>>,
     cancel: CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), RuntimeError> {
     store
         .validate_directory(settings.root.clone(), settings.directory.clone())
         .await
-        .map_err(|_| "初始目录无效或越出工作区".to_owned())?;
-    let directories = store
-        .directory_preferences()
-        .await
-        .map_err(|_| "无法读取用户目录设置".to_owned())?;
+        .map_err(|_| RuntimeError::Directory("初始目录无效或越出工作区"))?;
+    let directories = store.directory_preferences().await?;
     let (delivery, mut deliveries) =
         mpsc::channel::<crate::presentation::Request>(limits::DELIVERY_QUEUE);
     let text_messenger = messenger.clone();
@@ -143,21 +173,21 @@ pub async fn run(
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break Ok(()),
-                _ = &mut sender => break Err("发送器意外退出".to_owned()),
+                _ = &mut sender => break Err(RuntimeError::Connection("发送器意外退出")),
                 input = inputs.recv() => {
-                    let Some(input) = input else { break Err("飞书连接已关闭".to_owned()); };
+                    let Some(input) = input else { break Err(RuntimeError::Connection("飞书连接已关闭")); };
                     state.handle_input(input, &mut jobs).await?;
                 }
                 done = jobs.join_next(), if !jobs.is_empty() => {
                     let done = done
-                        .ok_or("后台任务集合异常".to_owned())?
-                        .map_err(|_| "后台任务异常退出".to_owned())?;
+                        .ok_or(RuntimeError::Internal("后台任务集合异常"))?
+                        .map_err(|_| RuntimeError::Internal("后台任务异常退出"))?;
                     state.handle_done(done, &mut jobs).await?;
                 }
                 incoming = events.recv() => {
                     let incoming = incoming
-                        .ok_or("Codex 事件连接已关闭".to_owned())?
-                        .map_err(|_| "Codex 协议或连接异常".to_owned())?;
+                        .ok_or(RuntimeError::Connection("Codex 事件连接已关闭"))?
+                        .map_err(|_| RuntimeError::Backend("Codex 协议或连接异常"))?;
                     state.handle_protocol(incoming, &mut jobs).await?;
                 }
                 _ = tick.tick() => state.handle_tick(&mut jobs).await?,

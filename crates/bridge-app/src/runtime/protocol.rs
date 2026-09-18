@@ -1,5 +1,6 @@
 //! Backend protocol event handling: notifications fold into the active
 //! execution; requests become interactions or immediate denials.
+use super::RuntimeError;
 use super::flow::tell;
 use super::limits;
 use super::state::{ActiveKind, Done, Runtime};
@@ -17,7 +18,7 @@ impl Runtime {
         &mut self,
         incoming: Incoming,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         match incoming {
             Incoming::Notification(notification) => {
                 self.handle_notification(notification, jobs).await
@@ -62,7 +63,9 @@ impl Runtime {
                                 "普通执行模式不支持 Codex 问答请求；请在 Plan 模式下重新发起。",
                             )?;
                         }
-                        return Err("问答模式或执行身份无效，未提交空答案".into());
+                        return Err(RuntimeError::Interaction(
+                            "问答模式或执行身份无效，未提交空答案",
+                        ));
                     }
                     let supported = questions.iter().all(crate::cards::question_supported);
                     if !supported {
@@ -73,7 +76,7 @@ impl Runtime {
                                 "问答详情超过展示上限，停止本次运行；未提交空答案。",
                             )?;
                         }
-                        return Err("问答无法完整展示".into());
+                        return Err(RuntimeError::Interaction("问答无法完整展示"));
                     }
                 }
                 let valid_question_count = matches!(
@@ -102,7 +105,7 @@ impl Runtime {
                             self.next_approval = self
                                 .next_approval
                                 .checked_add(1)
-                                .ok_or("审批编号耗尽".to_owned())?;
+                                .ok_or(RuntimeError::Capacity("审批编号耗尽"))?;
                             let token = crate::cards::CardToken::new(format!(
                                 "approval-{}-{}",
                                 self.settings.epoch, self.next_approval
@@ -168,11 +171,13 @@ impl Runtime {
                 let response = match request.kind {
                     RequestKind::Approval(_) => crate::requests::AgentReply::Approve(false),
                     RequestKind::Questions { .. } => {
-                        return Err("问答请求无效或数量超过上限，未提交空答案".into());
+                        return Err(RuntimeError::Interaction(
+                            "问答请求无效或数量超过上限，未提交空答案",
+                        ));
                     }
                 };
                 if jobs.len() >= limits::BACKGROUND_JOBS {
-                    return Err("控制回传容量耗尽，停止运行".into());
+                    return Err(RuntimeError::Capacity("控制回传容量耗尽，停止运行"));
                 }
                 jobs.spawn(async move {
                     Done::Control {
@@ -190,18 +195,18 @@ impl Runtime {
         &mut self,
         notification: AgentEvent,
         jobs: &mut JoinSet<Done>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeError> {
         if let AgentEvent::Archived { epoch, thread } = &notification {
             if *epoch != self.settings.epoch {
                 return Ok(());
             }
             if !sessions::valid_thread_id(thread) {
-                return Err("归档通知会话 ID 无效".into());
+                return Err(RuntimeError::Internal("归档通知会话 ID 无效"));
             }
             if !self.archived_threads.contains(thread)
                 && self.archived_threads.len() >= limits::ARCHIVED_THREADS
             {
-                return Err("待同步归档通知超过上限，停止运行".into());
+                return Err(RuntimeError::Capacity("待同步归档通知超过上限，停止运行"));
             }
             self.archived_threads.insert(thread.clone());
             self.plan_offer = None;
@@ -244,22 +249,22 @@ impl Runtime {
             });
             if let Some(active) = compacting {
                 if active.turn.as_ref().is_some_and(|current| current != turn) {
-                    return Err("压缩期间出现其他执行，停止运行".into());
+                    return Err(RuntimeError::Maintenance("压缩期间出现其他执行，停止运行"));
                 }
                 if active.turn.is_none() {
                     active.turn = Some(turn.clone());
                     let early = active
                         .gate
                         .as_mut()
-                        .ok_or("缺少压缩状态".to_owned())?
+                        .ok_or(RuntimeError::Internal("缺少压缩状态"))?
                         .bind(turn.clone())
-                        .map_err(|_| "压缩执行身份不匹配".to_owned())?;
+                        .map_err(|_| RuntimeError::Interaction("压缩执行身份不匹配"))?;
                     let stopping = active.stopping;
                     if stopping {
                         let backend = self.backend.clone();
                         let stop_turn = turn.clone();
                         if jobs.len() >= limits::BACKGROUND_JOBS {
-                            return Err("控制容量耗尽，无法停止压缩".into());
+                            return Err(RuntimeError::Capacity("控制容量耗尽，无法停止压缩"));
                         }
                         jobs.spawn(async move {
                             Done::Control {
@@ -290,7 +295,7 @@ impl Runtime {
             .and_then(|active| active.gate.as_mut())
             .map(|gate| {
                 gate.event(notification)
-                    .map_err(|_| "Codex 提前事件过多".to_owned())
+                    .map_err(|_| RuntimeError::Backend("Codex 提前事件过多"))
             }) {
             Some(result) => result?,
             None => return Ok(()),

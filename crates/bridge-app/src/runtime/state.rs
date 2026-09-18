@@ -1,4 +1,5 @@
 //! Runtime state: execution, interactions, cards and bounded background jobs.
+use super::RuntimeError;
 use super::flow::{can_spawn, spawn_reply, tell};
 use super::limits;
 use crate::{
@@ -347,7 +348,7 @@ impl Runtime {
     /// Bookkeeping that runs between every event: archive sync, expiries,
     /// approval card delivery, panel refreshes, file delivery and admission.
     /// Returning `Err` stops the run.
-    pub(crate) async fn maintain(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), String> {
+    pub(crate) async fn maintain(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), RuntimeError> {
         if !self.archived_threads.is_empty()
             && self.can_spawn(jobs, false)
             && self.scheduler.begin_invalidation()
@@ -356,7 +357,7 @@ impl Runtime {
             let thread = self
                 .archived_threads
                 .pop_first()
-                .ok_or("缺少归档同步目标".to_owned())?;
+                .ok_or(RuntimeError::Internal("缺少归档同步目标"))?;
             let store = self.store.clone();
             jobs.spawn(async move {
                 Done::ArchiveSynced {
@@ -397,7 +398,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn expire_stale_approvals(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), String> {
+    fn expire_stale_approvals(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), RuntimeError> {
         let alive = |pending: &Pending| {
             self.active.as_ref().is_some_and(|active| {
                 active.spec.id == pending.task
@@ -419,7 +420,7 @@ impl Runtime {
                     &pending.owner.chat,
                     "问答未完成且已超时或任务已结束/停止，正在停止桥接；未提交空答案，不会自动重跑。",
                 )?;
-                return Err("问答未完成，停止本次运行".into());
+                return Err(RuntimeError::Interaction("问答未完成，停止本次运行"));
             }
             let message = "审批已超时或任务已结束/停止，正在回传拒绝。";
             if let Some(source) = &pending.source {
