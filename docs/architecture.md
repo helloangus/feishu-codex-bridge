@@ -8,13 +8,13 @@ This describes the current implementation, including known responsibility overla
 
 `bridge-feishu` owns native WebSocket framing, heartbeat/reconnect behavior, proxy handling, REST calls, cards, media and event decoding. Accepted events enter bounded application channels and are acknowledged only after durable admission or deliberate rejection.
 
-`bridge-app` owns authorization, command routing, scheduling, sessions, runtime approvals/questions, Plan flow and result presentation. It depends on ports rather than transport implementations. Its runtime currently has a separate approval implementation from the standalone interaction Registry; unifying those paths is pending.
+`bridge-app` owns authorization, command routing, scheduling, sessions, runtime approvals/questions, Plan flow and result presentation. It depends on ports rather than transport implementations. `bridge-app/src/interactions.rs` is the single interaction manager for approvals and question groups; the runtime consumes it through `runtime/state.rs`.
 
 `bridge-codex` is the sole owner of Codex app-server stdin/stdout JSON-RPC. It converts protocol messages to typed application events and owns the Codex process group.
 
-`bridge-local` owns versioned JSON state, deduplication, workspace containment, snapshots and delivery staging. Its Delivery adapter also currently selects results, renders delivery summaries and coordinates messaging. Moving those application policies into `bridge-app` is pending. Individual JSON writes are atomic and state access is lock protected; directory creation and state publication are not one cross-resource transaction.
+`bridge-local` owns versioned JSON state, deduplication, workspace containment, and the file primitives behind `bridge_app::files::LocalFiles`: safe directory opens, bounded snapshots and diffs, durable attachment staging and private stable upload handles. Result selection, per-task limits, delivery summaries and upload ordering live in `bridge-app` (`bridge_app::files::Deliveries`); messaging transport stays behind `bridge_app::messaging::Messenger`. Individual JSON writes are atomic and state access is lock protected; directory creation and state publication are not one cross-resource transaction.
 
-The CLI currently performs part of the raw Feishu event-to-application conversion. Typed ingress conversion is intended to move fully into `bridge-feishu`. Runtime diagnostics currently mix a global Sink with direct stderr events; unified persistent diagnostics are also pending.
+Feishu events convert to application inputs inside `bridge-feishu` (`ingress::Received::into_runtime_input`); the CLI only routes lifecycle state, bounded admission and assembly. Runtime diagnostics use a typed, cloneable `bridge_app::diagnostics::Diagnostics` handle injected per run; `bridge-cli/src/logging.rs` provides the persistent, rotating infrastructure sink, and pre-diagnostics startup failures go through the bounded sanitized `startup_record` path.
 
 ## Runtime invariants to preserve
 

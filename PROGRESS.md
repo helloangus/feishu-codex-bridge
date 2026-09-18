@@ -168,3 +168,29 @@
 - CI 变更(D 起引入 xtask 入口、release 冒烟;E 的 codex-schema 步骤)在真实
   GitHub Actions 上的运行验证;
 - 真实飞书交互、目标主机生命周期、长时间稳定性属于部署验收,本轮不覆盖。
+
+## 工作包 F 与最终验收(2026-09-18)
+
+- 分支:`integration/rust-remediation`(汇总分支上直接执行,由用户指示)
+- 基线:B2(`f9bb0b3`),工具链切换(`0c15d03`)之后
+- 交付内容(commit 系列):
+  - `c4a61f2` 第 7 项:`TaskFiles`/`Messenger` 端口拆分;`bridge-app::files::Deliveries`
+    承接成果选择、数量限额、上传顺序与失败反馈;`bridge-local` 保留文件原语
+    (`LocalFiles`:安全打开、快照、差异、稳定句柄、附件发布);飞书事件→应用输入
+    转换收回 `bridge-feishu::ingress`;同时以类型化诊断事件替换全部裸 stderr JSON,
+    并修复按 `safe_name(task)` 作快照键导致工作区差异/成果从未投递的问题。
+  - `d0c2682` 第 9 项:诊断改为可注入 `Diagnostics` 句柄(去除全局 OnceLock);
+    补 `DeliveryFailed`/`CardFailed`/`Overloaded`/`HealthWriteFailed`/`ArchiveReconciled`
+    事件;RuntimeExit 与 panic hook 移入持有 sink 的 bootstrap;新增有界脱敏的
+    `startup_record` 启动失败路径;录制器假实现、可观测性与多实例隔离测试、
+    真实二进制启动记录测试。
+  - `df2b1aa` 第 8 项:`TaskId`(`{epoch}:{counter}`,含压缩任务)与 `CardToken`
+    专用类型贯穿交互注册表、动作注册表、计划报价、ingress 解码与文本命令边界。
+  - `ed88b6f` 第 8 项:`SessionStoreError` 携带 `StoreFailureKind` 类别;
+    runtime 边界改为 `RuntimeError` 分类枚举(Connection/Capacity/Interaction/
+    Maintenance/Backend/Storage/Directory/Internal),Display 保持安全用户文案。
+  - `e3a3887` 第 10 项:慢传输(串行所有者响应性、有界 Capacity 停止)与
+    命令洪峰(忙碌拒绝、控制路径存活)测试。
+- 验证:`cargo xtask check` 全绿(stable 1.98.1,串行测试)。
+- 已知既有问题:`test-support` 的 `compaction_requires_existing_valid_idle_session`
+  在高并行负载下偶发 `Locked`(与 B2 基线上复现一致,非本批引入;串行执行稳定)。
