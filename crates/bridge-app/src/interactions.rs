@@ -64,6 +64,7 @@ impl Pending {
 /// Outcome of a text answer: recorded (possibly completing the group) or
 /// invalid and rejected. A completed group returns its consumed entry so the
 /// caller can submit the answers.
+#[allow(clippy::large_enum_variant)]
 pub enum TextOutcome {
     Recorded {
         complete: bool,
@@ -75,6 +76,7 @@ pub enum TextOutcome {
 /// Outcome of a button answer: waiting for free text, recorded (possibly
 /// completing the group), or invalid and rejected. A completed group returns
 /// its consumed entry so the caller can submit the answers.
+#[allow(clippy::large_enum_variant)]
 pub enum Choice {
     WaitingText,
     Recorded {

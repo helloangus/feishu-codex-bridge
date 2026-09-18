@@ -20,6 +20,6 @@ Tests must stay offline, use temporary directories and fakes, and must not chang
 
 ## Style and safety
 
-Use stable Rust 1.85.1, rustfmt, explicit error propagation, bounded channels, and typed protocol boundaries. `bridge-codex` remains the sole app-server stdin/stdout owner. Route Feishu events through the native ingress and application runtime. Never interpolate user input into shell commands. User-triggered failures must be returned through the existing card/text delivery path.
+Use stable Rust (the toolchain selected by `rust-toolchain.toml`), rustfmt, explicit error propagation, bounded channels, and typed protocol boundaries. `bridge-codex` remains the sole app-server stdin/stdout owner. Route Feishu events through the native ingress and application runtime. Never interpolate user input into shell commands. User-triggered failures must be returned through the existing card/text delivery path.
 
 Update README, relevant `docs/`, and `PLAN.md` when behavior, commands, architecture, deployment, or operational status changes. Use scoped Conventional Commit-like summaries: `feat:`, `fix:`, `test:`, and `docs:`.
