@@ -27,7 +27,13 @@ const RULES: &[(&str, Class, Allowlist, Allowlist, Allowlist)] = &[
     (
         "bridge-app",
         Class::Production,
-        &["bridge-core", "thiserror", "tokio", "tokio-util"],
+        &[
+            "bridge-core",
+            "tempfile",
+            "thiserror",
+            "tokio",
+            "tokio-util",
+        ],
         &[],
         &[],
     ),

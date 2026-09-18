@@ -31,7 +31,8 @@ fn step(name: &str, action: impl FnOnce() -> Result<(), String>) -> Result<(), S
 
 /// Run `cargo fetch --locked` so later steps can execute without the network.
 pub fn run_fetch(repo: &Path, offline: bool) -> Result<(), String> {
-    let args = cargo_args(&["fetch", "--locked", "-j", "1"], offline, &[]);
+    // `cargo fetch` does not accept `-j`; serial execution is not needed here.
+    let args = cargo_args(&["fetch", "--locked"], offline, &[]);
     cargo_cli::run_streamed(&cargo_cli::cargo_program(), &args, &[], repo)
 }
 
