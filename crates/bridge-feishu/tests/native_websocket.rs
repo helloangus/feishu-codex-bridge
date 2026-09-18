@@ -38,7 +38,15 @@ async fn cancellation_drops_pending_ack_and_full_queue_returns_failure() -> Resu
         let cancel = CancellationToken::new();
         let stop = cancel.clone();
         let worker = tokio::spawn(async move {
-            websocket::session(client, 1, &mut ClientConfig::default(), tx, stop).await
+            websocket::session(
+                client,
+                1,
+                &mut ClientConfig::default(),
+                tx,
+                stop,
+                &bridge_app::diagnostics::Diagnostics::noop(),
+            )
+            .await
         });
         let _ = read(&mut server).await?;
         server
@@ -222,7 +230,15 @@ async fn event_and_card_ack_wait_for_admission_while_control_frames_continue() -
         let cancel = CancellationToken::new();
         let stop = cancel.clone();
         let worker = tokio::spawn(async move {
-            websocket::session(client, 1, &mut ClientConfig::default(), tx, stop).await
+            websocket::session(
+                client,
+                1,
+                &mut ClientConfig::default(),
+                tx,
+                stop,
+                &bridge_app::diagnostics::Diagnostics::noop(),
+            )
+            .await
         });
         assert_eq!(read(&mut server).await?.header("type")?, "ping");
         for (kind, payload, accepted) in [
@@ -278,7 +294,15 @@ async fn receipt_timeout_and_malformed_payload_return_failed_ack() -> Result {
         let cancel = CancellationToken::new();
         let stop = cancel.clone();
         let worker = tokio::spawn(async move {
-            websocket::session(client, 1, &mut ClientConfig::default(), tx, stop).await
+            websocket::session(
+                client,
+                1,
+                &mut ClientConfig::default(),
+                tx,
+                stop,
+                &bridge_app::diagnostics::Diagnostics::noop(),
+            )
+            .await
         });
         let _ = read(&mut server).await?;
         server
@@ -319,7 +343,15 @@ async fn pong_configuration_changes_ping_schedule_and_missing_pong_disconnects()
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
     let worker = tokio::spawn(async move {
-        websocket::session(client, 1, &mut ClientConfig::default(), tx, stop).await
+        websocket::session(
+            client,
+            1,
+            &mut ClientConfig::default(),
+            tx,
+            stop,
+            &bridge_app::diagnostics::Diagnostics::noop(),
+        )
+        .await
     });
     let _ = read(&mut server).await?;
     let mut pong = Frame::ping(1);

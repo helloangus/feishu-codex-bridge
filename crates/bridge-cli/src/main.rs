@@ -159,8 +159,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print_status(&settings)?;
         }
         Action::Run { config } => {
-            let config = Config::read(&config)?;
-            config.validate()?;
+            let config = Config::read(&config).inspect_err(|_| {
+                bridge_app::diagnostics::startup_record("config");
+            })?;
+            config.validate().inspect_err(|_| {
+                bridge_app::diagnostics::startup_record("config");
+            })?;
             runtime()?.block_on(bridge_cli::bootstrap::run(config))?;
         }
         Action::Config {
@@ -209,18 +213,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 fn main() -> ExitCode {
-    use bridge_app::diagnostics::{Event, Status, emit};
-    std::panic::set_hook(Box::new(|_| {
-        // Panic payloads can contain remote data. Record occurrence without it.
-        emit(Event::Panic, Status::Failed, None, 0);
-    }));
     match run(Cli::parse()) {
-        Ok(()) => {
-            emit(Event::RuntimeExit, Status::Ok, None, 0);
-            ExitCode::SUCCESS
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            emit(Event::RuntimeExit, Status::Failed, None, 0);
             eprintln!("错误：{error}");
             ExitCode::FAILURE
         }

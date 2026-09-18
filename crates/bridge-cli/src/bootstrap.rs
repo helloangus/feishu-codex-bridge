@@ -54,23 +54,54 @@ pub fn app_lock(directory: &Path, app_id: &str) -> Result<File, Box<dyn std::err
 }
 
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let feishu = config.feishu.as_ref().ok_or("run 需要 [feishu] 配置")?;
-    let app_id = credential(&feishu.app_id_env)?;
-    let secret = credential(&feishu.app_secret_env)?;
+    let fail_early = |stage: &'static str, error: &'static str| -> &'static str {
+        bridge_app::diagnostics::startup_record(stage);
+        error
+    };
+    let feishu = config
+        .feishu
+        .as_ref()
+        .ok_or_else(|| fail_early("config", "run 需要 [feishu] 配置"))?;
+    let app_id = credential(&feishu.app_id_env)
+        .map_err(|_| fail_early("credentials", "凭据环境变量不可用"))?;
+    let secret = credential(&feishu.app_secret_env)
+        .map_err(|_| fail_early("credentials", "凭据环境变量不可用"))?;
     let lock_dir = match std::env::var_os("CODEX_SERVICE_GLOBAL_STATE") {
         Some(value) => PathBuf::from(value),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("缺少 HOME，无法取得全局锁位置")?)
-            .join(".feishu-codex-bridge"),
+        None => PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or_else(|| fail_early("lock", "缺少 HOME，无法取得全局锁位置"))?,
+        )
+        .join(".feishu-codex-bridge"),
     };
-    let _lock = app_lock(&lock_dir, &app_id)?;
-    let health = Arc::new(std::sync::Mutex::new(crate::health::Health::start(
-        &config.workspace.state_dir,
-    )?));
-    bridge_app::diagnostics::install(Box::new(crate::logging::Log::open(
-        &config.workspace.state_dir.join("runtime"),
-    )?))
-    .map_err(|_| "日志输出已经初始化，拒绝重复运行")?;
-    bridge_app::diagnostics::emit(
+    let _lock = app_lock(&lock_dir, &app_id).inspect_err(|_| {
+        bridge_app::diagnostics::startup_record("lock");
+    })?;
+    let health = Arc::new(std::sync::Mutex::new(
+        crate::health::Health::start(&config.workspace.state_dir).inspect_err(|_| {
+            bridge_app::diagnostics::startup_record("health");
+        })?,
+    ));
+    let diagnostics = bridge_app::diagnostics::Diagnostics::new(Box::new(
+        crate::logging::Log::open(&config.workspace.state_dir.join("runtime")).inspect_err(
+            |_| {
+                bridge_app::diagnostics::startup_record("diagnostics");
+            },
+        )?,
+    ));
+    std::panic::set_hook({
+        let diagnostics = diagnostics.clone();
+        // Panic payloads can contain remote data. Record occurrence without it.
+        Box::new(move |_| {
+            diagnostics.emit(
+                bridge_app::diagnostics::Event::Panic,
+                bridge_app::diagnostics::Status::Failed,
+                None,
+                0,
+            )
+        })
+    });
+    diagnostics.emit(
         bridge_app::diagnostics::Event::RuntimeStarted,
         bridge_app::diagnostics::Status::Ok,
         None,
@@ -114,7 +145,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let epoch = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())
         .unwrap_or_else(|_| u64::from(std::process::id()));
     let directory = fs::canonicalize(&config.workspace.cwd)?;
-    let connection = websocket::Client::new(app_id, secret, proxy.as_deref())?;
+    let connection = websocket::Client::new(app_id, secret, proxy.as_deref(), diagnostics.clone())?;
     let root = fs::canonicalize(&config.workspace.root)?;
     let mut server = AppServer::spawn(
         &config.codex.executable,
@@ -142,7 +173,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
     match reconciliation {
-        Ok(Ok(removed)) => bridge_app::diagnostics::emit(
+        Ok(Ok(removed)) => diagnostics.emit(
             bridge_app::diagnostics::Event::ArchiveReconciled,
             bridge_app::diagnostics::Status::Ok,
             None,
@@ -158,7 +189,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let cancel = CancellationToken::new();
-    let heartbeat = tokio::spawn(crate::health::heartbeat(health.clone(), cancel.clone()));
+    let heartbeat = tokio::spawn(crate::health::heartbeat(
+        health.clone(),
+        cancel.clone(),
+        diagnostics.clone(),
+    ));
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let (input_tx, input_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(256);
@@ -170,7 +205,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let stop = cancel.clone();
     let connection_health = health.clone();
+    let gateway_diagnostics = diagnostics.clone();
     let gateway = tokio::spawn(async move {
+        let diagnostics = &gateway_diagnostics;
         let mut healthy = true;
         while let Some(received) = incoming_rx.recv().await {
             // Feishu payloads become application inputs inside the ingress;
@@ -180,7 +217,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 _ => {
                     if let Some(input) = received.into_runtime_input() {
                         if input_tx.try_send(input).is_err() {
-                            bridge_app::diagnostics::emit(
+                            diagnostics.emit(
                                 bridge_app::diagnostics::Event::Overloaded,
                                 bridge_app::diagnostics::Status::Overloaded,
                                 None,
@@ -191,7 +228,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
             };
-            bridge_app::diagnostics::emit(
+            diagnostics.emit(
                 match connection {
                     bridge_feishu::ingress::ConnectionState::Starting => {
                         bridge_app::diagnostics::Event::ConnectionStarting
@@ -222,7 +259,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|mut h| h.set(phase).map_err(|_| ()))
                 .is_err()
             {
-                bridge_app::diagnostics::emit(
+                diagnostics.emit(
                     bridge_app::diagnostics::Event::HealthWriteFailed,
                     bridge_app::diagnostics::Status::Failed,
                     None,
@@ -268,6 +305,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let files = Arc::new(
         bridge_app::files::Deliveries::new(
+            diagnostics.clone(),
             Arc::new(bridge_local::workspace_files::WorkspaceFiles),
             messenger.clone(),
             messenger.clone(),
@@ -295,6 +333,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             sandbox: config.codex.sandbox.into(),
             epoch,
         },
+        diagnostics.clone(),
         backend,
         store,
         messenger,
@@ -324,7 +363,19 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         || !matches!(heartbeat_result, Ok(Ok(())))
         || !matches!(agent_result, Ok(Ok(())))
     {
+        diagnostics.emit(
+            bridge_app::diagnostics::Event::RuntimeExit,
+            bridge_app::diagnostics::Status::Failed,
+            None,
+            0,
+        );
         return Err("连接或后台任务异常退出；未自动重启任务".into());
     }
+    diagnostics.emit(
+        bridge_app::diagnostics::Event::RuntimeExit,
+        bridge_app::diagnostics::Status::Ok,
+        None,
+        0,
+    );
     Ok(())
 }

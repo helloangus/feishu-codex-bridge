@@ -161,6 +161,7 @@ async fn authorized_attachment_reaches_turn_once_and_delivery_blocks_next_task()
         });
         let delivery = Arc::new(
             Deliveries::new(
+                bridge_app::diagnostics::Diagnostics::noop(),
                 Arc::new(WorkspaceFiles),
                 messenger.clone(),
                 messenger.clone(),
@@ -177,6 +178,7 @@ async fn authorized_attachment_reaches_turn_once_and_delivery_blocks_next_task()
                 sandbox: bridge_app::ports::Sandbox::WorkspaceWrite,
                 epoch: 81,
             },
+            bridge_app::diagnostics::Diagnostics::noop(),
             Arc::new(bridge_codex::backend::CodexBackend::new(
                 connection.client.clone(),
             )),

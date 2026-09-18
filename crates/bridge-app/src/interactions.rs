@@ -326,7 +326,11 @@ impl Interactions {
 /// Submit one pending entry's reply. Groups with missing or empty answers are
 /// never submitted — dropping the handle writes nothing, including shutdown.
 /// The write is bounded; an elapsed bound reports [`BackendError::Uncertain`].
-pub async fn deliver_reply(pending: Pending, allow: bool) -> ReplyOutcome {
+pub async fn deliver_reply(
+    diagnostics: &crate::diagnostics::Diagnostics,
+    pending: Pending,
+    allow: bool,
+) -> ReplyOutcome {
     let questions = pending.is_questions();
     if let RequestKind::Questions {
         questions: list, ..
@@ -356,7 +360,7 @@ pub async fn deliver_reply(pending: Pending, allow: bool) -> ReplyOutcome {
         .await
         .unwrap_or(Err(BackendError::Uncertain));
     if questions {
-        crate::diagnostics::emit(
+        diagnostics.emit(
             crate::diagnostics::Event::AnswerReturned,
             if result.is_ok() {
                 crate::diagnostics::Status::Ok
@@ -684,7 +688,7 @@ mod tests {
         let mut pending = registry.remove("token").ok_or("entry")?;
         pending.answers.insert("q1".into(), vec!["first".into()]);
         pending.answers.insert("q2".into(), vec!["second".into()]);
-        let outcome = deliver_reply(pending, false).await;
+        let outcome = deliver_reply(&crate::diagnostics::Diagnostics::noop(), pending, false).await;
         assert_eq!(outcome.result, Err(BackendError::Rejected(1)));
         assert!(outcome.submitted);
         // An expired questions group drops the handle without any write.
@@ -698,7 +702,7 @@ mod tests {
             .next()
             .ok_or("expired entry")?;
         assert!(expired.expire(now()).is_empty());
-        let outcome = deliver_reply(pending, false).await;
+        let outcome = deliver_reply(&crate::diagnostics::Diagnostics::noop(), pending, false).await;
         assert!(!outcome.submitted);
         assert_eq!(outcome.result, Ok(()));
         Ok(())

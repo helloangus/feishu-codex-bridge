@@ -15,6 +15,7 @@ mod timers;
 pub use state::{Settings, Store};
 
 use crate::{
+    diagnostics::Diagnostics,
     events::Incoming,
     files::TaskFiles,
     messaging::Messenger,
@@ -40,6 +41,7 @@ pub struct Input {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     settings: Settings,
+    diagnostics: Diagnostics,
     backend: Arc<dyn AgentBackend>,
     store: Arc<dyn Store>,
     messenger: Arc<dyn Messenger>,
@@ -59,9 +61,11 @@ pub async fn run(
     let (delivery, mut deliveries) =
         mpsc::channel::<crate::presentation::Request>(limits::DELIVERY_QUEUE);
     let text_messenger = messenger.clone();
+    let sender_diagnostics = diagnostics.clone();
     let progress_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let busy = progress_busy.clone();
     let mut sender = tokio::spawn(async move {
+        let diagnostics = &sender_diagnostics;
         let mut presentation = crate::presentation::Presentation::default();
         while let Some(request) = deliveries.recv().await {
             let result = match request {
@@ -87,7 +91,7 @@ pub async fn run(
                         )
                         .await
                     };
-                    crate::diagnostics::emit(
+                    diagnostics.emit(
                         crate::diagnostics::Event::AnswerDelivered,
                         if matches!(&result, Ok(Ok(()))) {
                             crate::diagnostics::Status::Ok
@@ -102,7 +106,7 @@ pub async fn run(
                 crate::presentation::Request::Progress { task, chat, text } => {
                     if text_messenger.rich_output() {
                         presentation
-                            .progress(text_messenger.as_ref(), task, chat, text)
+                            .progress(diagnostics, text_messenger.as_ref(), task, chat, text)
                             .await;
                     }
                     busy.store(false, std::sync::atomic::Ordering::Release);
@@ -110,7 +114,7 @@ pub async fn run(
                 }
             };
             if !matches!(result, Ok(Ok(()))) {
-                crate::diagnostics::emit(
+                diagnostics.emit(
                     crate::diagnostics::Event::DeliveryFailed,
                     crate::diagnostics::Status::Failed,
                     None,
@@ -122,6 +126,7 @@ pub async fn run(
     let shutdown_backend = backend.clone();
     let mut state = state::Runtime::new(
         settings,
+        diagnostics.clone(),
         backend,
         store,
         messenger,
@@ -181,7 +186,7 @@ pub async fn run(
     for pending in state.approvals.drain() {
         // Only a control-capacity failure can abort a shutdown denial; the
         // timeout bounds the whole drain either way.
-        if flow::spawn_reply(&mut jobs, pending, false).is_err() {
+        if flow::spawn_reply(&diagnostics, &mut jobs, pending, false).is_err() {
             break;
         }
     }

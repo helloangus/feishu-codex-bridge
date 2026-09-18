@@ -99,7 +99,7 @@ impl Runtime {
                 result,
             } => {
                 if panel.title == "Codex 问答" {
-                    crate::diagnostics::emit(
+                    self.diagnostics.emit(
                         crate::diagnostics::Event::QuestionSent,
                         if result.is_ok() {
                             crate::diagnostics::Status::Ok
@@ -112,7 +112,7 @@ impl Runtime {
                         panel.buttons.len(),
                     );
                 } else if result.is_err() {
-                    crate::diagnostics::emit(
+                    self.diagnostics.emit(
                         crate::diagnostics::Event::CardFailed,
                         crate::diagnostics::Status::Failed,
                         None,
@@ -173,7 +173,7 @@ impl Runtime {
                             &pending.owner.chat,
                             "审批卡片发送失败、已失效或登记已满，正在拒绝请求。",
                         )?;
-                        spawn_reply(jobs, pending, false)?;
+                        spawn_reply(&self.diagnostics, jobs, pending, false)?;
                     }
                 }
             }
@@ -198,7 +198,7 @@ impl Runtime {
                         entry.source = id.0.clone();
                     }
                     if !self.card_actions.insert(entries, Instant::now()) {
-                        crate::diagnostics::emit(
+                        self.diagnostics.emit(
                             crate::diagnostics::Event::CardFailed,
                             crate::diagnostics::Status::Rejected,
                             None,
@@ -320,7 +320,15 @@ impl Runtime {
                             directory: current,
                             stop_snapshot: (self.next_task, None),
                         };
-                        send_panel(None, jobs, self.messenger.clone(), owner, panel, commands);
+                        send_panel(
+                            &self.diagnostics,
+                            None,
+                            jobs,
+                            self.messenger.clone(),
+                            owner,
+                            panel,
+                            commands,
+                        );
                     } else {
                         tell(
                             &self.delivery,
@@ -479,6 +487,7 @@ impl Runtime {
                     )?;
                     if !can_spawn(jobs, false) {
                         super::flow::finish(
+                            &self.diagnostics,
                             &mut self.active,
                             &mut self.scheduler,
                             &self.delivery,
@@ -529,6 +538,7 @@ impl Runtime {
                         .is_some_and(|active| active.is_compact() && active.spec.id == id)
                 {
                     super::flow::finish(
+                        &self.diagnostics,
                         &mut self.active,
                         &mut self.scheduler,
                         &self.delivery,
@@ -543,6 +553,7 @@ impl Runtime {
                 if let Some(active) = compacting {
                     if active.stopping {
                         super::flow::finish(
+                            &self.diagnostics,
                             &mut self.active,
                             &mut self.scheduler,
                             &self.delivery,
@@ -574,6 +585,7 @@ impl Runtime {
                             });
                         }
                         Err(error) => super::flow::finish(
+                            &self.diagnostics,
                             &mut self.active,
                             &mut self.scheduler,
                             &self.delivery,
@@ -603,6 +615,7 @@ impl Runtime {
                             };
                             if let Some(label) = terminal {
                                 super::flow::finish(
+                                    &self.diagnostics,
                                     &mut self.active,
                                     &mut self.scheduler,
                                     &self.delivery,
@@ -619,6 +632,7 @@ impl Runtime {
                         }
                         Err(BackendError::Rejected(_)) if active.turn.is_none() => {
                             super::flow::finish(
+                                &self.diagnostics,
                                 &mut self.active,
                                 &mut self.scheduler,
                                 &self.delivery,
@@ -865,7 +879,7 @@ impl Runtime {
                 }
             },
             Done::Prepared { id, result } => {
-                crate::diagnostics::emit(
+                self.diagnostics.emit(
                     crate::diagnostics::Event::TaskPrepared,
                     if result.is_ok() {
                         crate::diagnostics::Status::Ok
@@ -882,6 +896,7 @@ impl Runtime {
                         .is_some_and(|active| active.spec.id == id)
                 {
                     super::flow::finish(
+                        &self.diagnostics,
                         &mut self.active,
                         &mut self.scheduler,
                         &self.delivery,
@@ -893,6 +908,7 @@ impl Runtime {
                 if let Some(active) = preparing {
                     if active.stopping {
                         super::flow::finish(
+                            &self.diagnostics,
                             &mut self.active,
                             &mut self.scheduler,
                             &self.delivery,
@@ -918,6 +934,7 @@ impl Runtime {
                             });
                         }
                         Err(error) => super::flow::finish(
+                            &self.diagnostics,
                             &mut self.active,
                             &mut self.scheduler,
                             &self.delivery,
@@ -927,7 +944,7 @@ impl Runtime {
                 }
             }
             Done::Started { id, result } => {
-                crate::diagnostics::emit(
+                self.diagnostics.emit(
                     crate::diagnostics::Event::TaskStarted,
                     if result.is_ok() {
                         crate::diagnostics::Status::Ok
@@ -953,6 +970,7 @@ impl Runtime {
                             }
                             for item in early {
                                 if let Some(offer) = super::flow::event(
+                                    &self.diagnostics,
                                     &mut self.active,
                                     &mut self.scheduler,
                                     &self.delivery,
@@ -964,6 +982,7 @@ impl Runtime {
                         }
                         Err(error) => {
                             super::flow::finish(
+                                &self.diagnostics,
                                 &mut self.active,
                                 &mut self.scheduler,
                                 &self.delivery,
@@ -1027,7 +1046,15 @@ impl Runtime {
                 tell(&self.delivery, &chat, "系统繁忙，请稍后重新发送列表命令。")?;
                 return Ok(());
             }
-            send_panel(None, jobs, self.messenger.clone(), owner, panel, commands);
+            send_panel(
+                &self.diagnostics,
+                None,
+                jobs,
+                self.messenger.clone(),
+                owner,
+                panel,
+                commands,
+            );
         }
         Ok(())
     }

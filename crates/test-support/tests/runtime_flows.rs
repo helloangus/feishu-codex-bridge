@@ -1,9 +1,14 @@
 //! Full runtime actor with fake stdio app-server, real store and fake delivery.
+use bridge_app::messaging::{DeliveryError, DeliveryFuture, MessageId, Messenger, ResourceKind};
 use bridge_app::{ports::Sandbox, sessions::SessionStore};
+use bridge_core::view::Panel;
 use bridge_local::{async_state::AsyncState, state::JsonStore};
-use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet, error::Error, fs::File, path::PathBuf, sync::Arc, time::Duration,
+};
 use test_support::{
     actor::{Actor, ActorConfig},
+    diagnostics,
     input::submit,
     messenger::{MessengerOptions, RecordingMessenger, expect_chat_text},
 };
@@ -100,6 +105,7 @@ async fn compact_scenario(mode: &str) -> Result<(), Box<dyn Error>> {
             },
             store.clone(),
             messenger.clone(),
+            bridge_app::diagnostics::Diagnostics::noop(),
         )
         .await?;
         if mode == "storage" {
@@ -251,6 +257,7 @@ async fn scenario(fail_archive_commit: bool) -> Result<(), Box<dyn Error>> {
             },
             store.clone(),
             messenger.clone(),
+            bridge_app::diagnostics::Diagnostics::noop(),
         )
         .await?;
         actor.send_text("unauthorized", "stranger", "hello").await?;
@@ -420,4 +427,149 @@ async fn scenario(fail_archive_commit: bool) -> Result<(), Box<dyn Error>> {
     })
     .await??;
     Ok(())
+}
+
+/// A messenger whose texts also fail, so the card fallback cannot mask the
+/// transport failure the diagnostics must expose.
+struct SilentMessenger;
+
+impl Messenger for SilentMessenger {
+    fn send_text(&self, _: String, _: String) -> DeliveryFuture<'_, ()> {
+        Box::pin(async { Err(DeliveryError::Transport) })
+    }
+    fn send_panel(&self, _: String, _: Panel) -> DeliveryFuture<'_, MessageId> {
+        Box::pin(async { Err(DeliveryError::Transport) })
+    }
+    fn update_panel(&self, _: MessageId, _: Panel) -> DeliveryFuture<'_, ()> {
+        Box::pin(async { Err(DeliveryError::Transport) })
+    }
+    fn upload(&self, _: String, _: String, _: File, _: ResourceKind) -> DeliveryFuture<'_, ()> {
+        Box::pin(async { Err(DeliveryError::Transport) })
+    }
+}
+
+#[tokio::test]
+async fn background_delivery_failures_are_observable_through_injected_diagnostics()
+-> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(AsyncState::new(JsonStore::open(
+            &temp.path().join("state"),
+        )?));
+        let (diagnostics, records) = diagnostics::recorder();
+        let actor = Actor::start(
+            ActorConfig {
+                executable: test_support::fake_codex_runtime!(),
+                args: vec!["runtime".into()],
+                server_cwd: temp.path().into(),
+                epoch: 9,
+                root: temp.path().into(),
+                directory: temp.path().into(),
+                allowed: BTreeSet::from(["allowed".into()]),
+                open_access: false,
+                sandbox: Sandbox::WorkspaceWrite,
+            },
+            store,
+            Arc::new(SilentMessenger),
+            diagnostics,
+        )
+        .await?;
+        // The help panel and its text fallback both fail; both failures must
+        // reach the injected diagnostics.
+        actor.send_text("help", "allowed", "/help").await?;
+        let mut card_failed = false;
+        let mut delivery_failed = false;
+        for _ in 0..200 {
+            {
+                let log = diagnostics::records(&records);
+                card_failed |= log.iter().any(|r| r.contains("\"event\":\"CardFailed\""));
+                delivery_failed |= log
+                    .iter()
+                    .any(|r| r.contains("\"event\":\"DeliveryFailed\""));
+            }
+            if card_failed && delivery_failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        actor.cancel.cancel();
+        actor.worker.await.ok();
+        actor.server.await.ok();
+        assert!(card_failed, "records: {:?}", diagnostics::records(&records));
+        assert!(
+            delivery_failed,
+            "records: {:?}",
+            diagnostics::records(&records)
+        );
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn separate_runtime_instances_keep_separate_diagnostics() -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let temp = tempfile::tempdir()?;
+        let config = |name: &str| -> Result<(PathBuf, Arc<AsyncState>), Box<dyn Error>> {
+            let directory = temp.path().join(name);
+            std::fs::create_dir_all(&directory)?;
+            let store = Arc::new(AsyncState::new(JsonStore::open(&directory.join("state"))?));
+            Ok((directory, store))
+        };
+        let (one_directory, one_store) = config("one")?;
+        let (two_directory, two_store) = config("two")?;
+        let (first, first_records) = diagnostics::recorder();
+        let (second, second_records) = diagnostics::recorder();
+        let start = |epoch: u64,
+                     directory: PathBuf,
+                     store: Arc<AsyncState>,
+                     diagnostics: bridge_app::diagnostics::Diagnostics| async move {
+            let (messenger, handles) =
+                RecordingMessenger::recorded("test", MessengerOptions::new());
+            let actor = Actor::start(
+                ActorConfig {
+                    executable: test_support::fake_codex_runtime!(),
+                    args: vec!["runtime".into()],
+                    server_cwd: directory.clone(),
+                    epoch,
+                    root: directory.clone(),
+                    directory,
+                    allowed: BTreeSet::from(["allowed".into()]),
+                    open_access: false,
+                    sandbox: Sandbox::WorkspaceWrite,
+                },
+                store,
+                messenger,
+                diagnostics,
+            )
+            .await?;
+            Ok::<_, Box<dyn Error>>((actor, handles))
+        };
+        let (first_actor, _first_handles) = start(1, one_directory, one_store, first).await?;
+        let (second_actor, _second_handles) = start(2, two_directory, two_store, second).await?;
+        first_actor
+            .send_text("task", "allowed", "answer briefly")
+            .await?;
+        let mut finished = false;
+        for _ in 0..200 {
+            finished |= diagnostics::records(&first_records)
+                .iter()
+                .any(|r| r.contains("\"event\":\"TaskFinished\""));
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first_log = diagnostics::records(&first_records);
+        assert!(finished, "first: {first_log:?}");
+        assert!(diagnostics::records(&second_records).is_empty());
+        first_actor.cancel.cancel();
+        second_actor.cancel.cancel();
+        let _ = first_actor.worker.await;
+        let _ = second_actor.worker.await;
+        let _ = first_actor.server.await;
+        let _ = second_actor.server.await;
+        Ok(())
+    })
+    .await?
 }

@@ -2,6 +2,7 @@
 //! protocol event folding, plus the bounded background-job policy.
 use super::limits;
 use super::state::{Active, ActiveKind, Done};
+use crate::diagnostics::Diagnostics;
 use crate::{
     Scheduler,
     events::{AgentEvent, TurnOutcome},
@@ -39,6 +40,7 @@ pub(crate) fn can_spawn(jobs: &JoinSet<Done>, control: bool) -> bool {
 /// Queue one interaction reply on the reserved control capacity. A full
 /// reserve means replies could be lost silently; the run must stop instead.
 pub(crate) fn spawn_reply(
+    diagnostics: &Diagnostics,
     jobs: &mut JoinSet<Done>,
     pending: crate::interactions::Pending,
     allow: bool,
@@ -46,14 +48,16 @@ pub(crate) fn spawn_reply(
     if jobs.len() >= limits::BACKGROUND_JOBS {
         return Err("控制回传容量耗尽，停止运行".into());
     }
+    let handle = diagnostics.clone();
     jobs.spawn(async move {
-        let outcome = crate::interactions::deliver_reply(pending, allow).await;
+        let outcome = crate::interactions::deliver_reply(&handle, pending, allow).await;
         Done::ApprovalReplied { outcome }
     });
     Ok(())
 }
 
 pub(crate) fn send_panel(
+    diagnostics: &Diagnostics,
     source: Option<String>,
     jobs: &mut JoinSet<Done>,
     messenger: Arc<dyn Messenger>,
@@ -65,7 +69,9 @@ pub(crate) fn send_panel(
         return false;
     }
     let deadline = Instant::now() + limits::INTERACTION_TIMEOUT;
+    let handle = diagnostics.clone();
     jobs.spawn(async move {
+        let diagnostics = &handle;
         let fallback = if commands
             .iter()
             .any(|(_, command)| command.starts_with("/plan-action "))
@@ -103,7 +109,7 @@ pub(crate) fn send_panel(
             Err(_) => Err(DeliveryError::Transport),
         };
         if result.is_err() {
-            crate::diagnostics::emit(
+            diagnostics.emit(
                 crate::diagnostics::Event::CardFailed,
                 crate::diagnostics::Status::Failed,
                 None,
@@ -120,7 +126,7 @@ pub(crate) fn send_panel(
                 Ok(Ok(()))
             )
         {
-            crate::diagnostics::emit(
+            diagnostics.emit(
                 crate::diagnostics::Event::DeliveryFailed,
                 crate::diagnostics::Status::Failed,
                 None,
@@ -161,13 +167,14 @@ pub(crate) fn send_panel(
 }
 
 pub(crate) fn finish(
+    diagnostics: &Diagnostics,
     active: &mut Option<Active>,
     scheduler: &mut Scheduler,
     delivery: &mpsc::Sender<DeliveryRequest>,
     outcome: String,
 ) -> Result<(), String> {
     if let Some(active) = active.take() {
-        crate::diagnostics::emit(
+        diagnostics.emit(
             crate::diagnostics::Event::TaskFinished,
             if outcome.starts_with("执行完成") {
                 crate::diagnostics::Status::Ok
@@ -211,6 +218,7 @@ pub(crate) fn finish(
 }
 
 pub(crate) fn event(
+    diagnostics: &Diagnostics,
     active: &mut Option<Active>,
     scheduler: &mut Scheduler,
     delivery: &mpsc::Sender<DeliveryRequest>,
@@ -291,7 +299,7 @@ pub(crate) fn event(
                         return Ok(None);
                     }
                 }
-                return finish(active, scheduler, delivery, label).map(|_| None);
+                return finish(diagnostics, active, scheduler, delivery, label).map(|_| None);
             }
             let label = match outcome {
                 TurnOutcome::Completed => "执行完成".into(),
@@ -305,7 +313,7 @@ pub(crate) fn event(
                         .collect::<String>()
                 ),
             };
-            finish(active, scheduler, delivery, label)?;
+            finish(diagnostics, active, scheduler, delivery, label)?;
         }
         _ => {}
     }
@@ -394,6 +402,7 @@ mod tests {
         };
         let mut active = Some(compact_active(turn.clone()));
         event(
+            &Diagnostics::noop(),
             &mut active,
             &mut scheduler,
             &delivery,
@@ -410,7 +419,13 @@ mod tests {
             }
             _ => return Err("missing compact state".into()),
         };
-        finish(&mut active, &mut scheduler, &delivery, label)?;
+        finish(
+            &Diagnostics::noop(),
+            &mut active,
+            &mut scheduler,
+            &delivery,
+            label,
+        )?;
         assert!(active.is_none());
         assert!(scheduler.begin_session_mutation());
         assert!(

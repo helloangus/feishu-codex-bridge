@@ -27,6 +27,8 @@ pub struct MessengerOptions {
     pub panels_fail: bool,
     /// `update_panel` records the update first, then fails.
     pub updates_fail: bool,
+    /// `send_text` fails with a transport error.
+    pub texts_fail: bool,
     /// `upload` panics; use only where no upload may ever happen.
     pub upload_panics: bool,
 }
@@ -37,6 +39,7 @@ impl MessengerOptions {
         Self {
             panels_fail: false,
             updates_fail: false,
+            texts_fail: false,
             upload_panics: false,
         }
     }
@@ -62,6 +65,7 @@ struct Recordings {
     updates: mpsc::Sender<(String, Panel)>,
     panels_fail: AtomicBool,
     updates_fail: AtomicBool,
+    texts_fail: AtomicBool,
     upload_panics: AtomicBool,
     sequence: AtomicU64,
 }
@@ -86,6 +90,7 @@ impl RecordingMessenger {
             updates: updates_tx,
             panels_fail: AtomicBool::new(options.panels_fail),
             updates_fail: AtomicBool::new(options.updates_fail),
+            texts_fail: AtomicBool::new(options.texts_fail),
             upload_panics: AtomicBool::new(options.upload_panics),
             sequence: AtomicU64::new(1),
         };
@@ -118,6 +123,9 @@ impl RecordingMessenger {
 impl Messenger for RecordingMessenger {
     fn send_text(&self, chat: String, text: String) -> DeliveryFuture<'_, ()> {
         Box::pin(async move {
+            if self.0.texts_fail.load(Ordering::Relaxed) {
+                return Err(DeliveryError::Transport);
+            }
             self.0
                 .text
                 .send((chat, text))

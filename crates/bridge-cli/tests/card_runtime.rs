@@ -105,6 +105,7 @@ async fn help_and_creation_cards_round_trip_with_message_and_owner_checks()
                 sandbox: Sandbox::WorkspaceWrite,
                 epoch: 71,
             },
+            bridge_app::diagnostics::Diagnostics::noop(),
             backend,
             store.clone(),
             messenger.clone(),

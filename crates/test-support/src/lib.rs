@@ -7,6 +7,7 @@
 //! serial runtime. Everything runs offline against temporary directories.
 
 pub mod actor;
+pub mod diagnostics;
 pub mod fakes;
 pub mod files;
 pub mod input;

@@ -6,6 +6,7 @@
 //! handles used for shutdown assertions.
 
 use bridge_app::{
+    diagnostics::Diagnostics,
     events::Incoming,
     files::TaskFiles,
     messaging::Messenger,
@@ -56,6 +57,7 @@ impl Actor {
         config: ActorConfig,
         store: Arc<dyn runtime::Store>,
         messenger: Arc<dyn Messenger>,
+        diagnostics: Diagnostics,
     ) -> Result<Self, Box<dyn Error>> {
         let mut server = AppServer::spawn(
             &config.executable,
@@ -91,6 +93,7 @@ impl Actor {
                 sandbox: config.sandbox,
                 epoch: config.epoch,
             },
+            diagnostics,
             backend,
             store,
             messenger,

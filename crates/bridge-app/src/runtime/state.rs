@@ -3,6 +3,7 @@ use super::flow::{can_spawn, spawn_reply, tell};
 use super::limits;
 use crate::{
     Scheduler,
+    diagnostics::Diagnostics,
     directories::{Confirmations, DirectoryStore},
     execution::Execution,
     files::{Attachment, TaskFiles},
@@ -230,6 +231,7 @@ pub(crate) enum Done {
 /// [`super::input`], [`super::protocol`], [`super::jobs`] and [`super::timers`].
 pub(crate) struct Runtime {
     pub(crate) settings: Settings,
+    pub(crate) diagnostics: Diagnostics,
     pub(crate) backend: Arc<dyn AgentBackend>,
     pub(crate) store: Arc<dyn Store>,
     pub(crate) messenger: Arc<dyn Messenger>,
@@ -267,6 +269,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         settings: Settings,
+        diagnostics: Diagnostics,
         backend: Arc<dyn AgentBackend>,
         store: Arc<dyn Store>,
         messenger: Arc<dyn Messenger>,
@@ -278,6 +281,7 @@ impl Runtime {
         let allowed = settings.allowed.clone();
         Self {
             settings,
+            diagnostics,
             backend,
             store,
             messenger,
@@ -418,7 +422,7 @@ impl Runtime {
                 self.card_views.note(source, message);
             }
             tell(&self.delivery, &pending.owner.chat, message)?;
-            spawn_reply(jobs, pending, false)?;
+            spawn_reply(&self.diagnostics, jobs, pending, false)?;
         }
         Ok(())
     }
@@ -478,6 +482,7 @@ impl Runtime {
         }
         if let Some(refresh) = self.refreshes.pop_front() {
             self.updating_panel = super::flow::send_panel(
+                &self.diagnostics,
                 Some(refresh.source),
                 jobs,
                 self.messenger.clone(),
@@ -494,6 +499,7 @@ impl Runtime {
         {
             self.updating_panel = true;
             let messenger = self.messenger.clone();
+            let diagnostics = self.diagnostics.clone();
             jobs.spawn(async move {
                 if !matches!(
                     timeout(
@@ -503,7 +509,7 @@ impl Runtime {
                     .await,
                     Ok(Ok(()))
                 ) {
-                    crate::diagnostics::emit(
+                    diagnostics.emit(
                         crate::diagnostics::Event::CardFailed,
                         crate::diagnostics::Status::Failed,
                         None,
@@ -530,13 +536,14 @@ impl Runtime {
         }
         let task_files = self.task_files.clone();
         let messenger = self.messenger.clone();
+        let diagnostics = self.diagnostics.clone();
         jobs.spawn(async move {
             let result = timeout(
                 limits::FILE_FINISH_TIMEOUT,
                 task_files.finish_files(spec.id.clone(), spec.chat.clone(), spec.session.workspace),
             )
             .await;
-            crate::diagnostics::emit(
+            diagnostics.emit(
                 crate::diagnostics::Event::FilesFinished,
                 if matches!(&result, Ok(Ok(()))) {
                     crate::diagnostics::Status::Ok
@@ -602,7 +609,15 @@ impl Runtime {
                 .unwrap_or(&0),
             stop_snapshot: (self.next_task, None),
         };
-        super::flow::send_panel(None, jobs, self.messenger.clone(), owner, panel, commands);
+        super::flow::send_panel(
+            &self.diagnostics,
+            None,
+            jobs,
+            self.messenger.clone(),
+            owner,
+            panel,
+            commands,
+        );
     }
 
     fn start_next_task(&mut self, jobs: &mut JoinSet<Done>) {
@@ -640,6 +655,7 @@ impl Runtime {
         let sandbox = self.settings.sandbox;
         let root = self.settings.root.clone();
         let task_files = self.task_files.clone();
+        let diagnostics = self.diagnostics.clone();
         jobs.spawn(async move {
             let result = async {
                 store
@@ -659,7 +675,7 @@ impl Runtime {
                     ),
                 )
                 .await;
-                crate::diagnostics::emit(
+                diagnostics.emit(
                     crate::diagnostics::Event::FilesPrepared,
                     if matches!(&prepared, Ok(Ok(_))) {
                         crate::diagnostics::Status::Ok

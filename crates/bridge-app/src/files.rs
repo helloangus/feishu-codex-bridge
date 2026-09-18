@@ -2,7 +2,7 @@
 //! selection, upload ordering and failure feedback. Filesystem mechanics stay
 //! behind [`LocalFiles`]; transport stays behind [`Messenger`].
 use crate::{
-    diagnostics,
+    diagnostics::{self, Diagnostics},
     messaging::{DeliveryError, DeliveryFuture, Messenger, ResourceKind, ResourceRef},
     runtime::limits,
 };
@@ -164,6 +164,7 @@ const ARTIFACTS_PER_TASK: usize = 10;
 
 /// The application delivery strategy over local primitives and a transport.
 pub struct Deliveries {
+    diagnostics: Diagnostics,
     local: Arc<dyn LocalFiles>,
     messenger: Arc<dyn Messenger>,
     fetcher: Arc<dyn ResourceFetcher>,
@@ -179,11 +180,13 @@ fn io_error(_: impl std::fmt::Debug) -> DeliveryError {
 
 impl Deliveries {
     pub fn new(
+        diagnostics: Diagnostics,
         local: Arc<dyn LocalFiles>,
         messenger: Arc<dyn Messenger>,
         fetcher: Arc<dyn ResourceFetcher>,
     ) -> Self {
         Self {
+            diagnostics,
             local,
             messenger,
             fetcher,
@@ -480,7 +483,7 @@ impl TaskFiles for Deliveries {
                     .await,
                     Ok(Ok(()))
                 );
-                diagnostics::emit(
+                self.diagnostics.emit(
                     diagnostics::Event::ArtifactSent,
                     if ok {
                         diagnostics::Status::Ok

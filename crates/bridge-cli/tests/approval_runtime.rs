@@ -123,6 +123,7 @@ impl Harness {
                 sandbox: bridge_app::ports::Sandbox::WorkspaceWrite,
                 epoch: 71,
             },
+            bridge_app::diagnostics::Diagnostics::noop(),
             Arc::new(bridge_codex::backend::CodexBackend::new(
                 connection.client.clone(),
             )),

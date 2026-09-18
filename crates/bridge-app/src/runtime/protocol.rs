@@ -24,7 +24,7 @@ impl Runtime {
             }
             Incoming::Request { mut request, reply } => {
                 if let RequestKind::Questions { questions, .. } = &request.kind {
-                    crate::diagnostics::emit(
+                    self.diagnostics.emit(
                         crate::diagnostics::Event::QuestionReceived,
                         crate::diagnostics::Status::Ok,
                         self.active.as_ref().map(|active| active.spec.id.as_str()),
@@ -267,6 +267,7 @@ impl Runtime {
                     }
                     for item in early {
                         if let Some(offer) = super::flow::event(
+                            &self.diagnostics,
                             &mut self.active,
                             &mut self.scheduler,
                             &self.delivery,
@@ -294,6 +295,7 @@ impl Runtime {
         };
         if let Some(notification) = early {
             if let Some(offer) = super::flow::event(
+                &self.diagnostics,
                 &mut self.active,
                 &mut self.scheduler,
                 &self.delivery,

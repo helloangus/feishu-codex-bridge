@@ -106,6 +106,7 @@ fn heartbeat_fresh(running: bool, snapshot: Option<&Snapshot>, at: u64) -> Optio
 pub async fn heartbeat(
     health: std::sync::Arc<std::sync::Mutex<Health>>,
     cancel: tokio_util::sync::CancellationToken,
+    diagnostics: bridge_app::diagnostics::Diagnostics,
 ) -> io::Result<()> {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -120,7 +121,12 @@ pub async fn heartbeat(
             .map_err(|_| io::Error::other("health lock poisoned"))
             .and_then(|mut health| health.pulse());
         if let Err(error) = result {
-            eprintln!("{{\"event\":\"health_write_failed\"}}");
+            diagnostics.emit(
+                bridge_app::diagnostics::Event::HealthWriteFailed,
+                bridge_app::diagnostics::Status::Failed,
+                None,
+                0,
+            );
             cancel.cancel();
             return Err(error);
         }
@@ -381,11 +387,24 @@ mod tests {
         let before = fs::read(&path)?;
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        heartbeat(health.clone(), cancel).await?;
+        heartbeat(
+            health.clone(),
+            cancel,
+            bridge_app::diagnostics::Diagnostics::noop(),
+        )
+        .await?;
         assert_eq!(fs::read(path)?, before);
         fs::create_dir(tmp.path().join("runtime/health.pending"))?;
         let cancel = tokio_util::sync::CancellationToken::new();
-        assert!(heartbeat(health, cancel.clone()).await.is_err());
+        assert!(
+            heartbeat(
+                health,
+                cancel.clone(),
+                bridge_app::diagnostics::Diagnostics::noop(),
+            )
+            .await
+            .is_err()
+        );
         assert!(cancel.is_cancelled());
         Ok(())
     }

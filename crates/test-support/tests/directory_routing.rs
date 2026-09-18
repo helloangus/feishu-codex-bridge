@@ -60,6 +60,7 @@ async fn runtime_scenario(fail_directory_save: bool) -> Result<(), Box<dyn Error
                 },
                 store.clone(),
                 messenger.clone(),
+                bridge_app::diagnostics::Diagnostics::noop(),
             )
             .await?;
             if round == 0 {

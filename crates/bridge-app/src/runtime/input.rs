@@ -186,7 +186,15 @@ impl Runtime {
                         generation: *self.card_generations.get(&input.user).unwrap_or(&0),
                         stop_snapshot: self.card_snapshot(),
                     };
-                    send_panel(None, jobs, self.messenger.clone(), owner, panel, commands);
+                    send_panel(
+                        &self.diagnostics,
+                        None,
+                        jobs,
+                        self.messenger.clone(),
+                        owner,
+                        panel,
+                        commands,
+                    );
                 }
             }
             (input.accept)(true);
@@ -619,7 +627,7 @@ impl Runtime {
                 tell(&self.delivery, &input.chat, "答案已记录。")?;
                 if complete {
                     if let Some(pending) = finished {
-                        spawn_reply(jobs, pending, false)?;
+                        spawn_reply(&self.diagnostics, jobs, pending, false)?;
                     }
                 }
             }
@@ -673,7 +681,7 @@ impl Runtime {
                 }
                 if complete {
                     if let Some(pending) = finished {
-                        spawn_reply(jobs, pending, false)?;
+                        spawn_reply(&self.diagnostics, jobs, pending, false)?;
                     }
                 }
             }
@@ -741,7 +749,7 @@ impl Runtime {
                     self.card_views
                         .note(source, "审批选择已接收，回传结果请查看单独回复。");
                 }
-                spawn_reply(jobs, pending, allow)?;
+                spawn_reply(&self.diagnostics, jobs, pending, allow)?;
             }
             None => {
                 tell(
