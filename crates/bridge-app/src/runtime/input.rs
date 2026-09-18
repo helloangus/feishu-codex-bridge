@@ -465,7 +465,7 @@ impl Runtime {
             && matches!(parts[2], "implement" | "fresh" | "stay")
             && approval_source.is_some()
             && self.plan_offer.as_ref().is_some_and(|offer| {
-                offer.token == parts[1]
+                offer.token.as_str() == parts[1]
                     && offer.task.session.user == input.user
                     && offer.task.chat == input.chat
                     && offer.task.session.workspace == current
@@ -516,7 +516,7 @@ impl Runtime {
             None
         } else {
             Some(TaskSpec {
-                id: format!("{}:{}", self.settings.epoch, self.next_task),
+                id: bridge_core::task::TaskId::new(self.settings.epoch, self.next_task),
                 session: offer.task.session.clone(),
                 chat: input.chat.clone(),
                 prompt: format!("请实施以下已确认的计划：\n\n{}", offer.text),
@@ -608,7 +608,7 @@ impl Runtime {
             if let Some(index) = index {
                 let active = self.active.as_ref();
                 outcome = self.approvals.answer_text(
-                    &token,
+                    &crate::cards::CardToken::new(&token),
                     Claim {
                         user: &input.user,
                         chat: &input.chat,
@@ -657,7 +657,7 @@ impl Runtime {
             if let Some(source) = &approval_source {
                 let active = self.active.as_ref();
                 outcome = self.approvals.answer_choice(
-                    parts[1],
+                    &crate::cards::CardToken::new(parts[1]),
                     Claim {
                         user: &input.user,
                         chat: &input.chat,
@@ -673,7 +673,8 @@ impl Runtime {
         }
         match outcome {
             Choice::Recorded { complete, finished } => {
-                self.card_actions.invalidate_approval(parts[1]);
+                self.card_actions
+                    .invalidate_approval(&crate::cards::CardToken::new(parts[1]));
                 // The click source equals the entry source whenever the
                 // recording was accepted, so the note uses the click.
                 if let Some(source) = &approval_source {
@@ -686,14 +687,15 @@ impl Runtime {
                 }
             }
             Choice::WaitingText => {
-                self.card_actions.invalidate_approval(parts[1]);
+                self.card_actions
+                    .invalidate_approval(&crate::cards::CardToken::new(parts[1]));
                 if let Some(source) = &approval_source {
                     self.card_views
                         .note(source, "已进入自行回答，请按单独提示发送答案。");
                 }
                 let question = self
                     .approvals
-                    .get(parts[1])
+                    .get(&crate::cards::CardToken::new(parts[1]))
                     .map(|pending| pending.question)
                     .unwrap_or_default();
                 tell(
@@ -731,7 +733,7 @@ impl Runtime {
         let active = self.active.as_ref();
         let pending = approval_source.as_deref().and_then(|source| {
             self.approvals.approve(
-                token,
+                &crate::cards::CardToken::new(token),
                 Claim {
                     user: &input.user,
                     chat: &input.chat,
@@ -744,7 +746,8 @@ impl Runtime {
         });
         match pending {
             Some(pending) => {
-                self.card_actions.invalidate_approval(token);
+                self.card_actions
+                    .invalidate_approval(&crate::cards::CardToken::new(token));
                 if let Some(source) = &pending.source {
                     self.card_views
                         .note(source, "审批选择已接收，回传结果请查看单独回复。");
@@ -1058,7 +1061,7 @@ impl Runtime {
             .checked_add(1)
             .ok_or("任务标识耗尽".to_owned())?;
         let spec = TaskSpec {
-            id: format!("{}:{}", self.settings.epoch, self.next_task),
+            id: bridge_core::task::TaskId::new(self.settings.epoch, self.next_task),
             session,
             chat: input.chat.clone(),
             prompt: text,

@@ -77,7 +77,7 @@ async fn scenario(
             Ok::<_, Box<dyn Error + Send + Sync>>(methods)
         });
         let task = TaskSpec {
-            id: "task".into(),
+            id: bridge_core::task::TaskId::new(1, 1),
             session: SessionKey::new("user", "/tmp/project"),
             chat: "chat".into(),
             prompt: "test".into(),

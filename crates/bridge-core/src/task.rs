@@ -1,10 +1,31 @@
 //! Explicit task lifecycle; delivery failure never rewrites execution outcome.
 use crate::{ExecutionMode, SessionKey};
+use std::fmt;
 use thiserror::Error;
+
+/// Opaque per-run task identifier of the form `{epoch}:{counter}`. A dedicated
+/// type keeps task ids, thread ids and card tokens apart at every boundary.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskId(String);
+
+impl TaskId {
+    pub fn new(epoch: u64, counter: u64) -> Self {
+        Self(format!("{epoch}:{counter}"))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
-    pub id: String,
+    pub id: TaskId,
     pub session: SessionKey,
     pub chat: String,
     pub prompt: String,

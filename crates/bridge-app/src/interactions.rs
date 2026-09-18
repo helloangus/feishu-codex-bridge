@@ -21,7 +21,7 @@ pub struct Pending {
     pub question: usize,
     pub request: AgentRequest,
     pub reply: Box<dyn ReplyHandle>,
-    pub task: String,
+    pub task: bridge_core::task::TaskId,
     pub owner: Owner,
     pub deadline: Instant,
     /// True once the current question or approval card has been dispatched.
@@ -108,7 +108,7 @@ pub struct Claim<'a> {
 
 #[derive(Default)]
 pub struct Interactions {
-    entries: BTreeMap<String, Pending>,
+    entries: BTreeMap<crate::cards::CardToken, Pending>,
 }
 
 impl Interactions {
@@ -118,22 +118,22 @@ impl Interactions {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn contains(&self, token: &str) -> bool {
+    pub fn contains(&self, token: &crate::cards::CardToken) -> bool {
         self.entries.contains_key(token)
     }
-    pub fn get(&self, token: &str) -> Option<&Pending> {
+    pub fn get(&self, token: &crate::cards::CardToken) -> Option<&Pending> {
         self.entries.get(token)
     }
-    pub fn get_mut(&mut self, token: &str) -> Option<&mut Pending> {
+    pub fn get_mut(&mut self, token: &crate::cards::CardToken) -> Option<&mut Pending> {
         self.entries.get_mut(token)
     }
-    pub fn remove(&mut self, token: &str) -> Option<Pending> {
+    pub fn remove(&mut self, token: &crate::cards::CardToken) -> Option<Pending> {
         self.entries.remove(token)
     }
     /// Registration is bounded and refuses a second open request for the same
     /// turn item; duplicates are ambiguous and revoke what came before.
-    pub fn insert(&mut self, token: String, pending: Pending) -> bool {
-        if token.is_empty()
+    pub fn insert(&mut self, token: crate::cards::CardToken, pending: Pending) -> bool {
+        if token.as_str().is_empty()
             || self.entries.len() >= limits::INTERACTIONS
             || self.entries.contains_key(&token)
         {
@@ -165,7 +165,11 @@ impl Interactions {
     /// Tokens whose deadline passed or whose owning task is no longer alive.
     /// Expired entries stay registered until `expire` removes them so their
     /// required denial is sent exactly once.
-    pub fn stale_tokens(&self, now: Instant, alive: impl Fn(&Pending) -> bool) -> Vec<String> {
+    pub fn stale_tokens(
+        &self,
+        now: Instant,
+        alive: impl Fn(&Pending) -> bool,
+    ) -> Vec<crate::cards::CardToken> {
         self.entries
             .iter()
             .filter(|(_, pending)| now >= pending.deadline || !alive(pending))
@@ -173,7 +177,7 @@ impl Interactions {
             .collect()
     }
     /// Tokens whose card still needs to be sent for a live turn.
-    pub fn unsent_tokens(&self, valid: impl Fn(&Pending) -> bool) -> Vec<String> {
+    pub fn unsent_tokens(&self, valid: impl Fn(&Pending) -> bool) -> Vec<crate::cards::CardToken> {
         self.entries
             .iter()
             .filter(|(_, pending)| !pending.card_dispatched && valid(pending))
@@ -185,7 +189,7 @@ impl Interactions {
     /// removed and returned so the caller can submit the answers.
     pub fn answer_text(
         &mut self,
-        token: &str,
+        token: &crate::cards::CardToken,
         claim: Claim<'_>,
         index: usize,
         answer: &str,
@@ -230,7 +234,7 @@ impl Interactions {
     /// text mode; anything else must name a valid option index.
     pub fn answer_choice(
         &mut self,
-        token: &str,
+        token: &crate::cards::CardToken,
         claim: Claim<'_>,
         source: &str,
         index: usize,
@@ -285,7 +289,7 @@ impl Interactions {
     /// entry last delivered; the entry is removed before the async write.
     pub fn approve(
         &mut self,
-        token: &str,
+        token: &crate::cards::CardToken,
         claim: Claim<'_>,
         source: &str,
         turn_live: impl Fn(&Pending) -> bool,
@@ -303,7 +307,7 @@ impl Interactions {
     /// Remove and return every entry whose deadline has passed; the caller
     /// turns each into the required denial.
     pub fn expire(&mut self, now: Instant) -> Vec<Pending> {
-        let tokens: Vec<String> = self
+        let tokens: Vec<crate::cards::CardToken> = self
             .entries
             .iter()
             .filter(|(_, pending)| now >= pending.deadline)
@@ -315,7 +319,7 @@ impl Interactions {
     pub fn drain(&mut self) -> Vec<Pending> {
         self.remove_all(self.entries.keys().cloned().collect())
     }
-    fn remove_all(&mut self, tokens: Vec<String>) -> Vec<Pending> {
+    fn remove_all(&mut self, tokens: Vec<crate::cards::CardToken>) -> Vec<Pending> {
         tokens
             .into_iter()
             .filter_map(|token| self.entries.remove(&token))
@@ -367,7 +371,7 @@ pub async fn deliver_reply(
             } else {
                 crate::diagnostics::Status::Failed
             },
-            Some(&pending.task),
+            Some(pending.task.as_str()),
             0,
         );
     }
@@ -383,6 +387,7 @@ pub async fn deliver_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cards::CardToken;
     use crate::requests::{Approval, ApprovalKind, Question};
     use std::sync::{Arc, Mutex};
 
@@ -416,10 +421,10 @@ mod tests {
             stop_snapshot: (0, None),
         }
     }
-    fn task() -> String {
-        "task".into()
+    fn task() -> bridge_core::task::TaskId {
+        bridge_core::task::TaskId::new(7, 1)
     }
-    fn approval_request(token: &str) -> AgentRequest {
+    fn approval_request(token: &CardToken) -> AgentRequest {
         AgentRequest {
             turn: TurnRef {
                 epoch: 1,
@@ -440,7 +445,7 @@ mod tests {
             }),
         }
     }
-    fn question_request(token: &str) -> AgentRequest {
+    fn question_request(token: &CardToken) -> AgentRequest {
         AgentRequest {
             turn: TurnRef {
                 epoch: 1,
@@ -480,11 +485,11 @@ mod tests {
 
     fn insert_approval(
         registry: &mut Interactions,
-        token: &str,
+        token: &CardToken,
         handle: Box<dyn ReplyHandle>,
     ) -> bool {
         registry.insert(
-            token.into(),
+            token.clone(),
             Pending {
                 waiting_text: false,
                 answers: BTreeMap::new(),
@@ -499,9 +504,13 @@ mod tests {
             },
         )
     }
-    fn insert_questions(registry: &mut Interactions, token: &str, handle: Box<dyn ReplyHandle>) {
+    fn insert_questions(
+        registry: &mut Interactions,
+        token: &CardToken,
+        handle: Box<dyn ReplyHandle>,
+    ) {
         assert!(registry.insert(
-            token.into(),
+            token.clone(),
             Pending {
                 waiting_text: false,
                 answers: BTreeMap::new(),
@@ -523,24 +532,28 @@ mod tests {
         for index in 0..32 {
             assert!(insert_approval(
                 &mut registry,
-                &format!("t{index}"),
+                &CardToken::new(format!("t{index}")),
                 Box::new(Handle(Arc::new(Mutex::new(Vec::new()))))
             ));
         }
         assert!(!insert_approval(
             &mut registry,
-            "extra",
+            &CardToken::new("extra"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new()))))
         ));
         let mut duplicate = Interactions::default();
         let handle = || Box::new(Handle(Arc::new(Mutex::new(Vec::new())))) as Box<dyn ReplyHandle>;
-        assert!(insert_approval(&mut duplicate, "first", handle()));
+        assert!(insert_approval(
+            &mut duplicate,
+            &CardToken::new("first"),
+            handle()
+        ));
         // The second registration reuses the first request's turn and item.
         let mut second = Pending {
             waiting_text: false,
             answers: BTreeMap::new(),
             question: 0,
-            request: approval_request("first"),
+            request: approval_request(&CardToken::new("first")),
             reply: handle(),
             task: task(),
             owner: owner(),
@@ -549,7 +562,7 @@ mod tests {
             source: Some("card".into()),
         };
         second.request.turn.thread_id = "thread".into();
-        assert!(!duplicate.insert("second".into(), second));
+        assert!(!duplicate.insert(CardToken::new("second"), second));
         assert!(!duplicate.item_is_open(
             &TurnRef {
                 epoch: 9,
@@ -564,12 +577,16 @@ mod tests {
     fn foreign_owners_and_unknown_sources_never_consume() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let mut registry = Interactions::default();
-        insert_approval(&mut registry, "token", Box::new(Handle(recorded.clone())));
+        insert_approval(
+            &mut registry,
+            &CardToken::new("token"),
+            Box::new(Handle(recorded.clone())),
+        );
         let directory = std::path::Path::new("/workspace");
         assert!(
             registry
                 .approve(
-                    "token",
+                    &CardToken::new("token"),
                     Claim {
                         user: "other",
                         chat: "chat",
@@ -584,7 +601,7 @@ mod tests {
         assert!(
             registry
                 .approve(
-                    "token",
+                    &CardToken::new("token"),
                     Claim {
                         user: "user",
                         chat: "elsewhere",
@@ -599,7 +616,7 @@ mod tests {
         assert!(
             registry
                 .approve(
-                    "token",
+                    &CardToken::new("token"),
                     Claim {
                         user: "user",
                         chat: "chat",
@@ -614,7 +631,7 @@ mod tests {
         assert!(
             registry
                 .approve(
-                    "token",
+                    &CardToken::new("token"),
                     Claim {
                         user: "user",
                         chat: "chat",
@@ -629,13 +646,13 @@ mod tests {
         // A questions entry is never consumable through the approval path.
         insert_questions(
             &mut registry,
-            "questions",
+            &CardToken::new("questions"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new())))),
         );
         assert!(
             registry
                 .approve(
-                    "questions",
+                    &CardToken::new("questions"),
                     Claim {
                         user: "user",
                         chat: "chat",
@@ -656,7 +673,7 @@ mod tests {
         let mut registry = Interactions::default();
         insert_approval(
             &mut registry,
-            "token",
+            &CardToken::new("token"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new())))),
         );
         let directory = std::path::Path::new("/workspace");
@@ -667,13 +684,13 @@ mod tests {
             now: now(),
         };
         let pending = registry
-            .approve("token", claim(), "card", |_| true)
+            .approve(&CardToken::new("token"), claim(), "card", |_| true)
             .ok_or("approval must be consumable")?;
         assert!(registry.is_empty());
         // The second attempt has nothing to consume.
         assert!(
             registry
-                .approve("token", claim(), "card", |_| true)
+                .approve(&CardToken::new("token"), claim(), "card", |_| true)
                 .is_none()
         );
         drop(pending);
@@ -684,8 +701,12 @@ mod tests {
     async fn uncertain_reply_is_reported_and_incomplete_answers_are_never_submitted()
     -> Result<(), BoxError> {
         let mut registry = Interactions::default();
-        insert_questions(&mut registry, "token", Box::new(FailingHandle));
-        let mut pending = registry.remove("token").ok_or("entry")?;
+        insert_questions(
+            &mut registry,
+            &CardToken::new("token"),
+            Box::new(FailingHandle),
+        );
+        let mut pending = registry.remove(&CardToken::new("token")).ok_or("entry")?;
         pending.answers.insert("q1".into(), vec!["first".into()]);
         pending.answers.insert("q2".into(), vec!["second".into()]);
         let outcome = deliver_reply(&crate::diagnostics::Diagnostics::noop(), pending, false).await;
@@ -693,8 +714,15 @@ mod tests {
         assert!(outcome.submitted);
         // An expired questions group drops the handle without any write.
         let mut expired = Interactions::default();
-        insert_questions(&mut expired, "token", Box::new(FailingHandle));
-        expired.get_mut("token").ok_or("entry")?.deadline = now();
+        insert_questions(
+            &mut expired,
+            &CardToken::new("token"),
+            Box::new(FailingHandle),
+        );
+        expired
+            .get_mut(&CardToken::new("token"))
+            .ok_or("entry")?
+            .deadline = now();
         // Expired entries stay registered until expire() removes them once.
         let pending = expired
             .expire(now())
@@ -713,7 +741,7 @@ mod tests {
         let mut registry = Interactions::default();
         insert_questions(
             &mut registry,
-            "token",
+            &CardToken::new("token"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new())))),
         );
         let directory = std::path::Path::new("/workspace");
@@ -725,31 +753,50 @@ mod tests {
         };
         // Buttons only work after the card source has been delivered.
         assert!(matches!(
-            registry.answer_choice("token", claim(), "card", 0, "0", |_| true),
+            registry.answer_choice(&CardToken::new("token"), claim(), "card", 0, "0", |_| true),
             Choice::Invalid
         ));
-        registry.get_mut("token").ok_or("entry")?.source = Some("card".into());
+        registry
+            .get_mut(&CardToken::new("token"))
+            .ok_or("entry")?
+            .source = Some("card".into());
         assert!(matches!(
-            registry.answer_choice("token", claim(), "card", 1, "0", |_| true),
+            registry.answer_choice(&CardToken::new("token"), claim(), "card", 1, "0", |_| true),
             Choice::Invalid
         ));
         // "other" without options waits for text.
         assert!(matches!(
-            registry.answer_choice("token", claim(), "card", 0, "other", |_| true),
+            registry.answer_choice(
+                &CardToken::new("token"),
+                claim(),
+                "card",
+                0,
+                "other",
+                |_| true
+            ),
             Choice::WaitingText
         ));
         // The first question has no options; a choice index cannot record.
         assert!(matches!(
-            registry.answer_choice("token", claim(), "card", 0, "0", |_| true),
+            registry.answer_choice(&CardToken::new("token"), claim(), "card", 0, "0", |_| true),
             Choice::Invalid
         ));
         // Text answers only apply to the waiting question.
         assert!(matches!(
-            registry.answer_text("token", claim(), 1, "late", false, |_| true),
+            registry.answer_text(&CardToken::new("token"), claim(), 1, "late", false, |_| {
+                true
+            }),
             TextOutcome::Invalid
         ));
         assert!(matches!(
-            registry.answer_text("token", claim(), 0, "first answer", false, |_| true),
+            registry.answer_text(
+                &CardToken::new("token"),
+                claim(),
+                0,
+                "first answer",
+                false,
+                |_| true
+            ),
             TextOutcome::Recorded {
                 complete: false,
                 finished: None
@@ -757,13 +804,30 @@ mod tests {
         ));
         // The next question re-enters text mode through its own card click;
         // the re-delivered card installs a fresh source first.
-        registry.get_mut("token").ok_or("entry")?.source = Some("card".into());
+        registry
+            .get_mut(&CardToken::new("token"))
+            .ok_or("entry")?
+            .source = Some("card".into());
         assert!(matches!(
-            registry.answer_choice("token", claim(), "card", 1, "other", |_| true),
+            registry.answer_choice(
+                &CardToken::new("token"),
+                claim(),
+                "card",
+                1,
+                "other",
+                |_| true
+            ),
             Choice::WaitingText
         ));
         assert!(matches!(
-            registry.answer_text("token", claim(), 1, "second answer", false, |_| true),
+            registry.answer_text(
+                &CardToken::new("token"),
+                claim(),
+                1,
+                "second answer",
+                false,
+                |_| true
+            ),
             TextOutcome::Recorded {
                 complete: true,
                 finished: Some(_)
@@ -778,11 +842,11 @@ mod tests {
         let mut registry = Interactions::default();
         insert_approval(
             &mut registry,
-            "token",
+            &CardToken::new("token"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new())))),
         );
         let stale = registry.stale_tokens(now(), |_| false);
-        assert_eq!(stale, vec!["token".to_owned()]);
+        assert_eq!(stale, vec![CardToken::new("token")]);
         assert!(registry.stale_tokens(now(), live()).is_empty());
         let removed = registry.expire(now() + std::time::Duration::from_secs(601));
         assert_eq!(removed.len(), 1);
@@ -795,7 +859,7 @@ mod tests {
         let mut registry = Interactions::default();
         insert_approval(
             &mut registry,
-            "token",
+            &CardToken::new("token"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new())))),
         );
         registry.expire_turn(
@@ -817,12 +881,12 @@ mod tests {
         let mut registry = Interactions::default();
         insert_approval(
             &mut registry,
-            "token",
+            &CardToken::new("token"),
             Box::new(Handle(Arc::new(Mutex::new(Vec::new())))),
         );
         assert_eq!(
             registry.stale_tokens(now(), |_| false),
-            vec!["token".to_owned()]
+            vec![CardToken::new("token")]
         );
         assert_eq!(registry.len(), 1);
         assert!(registry.stale_tokens(now(), live()).is_empty());

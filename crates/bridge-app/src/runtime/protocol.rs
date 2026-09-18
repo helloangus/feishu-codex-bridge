@@ -103,8 +103,10 @@ impl Runtime {
                                 .next_approval
                                 .checked_add(1)
                                 .ok_or("审批编号耗尽".to_owned())?;
-                            let token =
-                                format!("approval-{}-{}", self.settings.epoch, self.next_approval);
+                            let token = crate::cards::CardToken::new(format!(
+                                "approval-{}-{}",
+                                self.settings.epoch, self.next_approval
+                            ));
                             let owner = crate::cards::Owner {
                                 user: self
                                     .active

@@ -24,7 +24,10 @@ pub fn decode_card_click(source: String, action: &Value) -> Option<Click> {
         bridge_core::view::ButtonAction::Interaction { token, choice }
             if choice == "run" && !source.is_empty() =>
         {
-            Some(Click { token, source })
+            Some(Click {
+                token: bridge_app::cards::CardToken::new(token),
+                source,
+            })
         }
         _ => None,
     }

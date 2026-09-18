@@ -3,6 +3,7 @@ use super::flow::{can_spawn, spawn_reply, tell};
 use super::limits;
 use crate::{
     Scheduler,
+    cards::CardToken,
     diagnostics::Diagnostics,
     directories::{Confirmations, DirectoryStore},
     execution::Execution,
@@ -14,7 +15,10 @@ use crate::{
     requests::RequestKind,
     sessions::{self, DurableJournal, SessionStore},
 };
-use bridge_core::{task::TaskSpec, view::Panel};
+use bridge_core::{
+    task::{TaskId, TaskSpec},
+    view::Panel,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
@@ -88,7 +92,7 @@ pub(crate) struct PanelRefresh {
     pub(crate) source: String,
     pub(crate) owner: crate::cards::Owner,
     pub(crate) panel: Panel,
-    pub(crate) commands: Vec<(String, String)>,
+    pub(crate) commands: Vec<(CardToken, String)>,
 }
 
 pub(crate) enum ListedContent {
@@ -114,9 +118,9 @@ pub(crate) enum Done {
     },
     FilesDelivered,
     ApprovalSent {
-        token: String,
+        token: CardToken,
         panel: Panel,
-        commands: Vec<(String, String)>,
+        commands: Vec<(CardToken, String)>,
         result: Result<MessageId, DeliveryError>,
     },
     ApprovalReplied {
@@ -126,7 +130,7 @@ pub(crate) enum Done {
     PanelSent {
         refreshed: bool,
         panel: Panel,
-        entries: Vec<(String, crate::cards::Action)>,
+        entries: Vec<(CardToken, crate::cards::Action)>,
         result: Result<MessageId, DeliveryError>,
     },
     DirectoryProposed {
@@ -167,11 +171,11 @@ pub(crate) enum Done {
         result: Result<bool, ()>,
     },
     CompactPrepared {
-        id: String,
+        id: TaskId,
         result: Result<String, sessions::StartError>,
     },
     CompactSubmitted {
-        id: String,
+        id: TaskId,
         result: Result<(), crate::ports::BackendError>,
     },
     PreferenceClaim {
@@ -202,7 +206,7 @@ pub(crate) enum Done {
         user: String,
         directory: PathBuf,
         generation: u64,
-        stop_snapshot: (u64, Option<String>),
+        stop_snapshot: (u64, Option<TaskId>),
         result: Result<ListedContent, sessions::StartError>,
     },
     Reset {
@@ -215,11 +219,11 @@ pub(crate) enum Done {
         result: Result<bool, ()>,
     },
     Prepared {
-        id: String,
+        id: TaskId,
         result: Result<crate::ports::TurnInput, String>,
     },
     Started {
-        id: String,
+        id: TaskId,
         result: Result<TurnRef, crate::ports::BackendError>,
     },
     Control {
@@ -241,7 +245,7 @@ pub(crate) struct Runtime {
     pub(crate) scheduler: Scheduler,
     pub(crate) active: Option<Active>,
     pub(crate) next_task: u64,
-    pub(crate) resources: BTreeMap<String, Vec<Attachment>>,
+    pub(crate) resources: BTreeMap<TaskId, Vec<Attachment>>,
     pub(crate) files: FileDelivery,
     pub(crate) plan_offer: Option<crate::plans::Offer>,
     pub(crate) seen_commands: BTreeMap<String, Instant>,
@@ -333,7 +337,7 @@ impl Runtime {
     }
 
     /// The snapshot card actions compare themselves against.
-    pub(crate) fn card_snapshot(&self) -> (u64, Option<String>) {
+    pub(crate) fn card_snapshot(&self) -> (u64, Option<TaskId>) {
         (
             self.next_task,
             self.active.as_ref().map(|active| active.spec.id.clone()),
@@ -368,9 +372,9 @@ impl Runtime {
             self.plan_offer = None;
         }
         self.card_actions
-            .retain_plan(self.plan_offer.as_ref().map(|offer| offer.token.as_str()));
+            .retain_plan(self.plan_offer.as_ref().map(|offer| &offer.token));
         self.resources
-            .retain(|id: &String, _| self.scheduler.has_task(id));
+            .retain(|id: &TaskId, _| self.scheduler.has_task(id));
         let live_keys: std::collections::BTreeSet<(u64, String, String, String)> = self
             .file_changes
             .keys()
@@ -540,7 +544,11 @@ impl Runtime {
         jobs.spawn(async move {
             let result = timeout(
                 limits::FILE_FINISH_TIMEOUT,
-                task_files.finish_files(spec.id.clone(), spec.chat.clone(), spec.session.workspace),
+                task_files.finish_files(
+                    spec.id.as_str().to_owned(),
+                    spec.chat.clone(),
+                    spec.session.workspace,
+                ),
             )
             .await;
             diagnostics.emit(
@@ -550,7 +558,7 @@ impl Runtime {
                 } else {
                     crate::diagnostics::Status::Failed
                 },
-                Some(&spec.id),
+                Some(spec.id.as_str()),
                 0,
             );
             if !matches!(result, Ok(Ok(()))) {
@@ -669,7 +677,7 @@ impl Runtime {
                 let prepared = timeout(
                     limits::FILE_PREPARE_TIMEOUT,
                     task_files.prepare_files(
-                        spec.id.clone(),
+                        spec.id.as_str().to_owned(),
                         spec.session.workspace.clone(),
                         attachments,
                     ),
@@ -682,7 +690,7 @@ impl Runtime {
                     } else {
                         crate::diagnostics::Status::Failed
                     },
-                    Some(&spec.id),
+                    Some(spec.id.as_str()),
                     count,
                 );
                 let files = prepared
@@ -701,7 +709,7 @@ impl Runtime {
                 turn.images = files.images;
                 timeout(
                     limits::FILE_BIND_TIMEOUT,
-                    task_files.bind_files(spec.id.clone(), turn.thread_id.clone()),
+                    task_files.bind_files(spec.id.as_str().to_owned(), turn.thread_id.clone()),
                 )
                 .await
                 .map_err(|_| "生成图片快照超时".to_owned())?

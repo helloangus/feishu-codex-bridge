@@ -176,7 +176,7 @@ pub async fn run(
         let _ = state
             .delivery
             .try_send(crate::presentation::Request::Answer {
-                task: active.spec.id,
+                task: active.spec.id.as_str().to_owned(),
                 chat: active.spec.chat,
                 text: "桥接已停止；未完成任务不会自动重跑。".into(),
             });

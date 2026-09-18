@@ -63,7 +63,7 @@ pub(crate) fn send_panel(
     messenger: Arc<dyn Messenger>,
     owner: crate::cards::Owner,
     panel: Panel,
-    commands: Vec<(String, String)>,
+    commands: Vec<(crate::cards::CardToken, String)>,
 ) -> bool {
     if !can_spawn(jobs, false) {
         return false;
@@ -181,7 +181,7 @@ pub(crate) fn finish(
             } else {
                 crate::diagnostics::Status::Failed
             },
-            Some(&active.spec.id),
+            Some(active.spec.id.as_str()),
             active.output.len(),
         );
         if active.is_compact() {
@@ -201,7 +201,7 @@ pub(crate) fn finish(
         };
         delivery
             .try_send(DeliveryRequest::Answer {
-                task: active.spec.id,
+                task: active.spec.id.as_str().to_owned(),
                 chat: active.spec.chat,
                 text: format!(
                     "{outcome}\n\n{output}{}",
@@ -245,7 +245,7 @@ pub(crate) fn event(
                     task: active.spec.clone(),
                     thread: active.turn.as_ref()?.thread_id.clone(),
                     text: text.clone(),
-                    token: format!("plan-{}", active.spec.id),
+                    token: crate::cards::CardToken::new(format!("plan-{}", active.spec.id)),
                     sent: false,
                     deadline: Instant::now() + limits::INTERACTION_TIMEOUT,
                 })
@@ -352,7 +352,7 @@ mod tests {
                 thread: Some(turn.thread_id.clone()),
             },
             spec: TaskSpec {
-                id: "request".into(),
+                id: bridge_core::task::TaskId::new(1, 1),
                 session: SessionKey::new("user", "/project"),
                 chat: "chat".into(),
                 prompt: String::new(),

@@ -45,7 +45,7 @@ impl Runtime {
                     if self
                         .delivery
                         .try_send(DeliveryRequest::Progress {
-                            task: active.spec.id.clone(),
+                            task: active.spec.id.as_str().to_owned(),
                             chat: active.spec.chat.clone(),
                             text,
                         })

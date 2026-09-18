@@ -5,6 +5,7 @@ use super::flow::{can_spawn, send_panel, spawn_interrupt, spawn_reply, tell};
 use super::limits;
 use super::state::{Active, ActiveKind, Done, FileDelivery, ListedContent, PanelRefresh, Runtime};
 use crate::{execution::Execution, ports::BackendError, sessions};
+use bridge_core::task::TaskId;
 use bridge_core::{ExecutionMode, task::TaskSpec};
 use std::path::PathBuf;
 use tokio::{task::JoinSet, time::Instant};
@@ -456,7 +457,11 @@ impl Runtime {
             } => match result {
                 Ok(true) => {
                     (input.accept)(true);
-                    let id = input.id;
+                    self.next_task = self
+                        .next_task
+                        .checked_add(1)
+                        .ok_or("任务标识耗尽".to_owned())?;
+                    let id = bridge_core::task::TaskId::new(self.settings.epoch, self.next_task);
                     let chat = input.chat.clone();
                     self.active = Some(Active {
                         kind: ActiveKind::Compact {
@@ -886,7 +891,7 @@ impl Runtime {
                     } else {
                         crate::diagnostics::Status::Failed
                     },
-                    Some(&id),
+                    Some(id.as_str()),
                     0,
                 );
                 if !can_spawn(jobs, false)
@@ -951,7 +956,7 @@ impl Runtime {
                     } else {
                         crate::diagnostics::Status::Failed
                     },
-                    Some(&id),
+                    Some(id.as_str()),
                     0,
                 );
                 let starting = self.active.as_mut().filter(|active| active.spec.id == id);
@@ -1011,8 +1016,11 @@ impl Runtime {
         user: String,
         directory: PathBuf,
         generation: u64,
-        stop_snapshot: (u64, Option<String>),
-        built: (bridge_core::view::Panel, Vec<(String, String)>),
+        stop_snapshot: (u64, Option<TaskId>),
+        built: (
+            bridge_core::view::Panel,
+            Vec<(crate::cards::CardToken, String)>,
+        ),
     ) -> Result<(), String> {
         self.next_panel = self
             .next_panel

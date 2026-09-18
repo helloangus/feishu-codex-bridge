@@ -5,12 +5,18 @@ pub struct Offer {
     pub task: TaskSpec,
     pub thread: String,
     pub text: String,
-    pub token: String,
+    pub token: crate::cards::CardToken,
     pub sent: bool,
     pub deadline: tokio::time::Instant,
 }
 
-pub fn panel(offer: &Offer, prefix: &str) -> (bridge_core::view::Panel, Vec<(String, String)>) {
+pub fn panel(
+    offer: &Offer,
+    prefix: &str,
+) -> (
+    bridge_core::view::Panel,
+    Vec<(crate::cards::CardToken, String)>,
+) {
     crate::cards::panel(
         "Plan 已完成，请确认下一步",
         format!(
