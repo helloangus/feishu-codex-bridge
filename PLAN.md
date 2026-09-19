@@ -66,8 +66,8 @@
 
 ### K `refactor/transport-readability` — 传输子系统可述性
 
-- [ ] `bridge-feishu`：`session()` select 分支拆具名处理器并常量化心跳/背压/回执阈值；重连返回值改 `AttemptOutcome` 并命名 60 秒稳定连接阈值；`Fragments::push` 的 signature 五元组具名化并逐条注释上限；`rest.rs` 提取 `authenticated_post` 统一认证与状态码检查；`attachments()` 拆分并命名哨兵值；`proxy.rs` 补协议阶段注释。
-- [ ] `bridge-codex`：`events.rs::notification()` 按 method 拆函数并常量化截断阈值；`requests.rs::decode()` 的 5 个审批否决条件具名化；`transport.rs` 封装有界等待样板；`permissions.rs` 校验与渲染分离；`backend.rs` sourceKinds 提常量注明来源。
+- [x] `bridge-feishu`：`session()` select 分支拆具名处理器并常量化心跳/背压/回执阈值；重连返回值改 `AttemptOutcome` 并命名 60 秒稳定连接阈值；`Fragments::push` 的 signature 五元组具名化并逐条注释上限；`rest.rs` 提取 `authenticated_post` 统一认证与状态码检查；`attachments()` 拆分并命名哨兵值；`proxy.rs` 补协议阶段注释。
+- [x] `bridge-codex`：`events.rs::notification()` 按 method 拆函数并常量化截断阈值；`requests.rs::decode()` 的 5 个审批否决条件具名化；`transport.rs` 封装有界等待样板；`permissions.rs` 校验与渲染分离；`backend.rs` sourceKinds 提常量注明来源。
 - [ ] 飞书会话/重连状态机图与 Codex 协议映射表进入文档。
 
 ### L `refactor/local-safeio` — 安全边界与测试契约
