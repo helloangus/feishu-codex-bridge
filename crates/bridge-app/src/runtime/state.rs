@@ -108,31 +108,28 @@ pub(crate) enum ListedContent {
     },
 }
 
+/// One finished background job, grouped by the causal flow it belongs to so
+/// [`super::jobs`] can route it to one handler per domain. Every completion
+/// either advances its flow or reports a failure to the user; results unknown
+/// to the protocol stop the run instead of retrying.
 pub(crate) enum Done {
+    /// Durable claim chains over session state: directory selection and
+    /// creation, preferences, thread resume/archive, reset, compaction and
+    /// archive sync. Each claim job owns the scheduler's session-mutation gate
+    /// until its terminal event releases it.
+    Session(SessionDone),
+    /// Task lifecycle: plan implementation, durable admission, preparation,
+    /// turn start and backend control replies (interrupts, denials).
+    Task(TaskDone),
+    /// Card and panel delivery receipts plus interaction reply receipts.
+    Card(CardDone),
+    /// Task-file delivery.
+    Delivery(DeliveryDone),
+}
+
+pub(crate) enum SessionDone {
     ArchiveSynced {
         result: Result<(), sessions::SessionStoreError>,
-    },
-    PlanAction {
-        input: super::Input,
-        task: Option<TaskSpec>,
-        result: Result<bool, String>,
-    },
-    FilesDelivered,
-    ApprovalSent {
-        token: CardToken,
-        panel: Panel,
-        commands: Vec<(CardToken, String)>,
-        result: Result<MessageId, DeliveryError>,
-    },
-    ApprovalReplied {
-        outcome: ReplyOutcome,
-    },
-    PanelUpdated,
-    PanelSent {
-        refreshed: bool,
-        panel: Panel,
-        entries: Vec<(CardToken, crate::cards::Action)>,
-        result: Result<MessageId, DeliveryError>,
     },
     DirectoryProposed {
         user: String,
@@ -166,6 +163,10 @@ pub(crate) enum Done {
         chat: String,
         result: Result<crate::directories::DirectoryView, sessions::SessionStoreError>,
     },
+    /// Compaction claim chain. Between `Prepared` and `Submitted` the active
+    /// entry is a compaction; `acknowledged` records that the backend accepted
+    /// the request, and a terminal event that arrives unacknowledged must park
+    /// its label in `terminal` while keeping the mutation gate closed.
     CompactClaim {
         input: super::Input,
         session: bridge_core::SessionKey,
@@ -201,18 +202,17 @@ pub(crate) enum Done {
         action: sessions::ThreadAction,
         result: Result<(), sessions::StartError>,
     },
-    Listed {
-        refresh: Option<String>,
-        chat: String,
-        user: String,
-        directory: PathBuf,
-        generation: u64,
-        stop_snapshot: (u64, Option<TaskId>),
-        result: Result<ListedContent, sessions::StartError>,
-    },
     Reset {
         input: super::Input,
         result: Result<bool, ()>,
+    },
+}
+
+pub(crate) enum TaskDone {
+    PlanAction {
+        input: super::Input,
+        task: Option<TaskSpec>,
+        result: Result<bool, String>,
     },
     Admission {
         ticket: crate::AdmissionTicket,
@@ -230,6 +230,38 @@ pub(crate) enum Done {
     Control {
         result: Result<(), crate::ports::BackendError>,
     },
+}
+
+pub(crate) enum CardDone {
+    ApprovalSent {
+        token: CardToken,
+        panel: Panel,
+        commands: Vec<(CardToken, String)>,
+        result: Result<MessageId, DeliveryError>,
+    },
+    ApprovalReplied {
+        outcome: ReplyOutcome,
+    },
+    PanelUpdated,
+    PanelSent {
+        refreshed: bool,
+        panel: Panel,
+        entries: Vec<(CardToken, crate::cards::Action)>,
+        result: Result<MessageId, DeliveryError>,
+    },
+    Listed {
+        refresh: Option<String>,
+        chat: String,
+        user: String,
+        directory: PathBuf,
+        generation: u64,
+        stop_snapshot: (u64, Option<TaskId>),
+        result: Result<ListedContent, sessions::StartError>,
+    },
+}
+
+pub(crate) enum DeliveryDone {
+    FilesDelivered,
 }
 
 /// Owner of the entire run state. Methods live beside their concern:
@@ -360,9 +392,9 @@ impl Runtime {
                 .ok_or(RuntimeError::Internal("缺少归档同步目标"))?;
             let store = self.store.clone();
             jobs.spawn(async move {
-                Done::ArchiveSynced {
+                Done::Session(SessionDone::ArchiveSynced {
                     result: store.clear_thread(thread).await,
-                }
+                })
             });
         }
         if self
@@ -471,12 +503,12 @@ impl Runtime {
                 )
                 .await
                 .unwrap_or(Err(DeliveryError::Transport));
-                Done::ApprovalSent {
+                Done::Card(CardDone::ApprovalSent {
                     token,
                     panel,
                     commands,
                     result,
-                }
+                })
             });
         }
     }
@@ -521,7 +553,7 @@ impl Runtime {
                         0,
                     );
                 }
-                Done::PanelUpdated
+                Done::Card(CardDone::PanelUpdated)
             });
         }
     }
@@ -572,7 +604,7 @@ impl Runtime {
                 )
                 .await;
             }
-            Done::FilesDelivered
+            Done::Delivery(DeliveryDone::FilesDelivered)
         });
     }
 
@@ -718,10 +750,10 @@ impl Runtime {
                 Ok(turn)
             }
             .await;
-            Done::Prepared {
+            Done::Task(TaskDone::Prepared {
                 id: spec.id,
                 result,
-            }
+            })
         });
     }
 }

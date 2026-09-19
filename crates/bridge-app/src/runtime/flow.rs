@@ -2,7 +2,7 @@
 //! protocol event folding, plus the bounded background-job policy.
 use super::RuntimeError;
 use super::limits;
-use super::state::{Active, ActiveKind, Done};
+use super::state::{Active, ActiveKind, CardDone, Done, TaskDone};
 use crate::diagnostics::Diagnostics;
 use crate::{
     Scheduler,
@@ -52,7 +52,7 @@ pub(crate) fn spawn_reply(
     let handle = diagnostics.clone();
     jobs.spawn(async move {
         let outcome = crate::interactions::deliver_reply(&handle, pending, allow).await;
-        Done::ApprovalReplied { outcome }
+        Done::Card(CardDone::ApprovalReplied { outcome })
     });
     Ok(())
 }
@@ -157,12 +157,12 @@ pub(crate) fn send_panel(
                 )
             })
             .collect();
-        Done::PanelSent {
+        Done::Card(CardDone::PanelSent {
             refreshed: source.is_some(),
             panel,
             entries,
             result,
-        }
+        })
     });
     true
 }
@@ -331,9 +331,9 @@ pub(crate) fn spawn_interrupt(
         return Err(RuntimeError::Capacity("控制容量耗尽，无法回传停止请求"));
     }
     jobs.spawn(async move {
-        Done::Control {
+        Done::Task(TaskDone::Control {
             result: backend.interrupt(turn).await,
-        }
+        })
     });
     Ok(())
 }

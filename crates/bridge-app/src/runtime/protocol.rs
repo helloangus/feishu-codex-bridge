@@ -3,7 +3,7 @@
 use super::RuntimeError;
 use super::flow::tell;
 use super::limits;
-use super::state::{ActiveKind, Done, Runtime};
+use super::state::{ActiveKind, Done, Runtime, TaskDone};
 use crate::{
     events::{AgentEvent, Incoming},
     interactions::Pending,
@@ -180,11 +180,11 @@ impl Runtime {
                     return Err(RuntimeError::Capacity("控制回传容量耗尽，停止运行"));
                 }
                 jobs.spawn(async move {
-                    Done::Control {
+                    Done::Task(TaskDone::Control {
                         result: timeout(limits::BACKEND_REPLY_TIMEOUT, reply.reply(response))
                             .await
                             .unwrap_or(Err(BackendError::Uncertain)),
-                    }
+                    })
                 });
                 Ok(())
             }
@@ -267,9 +267,9 @@ impl Runtime {
                             return Err(RuntimeError::Capacity("控制容量耗尽，无法停止压缩"));
                         }
                         jobs.spawn(async move {
-                            Done::Control {
+                            Done::Task(TaskDone::Control {
                                 result: backend.interrupt(stop_turn).await,
-                            }
+                            })
                         });
                     }
                     for item in early {

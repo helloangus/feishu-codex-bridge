@@ -3,7 +3,7 @@
 use super::RuntimeError;
 use super::flow::{can_spawn, send_panel, spawn_interrupt, spawn_reply, tell};
 use super::limits;
-use super::state::{Done, FileDelivery, Runtime};
+use super::state::{CardDone, Done, FileDelivery, Runtime, SessionDone, TaskDone};
 use crate::{
     interactions::{Choice, Claim, Pending, TextOutcome},
     sessions,
@@ -232,11 +232,11 @@ impl Runtime {
             let store = self.store.clone();
             jobs.spawn(async move {
                 let result = store.claim(input.id.clone()).await.map_err(|_| ());
-                Done::CreationClaim {
+                Done::Session(SessionDone::CreationClaim {
                     input,
                     creation,
                     result,
-                }
+                })
             });
             return Ok(());
         }
@@ -269,12 +269,12 @@ impl Runtime {
                 let store = self.store.clone();
                 jobs.spawn(async move {
                     let result = store.claim(input.id.clone()).await.map_err(|_| ());
-                    Done::DirectoryClaim {
+                    Done::Session(SessionDone::DirectoryClaim {
                         input,
                         current,
                         target,
                         result,
-                    }
+                    })
                 });
             } else {
                 if seen_insert(&mut self.seen_commands, &input.id) {
@@ -285,10 +285,10 @@ impl Runtime {
                         let root = self.settings.root.clone();
                         let chat = input.chat.clone();
                         jobs.spawn(async move {
-                            Done::DirectoryListed {
+                            Done::Session(SessionDone::DirectoryListed {
                                 chat,
                                 result: store.inspect_directory(root, current).await,
-                            }
+                            })
                         });
                     }
                 }
@@ -328,11 +328,11 @@ impl Runtime {
             let store = self.store.clone();
             jobs.spawn(async move {
                 let result = store.claim(input.id.clone()).await.map_err(|_| ());
-                Done::CompactClaim {
+                Done::Session(SessionDone::CompactClaim {
                     input,
                     session,
                     result,
-                }
+                })
             });
             return Ok(());
         }
@@ -382,7 +382,7 @@ impl Runtime {
                     Ok(new)
                 }
                 .await;
-                Done::Reset { input, result }
+                Done::Session(SessionDone::Reset { input, result })
             });
             return Ok(());
         }
@@ -575,11 +575,11 @@ impl Runtime {
                 Ok(true)
             }
             .await;
-            Done::PlanAction {
+            Done::Task(TaskDone::PlanAction {
                 input,
                 task,
                 result,
-            }
+            })
         });
         Ok(())
     }
@@ -808,12 +808,12 @@ impl Runtime {
             let store = self.store.clone();
             jobs.spawn(async move {
                 let result = store.claim(input.id.clone()).await.map_err(|_| ());
-                Done::PreferenceClaim {
+                Done::Session(SessionDone::PreferenceClaim {
                     input,
                     session,
                     change,
                     result,
-                }
+                })
             });
         } else {
             if seen_insert(&mut self.seen_commands, &input.id) {
@@ -861,7 +861,7 @@ impl Runtime {
                             }
                         }
                         .await;
-                        Done::Listed {
+                        Done::Card(CardDone::Listed {
                             refresh,
                             chat,
                             user,
@@ -869,7 +869,7 @@ impl Runtime {
                             generation,
                             stop_snapshot,
                             result,
-                        }
+                        })
                     });
                 }
             }
@@ -920,13 +920,13 @@ impl Runtime {
             let store = self.store.clone();
             jobs.spawn(async move {
                 let result = store.claim(input.id.clone()).await.map_err(|_| ());
-                Done::ThreadClaim {
+                Done::Session(SessionDone::ThreadClaim {
                     input,
                     session,
                     thread,
                     action,
                     result,
-                }
+                })
             });
         } else {
             if seen_insert(&mut self.seen_commands, &input.id) {
@@ -942,7 +942,7 @@ impl Runtime {
                     let generation = *self.card_generations.get(&user).unwrap_or(&0);
                     let stop_snapshot = self.card_snapshot();
                     jobs.spawn(async move {
-                        Done::Listed {
+                        Done::Card(CardDone::Listed {
                             refresh,
                             chat,
                             user,
@@ -959,7 +959,7 @@ impl Runtime {
                                 Ok(super::state::ListedContent::Threads { entries, archived })
                             }
                             .await,
-                        }
+                        })
                     });
                 }
             }
@@ -1092,11 +1092,11 @@ impl Runtime {
                 let store = self.store.clone();
                 jobs.spawn(async move {
                     let result = store.claim(input.id.clone()).await.map_err(|_| ());
-                    Done::Admission {
+                    Done::Task(TaskDone::Admission {
                         ticket,
                         input,
                         result,
-                    }
+                    })
                 });
             }
             Err(_) => {
