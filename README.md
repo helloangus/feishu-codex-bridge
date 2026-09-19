@@ -40,7 +40,7 @@
 cargo xtask check
 ```
 
-统一入口依次执行 fmt、Clippy（`-D warnings`）、串行 workspace 测试、产品构建、rustdoc（warnings 视为错误）、依赖边界、仓库卫生、Shell 语法、diff 检查和打包结构校验；`cargo xtask fetch` 预取依赖后可用 `cargo xtask check --offline` 完全离线执行。发布打包使用 `cargo xtask package [输出目录]`，根目录 `package.sh` 是它的转发入口。
+统一入口依次执行 fmt、Clippy（`-D warnings`）、串行 workspace 测试、产品构建、rustdoc（warnings 视为错误）、依赖边界、Codex 协议快照校验、仓库卫生、Shell 语法、diff 检查和打包结构校验；`cargo xtask fetch` 预取依赖后可用 `cargo xtask check --offline` 完全离线执行。依赖边界与协议快照校验可单独运行：`cargo xtask check-boundaries`、`cargo xtask codex-schema check`。发布打包使用 `cargo xtask package [输出目录]`，根目录 `package.sh` 是它的转发入口。
 
 测试不读取真实配置、不访问外部服务、不启动长期服务；网络协议测试使用本地 socket。协议假进程和 schema 校验由 Rust 测试工具完成，协议 fixture、生产序列化与真实解码均对照 `schemas/` 下版本化 schema 校验，协议基线版本集中在 `bridge_codex::protocol::CODEX_SCHEMA_BASELINE`。开发约定见 [开发指南](docs/development.md)，当前系统边界见 [架构说明](docs/architecture.md)。
 

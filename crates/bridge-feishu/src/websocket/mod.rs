@@ -113,9 +113,9 @@ fn pong_deadline(ping_interval: u64) -> Duration {
 }
 
 /// One connection attempt's result: how long it stayed up, and how it ended.
-type AttemptResult = (bool, Result<(), Error>);
+type AttemptOutcome = (bool, Result<(), Error>);
 type Attempt<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttemptResult, Error>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttemptOutcome, Error>> + Send + 'a>>;
 pub fn endpoint(bytes: &[u8]) -> Result<Endpoint, Error> {
     #[derive(Deserialize)]
     struct Response {

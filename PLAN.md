@@ -47,7 +47,7 @@
 ### H `refactor/outcome-model` — 结果模型
 
 - [x] 引入 `Outcome` 枚举，在 `flow::finish` 与协议事件边界携带；`presentation.rs` 不再用中文消息前缀做控制流，文案只在展示层生成且逐字不变（卡片标题判类型归入工作包 I 的 `CardBook`）。
-- [ ] 结果分类与 tone/文案映射表进入 `docs/runtime-flows.md`。
+- [x] 结果分类与 tone/文案映射表进入 `docs/runtime-flows.md`。
 
 ### I `refactor/card-grants` — 卡片授权模型
 
@@ -55,35 +55,35 @@
 - [x] `CardBook` 成为卡片校验唯一入口，文档写明统一失效规则（签发绑定 source+generation+任务快照、一次性消费、deadline、停止快照比对）。
 - [x] 无名元组 `stop_snapshot: (u64, Option<TaskId>)` 改为具名 `TaskSnapshot`。
 - [x] `deliver_list` 参数收敛，删除调用方 `next_panel + 1` 预言。
-- [ ] 卡片令牌生命周期时序图进入文档。
+- [x] 卡片令牌生命周期时序图进入文档。
 
 ### J `refactor/supervision-plane` — 监督与控制平面
 
 - [x] `supervisor_state::Phase` 成为唯一权威状态机；控制 socket 从自由字符串（含 `backoff:N`）改为行 JSON 编码的枚举；删除 `health.rs` 与 `service_control.rs` 的猜测式解析。
 - [x] `run_layer`/`supervise` 的 `action: &str` 与 `outer: bool` 改为 `Layer` 枚举；120s/45s/20s/30s 阈值常量化并互注释。
 - [x] `bootstrap.rs::run`（约 326 行）提取归档对账与 gateway 路由循环为具名函数，合并重复的成功聚合。
-- [ ] guard→supervise→run 进程链图与监督状态机图进入文档。
+- [x] guard→supervise→run 进程链图与监督状态机图进入文档。
 
 ### K `refactor/transport-readability` — 传输子系统可述性
 
 - [x] `bridge-feishu`：`session()` select 分支拆具名处理器并常量化心跳/背压/回执阈值；重连返回值改 `AttemptOutcome` 并命名 60 秒稳定连接阈值；`Fragments::push` 的 signature 五元组具名化并逐条注释上限；`rest.rs` 提取 `authenticated_post` 统一认证与状态码检查；`attachments()` 拆分并命名哨兵值；`proxy.rs` 补协议阶段注释。
 - [x] `bridge-codex`：`events.rs::notification()` 按 method 拆函数并常量化截断阈值；`requests.rs::decode()` 的 5 个审批否决条件具名化；`transport.rs` 封装有界等待样板；`permissions.rs` 校验与渲染分离；`backend.rs` sourceKinds 提常量注明来源。
-- [ ] 飞书会话/重连状态机图与 Codex 协议映射表进入文档。
+- [x] 飞书会话/重连状态机图与 Codex 协议映射表进入文档。
 
 ### L `refactor/local-safeio` — 安全边界与测试契约
 
 - [x] 新增 `bridge-local/src/safeio.rs`：统一 NOFOLLOW 逐组件走路径（现三份重复）、原子发布（现两份重复）与 `pinned_path`；`bridge-cli` 的五处安全打开改用。
 - [x] `async_state.rs` 校验常量化并提取助手，`key()` 持久化格式成文；`snapshot.rs::scan_excluding` 拆分职责并命名 20MB 上限。
 - [x] `fake_codex_runtime.rs` 顶部补 mode→行为→信号文件契约表；`runtime_flows.rs` 按 mode 拆分断言函数。
-- [ ] 文件访问安全边界一节（威胁模型与原语清单）与测试架构节进入文档。
+- [x] 文件访问安全边界一节（威胁模型与原语清单）与测试架构节进入文档。
 
 ### M `docs/architecture-home` — 文档总装与词汇表
 
-- [ ] `docs/architecture.md` 重组为架构主页：系统上下文图、进程链图、运行时数据流图、五组件节、不变量节与词汇表（概念、代码符号、图节点三列对应）。
-- [ ] `docs/runtime-flows.md` 时序图集（文本任务执行、/cd 切目录、compact、卡片点击校验）。
-- [ ] `docs/operations.md` 补监督状态机与健康 Phase 含义；`docs/development.md` 补测试架构与 fake 契约表；`docs/deployment.md` 补 `bridge credentials`、`check-command`、`--danger-full-access`。
-- [ ] README 校验清单补 Codex 协议快照校验与单独命令入口。
-- [ ] 文档-代码对照走查：每张图的节点与边能在代码中找到同名模块、通道或类型。
+- [x] `docs/architecture.md` 重组为架构主页：系统上下文图、进程链图、运行时数据流图、五组件节、不变量节与词汇表（概念、代码符号、图节点三列对应）。
+- [x] `docs/runtime-flows.md` 时序图集（文本任务执行、/cd 切目录、compact、卡片点击校验）。
+- [x] `docs/operations.md` 补监督状态机与健康 Phase 含义；`docs/development.md` 补测试架构与 fake 契约表；`docs/deployment.md` 补 `bridge credentials`、`check-command`、`--danger-full-access`。
+- [x] README 校验清单补 Codex 协议快照校验与单独命令入口。
+- [x] 文档-代码对照走查：每张图的节点与边能在代码中找到同名模块、通道或类型。
 
 
 ## 第一阶段：修复确定的问题

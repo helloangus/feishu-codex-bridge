@@ -44,7 +44,21 @@ Generate a configuration, replacing the absolute example paths with your existin
 ./bridge config check --file ./bridge.toml
 ```
 
-For a static allowlist, add `--allowed-user ou_your_open_id` when generating the configuration; the option may be repeated. Otherwise the generated configuration uses pairing. Supply `FEISHU_APP_ID`, `FEISHU_APP_SECRET` and, when required, `FEISHU_PAIRING_CODE` through the service user's environment before starting. The binary currently does not prompt for them. Do not put secret values into shell history or the TOML file. For an existing configuration with custom environment variable names, supply those named variables instead. `config check` is an offline configuration check, not a credential or connectivity check.
+For a static allowlist, add `--allowed-user ou_your_open_id` when generating the configuration; the option may be repeated. Otherwise the generated configuration uses pairing. Supply `FEISHU_APP_ID`, `FEISHU_APP_SECRET` and, when required, `FEISHU_PAIRING_CODE` through the service user's environment before starting; the binary does not prompt for them. Do not put secret values into shell history or the TOML file. For an existing configuration with custom environment variable names, supply those named variables instead. `config check` is an offline configuration check, not a credential or connectivity check.
+
+The `credentials` subcommand validates the credential environment variables a configuration declares and can emit `export` statements for scripts; in an interactive terminal it offers hidden input:
+
+```sh
+# validate only (exit code reports missing/invalid variables)
+./bridge credentials --file ./bridge.toml
+# print export lines for missing credentials: eval them before starting the service
+eval "$(./bridge credentials --file ./bridge.toml --print)"
+```
+
+Two more offline helpers:
+
+- `./bridge check-command '/status'` validates the syntax of a chat text command without executing it.
+- `./bridge config init --danger-full-access` generates a configuration whose Codex sandbox is fully accessible. This disables workspace containment for every task; only use it when you accept Codex writing outside the workspace, and never combine it with an untrusted workspace.
 
 ```sh
 ./bridge service --config ./bridge.toml start
