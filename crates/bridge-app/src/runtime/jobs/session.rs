@@ -199,9 +199,9 @@ impl Runtime {
                     .next_confirmation
                     .checked_add(1)
                     .ok_or(RuntimeError::Capacity("确认编号耗尽"))?;
-                let token = format!(
-                    "cd-{}-{}",
-                    self.settings.epoch, self.session_book.next_confirmation
+                let token = super::super::tokens::confirmation(
+                    self.settings.epoch,
+                    self.session_book.next_confirmation,
                 );
                 let prompt = format!(
                     "目录不存在：{}\n确认后将创建该目录及缺失的父目录，并切换到此目录。\n\n/cd-confirm {token}\n\n仅限当前用户在此聊天确认，10 分钟内有效；超时或切换目录后失效，不会自动创建。",
@@ -233,14 +233,20 @@ impl Runtime {
                         "创建目录确认",
                         prompt,
                         vec![("确认创建并切换".into(), format!("/cd-confirm {token}"))],
-                        &format!("panel-{}-{}", self.settings.epoch, self.cards.next_panel),
+                        &super::super::tokens::panel_prefix(
+                            self.settings.epoch,
+                            self.cards.next_panel,
+                        ),
                     );
                     let owner = crate::cards::Owner {
                         generation: *self.cards.generations.get(&user).unwrap_or(&0),
                         user,
                         chat: chat.clone(),
                         directory: current,
-                        stop_snapshot: (self.tasks.next_task, None),
+                        snapshot: crate::cards::TaskSnapshot {
+                            next_task: self.tasks.next_task,
+                            active: None,
+                        },
                     };
                     super::super::flow::send_panel(
                         &self.diagnostics,
@@ -248,8 +254,11 @@ impl Runtime {
                         jobs,
                         self.messenger.clone(),
                         owner,
-                        panel,
-                        commands,
+                        crate::cards::BuiltCard {
+                            panel,
+                            commands,
+                            kind: crate::cards::CardKind::Interaction,
+                        },
                     );
                 } else {
                     tell(

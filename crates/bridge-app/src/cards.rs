@@ -30,6 +30,16 @@ pub struct Click {
     pub token: CardToken,
     pub source: String,
 }
+
+/// The task-side state a stop or plan-action button binds itself to: the task
+/// counter and the active task at issue time. A mismatch proves the button
+/// predates the current execution and must not fire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSnapshot {
+    pub next_task: u64,
+    pub active: Option<TaskId>,
+}
+
 pub struct Action {
     pub generation: u64,
     pub user: String,
@@ -38,14 +48,39 @@ pub struct Action {
     pub source: String,
     pub deadline: Instant,
     pub command: String,
-    pub stop_snapshot: Option<(u64, Option<TaskId>)>,
+    /// Set only for buttons that must die with the task they target.
+    pub stop_snapshot: Option<TaskSnapshot>,
 }
+
+/// Who a card belongs to and which task state it was issued under.
 pub struct Owner {
     pub user: String,
     pub chat: String,
     pub directory: PathBuf,
     pub generation: u64,
-    pub stop_snapshot: (u64, Option<TaskId>),
+    pub snapshot: TaskSnapshot,
+}
+
+/// What kind of card was delivered. Click routing re-issues list cards (one
+/// click invalidates the card and queues a fresh panel); other cards are
+/// one-shot without re-issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardKind {
+    List,
+    Interaction,
+}
+
+/// A card ready to deliver: its view, its one-use commands and its kind.
+pub struct BuiltCard {
+    pub panel: Panel,
+    pub commands: Vec<(CardToken, String)>,
+    pub kind: CardKind,
+}
+
+/// One delivered view: the panel plus what kind of card it is.
+pub struct CardView {
+    pub panel: Panel,
+    pub kind: CardKind,
 }
 #[derive(Default)]
 pub struct Actions(BTreeMap<CardToken, Action>);
@@ -53,24 +88,24 @@ pub struct Actions(BTreeMap<CardToken, Action>);
 /// Keep delivered views until all their actions have disappeared. Updates are
 /// serialized by the runtime, so an older snapshot cannot restore a button.
 #[derive(Default)]
-pub struct Views(BTreeMap<String, Panel>);
+pub struct Views(BTreeMap<String, CardView>);
 impl Views {
     pub fn note(&mut self, source: &str, text: &str) {
-        if let Some(panel) = self.0.get_mut(source) {
-            panel.body.push_str(&format!("\n\n{text}"));
+        if let Some(view) = self.0.get_mut(source) {
+            view.panel.body.push_str(&format!("\n\n{text}"));
         }
     }
     pub fn is_list(&self, source: &str) -> bool {
-        self.0.get(source).is_some_and(|panel| {
-            matches!(panel.title.as_str(), "最近会话" | "已归档会话" | "可用模型")
-        })
+        self.0
+            .get(source)
+            .is_some_and(|view| view.kind == CardKind::List)
     }
     pub fn remove(&mut self, source: &str) {
         self.0.remove(source);
     }
-    pub fn insert(&mut self, source: String, panel: Panel) {
-        if !panel.buttons.is_empty() && self.0.len() < 1000 {
-            self.0.insert(source, panel);
+    pub fn insert(&mut self, source: String, view: CardView) {
+        if !view.panel.buttons.is_empty() && self.0.len() < 1000 {
+            self.0.insert(source, view);
         }
     }
 
@@ -78,10 +113,11 @@ impl Views {
         &mut self,
         actions: &Actions,
         now: Instant,
-        snapshot: &(u64, Option<TaskId>),
+        snapshot: &TaskSnapshot,
     ) -> Option<(String, Panel)> {
         let mut update = None;
-        for (source, panel) in &mut self.0 {
+        for (source, view) in &mut self.0 {
+            let panel = &mut view.panel;
             let before = panel.buttons.len();
             panel.buttons.retain(|button| match &button.action {
                 ButtonAction::Interaction { token, .. } => actions
@@ -152,7 +188,7 @@ impl Actions {
         chat: &str,
         directory: &std::path::Path,
         now: Instant,
-        stop_snapshot: &(u64, Option<TaskId>),
+        snapshot: &TaskSnapshot,
     ) -> Option<String> {
         let entry = self.0.get(&click.token)?;
         if entry.user != user
@@ -163,7 +199,7 @@ impl Actions {
             || entry
                 .stop_snapshot
                 .as_ref()
-                .is_some_and(|snapshot| snapshot != stop_snapshot)
+                .is_some_and(|bound| bound != snapshot)
         {
             return None;
         }
@@ -174,7 +210,9 @@ impl Actions {
     }
 }
 
-pub fn panel(
+/// Assemble a plain interactive panel; public builders wrap it in a
+/// [`BuiltCard`].
+pub(crate) fn panel(
     title: &str,
     body: String,
     buttons: Vec<(String, String)>,
@@ -226,7 +264,7 @@ pub fn panel(
     )
 }
 
-pub fn help(prefix: &str) -> (Panel, Vec<(CardToken, String)>) {
+pub fn help(prefix: &str) -> BuiltCard {
     let commands = [
         ("状态 /status", "/status"),
         ("目录 /cd", "/cd"),
@@ -238,14 +276,28 @@ pub fn help(prefix: &str) -> (Panel, Vec<(CardToken, String)>) {
         ("刷新 /help", "/help"),
         ("停止 /stop", "/stop"),
     ];
-    panel("Codex 控制面板","发送文本开始任务。按钮限本人在当前聊天和目录使用，10 分钟内有效，每个按钮可执行一次；失效后重新发送 /help。\n/cd <路径> 切换目录，不存在时请求创建确认。\n/cd-confirm <编号> 确认创建。\n/archive <ID>、/archived、/unarchive <ID> 管理归档。\n/model [ID|default] 设置模型；/plan [on|off] 设置计划模式。\n目录和设置修改需全局空闲。".into(),commands.into_iter().map(|(label,command)|(label.into(),command.into())).collect(),prefix)
+    interaction_card(panel(
+        "Codex 控制面板",
+        "发送文本开始任务。按钮限本人在当前聊天和目录使用，10 分钟内有效，每个按钮可执行一次；失效后重新发送 /help。\n/cd <路径> 切换目录，不存在时请求创建确认。\n/cd-confirm <编号> 确认创建。\n/archive <ID>、/archived、/unarchive <ID> 管理归档。\n/model [ID|default] 设置模型；/plan [on|off] 设置计划模式。\n目录和设置修改需全局空闲。".into(),
+        commands.into_iter().map(|(label, command)| (label.into(), command.into())).collect(),
+        prefix,
+    ))
+}
+
+/// Wrap an already assembled panel as a one-shot interactive card.
+fn interaction_card(built: (Panel, Vec<(CardToken, String)>)) -> BuiltCard {
+    BuiltCard {
+        panel: built.0,
+        commands: built.1,
+        kind: CardKind::Interaction,
+    }
 }
 
 pub fn threads(
     entries: &[crate::sessions::ListedThread],
     archived: bool,
     prefix: &str,
-) -> (Panel, Vec<(CardToken, String)>) {
+) -> BuiltCard {
     let mut body =
         String::from("最多 8 项；按钮限本人在当前聊天和目录使用，10 分钟有效，每个按钮一次。\n");
     let mut buttons = Vec::new();
@@ -302,7 +354,7 @@ pub fn threads(
         .into(),
         if archived { "/resume" } else { "/archived" }.into(),
     ));
-    let (mut card, commands) = panel(
+    let (mut panel, commands) = panel(
         if archived {
             "已归档会话"
         } else {
@@ -312,17 +364,17 @@ pub fn threads(
         buttons,
         prefix,
     );
-    for button in &mut card.buttons {
+    for button in &mut panel.buttons {
         button.group = None;
     }
-    (card, commands)
+    BuiltCard {
+        panel,
+        commands,
+        kind: CardKind::List,
+    }
 }
 
-pub fn models(
-    models: &[crate::ports::Model],
-    current: Option<&str>,
-    prefix: &str,
-) -> (Panel, Vec<(CardToken, String)>) {
+pub fn models(models: &[crate::ports::Model], current: Option<&str>, prefix: &str) -> BuiltCard {
     let mut buttons = models
         .iter()
         .take(20)
@@ -349,7 +401,7 @@ pub fn models(
         .collect::<Vec<_>>();
     buttons.push(("恢复桥接默认模型".into(), "/model default".into()));
     buttons.push(("刷新模型列表".into(), "/models".into()));
-    let (mut card, commands) = panel(
+    let (mut panel, commands) = panel(
         "可用模型",
         format!(
             "当前模型：{}。全局空闲时可修改，保存成功后回复确认。\n按钮限本人在当前聊天和目录使用，10 分钟有效，每个按钮一次。",
@@ -358,10 +410,14 @@ pub fn models(
         buttons,
         prefix,
     );
-    for button in &mut card.buttons {
+    for button in &mut panel.buttons {
         button.group = None;
     }
-    (card, commands)
+    BuiltCard {
+        panel,
+        commands,
+        kind: CardKind::List,
+    }
 }
 
 /// One question per card; opaque commands carry indices, never answer text.
@@ -385,7 +441,7 @@ pub fn question(
     total: usize,
     token: &CardToken,
     prefix: &str,
-) -> (Panel, Vec<(CardToken, String)>) {
+) -> BuiltCard {
     let supported = question_supported(question);
     let mut body = format!(
         "第 {} / {} 题。请选择或自行回答。整组问答 10 分钟有效；超时停止本次桥接运行，不提交空答案。\n",
@@ -422,19 +478,20 @@ pub fn question(
     } else {
         body.push_str("本题详情超过展示上限，无法完整展示，已停止问答。\n");
     }
-    let (mut card, commands) = panel("Codex 问答", body, buttons, prefix);
-    for button in &mut card.buttons {
+    let built = interaction_card(panel("Codex 问答", body, buttons, prefix));
+    let mut panel = built.panel;
+    for button in &mut panel.buttons {
         button.group = None;
     }
-    (card, commands)
+    BuiltCard {
+        panel,
+        commands: built.commands,
+        kind: built.kind,
+    }
 }
 
 /// Approval details must remain complete before an allow action is offered.
-pub fn approval(
-    request: &crate::requests::Approval,
-    token: &CardToken,
-    prefix: &str,
-) -> (Panel, Vec<(CardToken, String)>) {
+pub fn approval(request: &crate::requests::Approval, token: &CardToken, prefix: &str) -> BuiltCard {
     use crate::requests::ApprovalKind;
     let title = match request.kind {
         ApprovalKind::Command if request.network_context.is_some() => "网络访问审批",
@@ -538,9 +595,9 @@ pub fn approval(
         body.push_str("\n本请求暂不能通过卡片同意，请拒绝后让 Codex 调整请求。\n");
     }
     buttons.push(("拒绝".into(), format!("/deny {token}")));
-    let (mut card, commands) = panel(title, body, buttons, prefix);
-    card.tone = Tone::Warning;
-    for button in &mut card.buttons {
+    let (mut panel, commands) = panel(title, body, buttons, prefix);
+    panel.tone = Tone::Warning;
+    for button in &mut panel.buttons {
         button.group = None;
         button.style = if button.label == "拒绝" {
             ButtonStyle::Destructive
@@ -548,12 +605,20 @@ pub fn approval(
             ButtonStyle::Primary
         };
     }
-    (card, commands)
+    BuiltCard {
+        panel,
+        commands,
+        kind: CardKind::Interaction,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split(built: BuiltCard) -> (Panel, Vec<(CardToken, String)>) {
+        (built.panel, built.commands)
+    }
     #[test]
     fn approval_details_are_literal_and_incomplete_display_cannot_allow() {
         let mut request = crate::requests::Approval {
@@ -567,7 +632,7 @@ mod tests {
             grant_root: None,
             can_allow: true,
         };
-        let (card, commands) = approval(&request, &CardToken::new("request-1"), "card-1");
+        let (card, commands) = split(approval(&request, &CardToken::new("request-1"), "card-1"));
         assert!(
             card.body
                 .contains("````\necho ```\n**not a heading**\n````")
@@ -583,7 +648,8 @@ mod tests {
         assert!(card.buttons.iter().all(|button| button.group.is_none()));
         for value in ["x".repeat(4097), "hidden\u{1b}[0m".into()] {
             request.command = Some(value);
-            let (card, commands) = approval(&request, &CardToken::new("request-1"), "card-2");
+            let (card, commands) =
+                split(approval(&request, &CardToken::new("request-1"), "card-2"));
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0].1, "/deny request-1");
             assert!(card.body.contains("暂不能通过卡片同意"));
@@ -591,7 +657,7 @@ mod tests {
         request.command = Some("echo ok".into());
         request.can_allow = false;
         assert_eq!(
-            approval(&request, &CardToken::new("request-1"), "card-3")
+            split(approval(&request, &CardToken::new("request-1"), "card-3"))
                 .1
                 .len(),
             1
@@ -599,30 +665,38 @@ mod tests {
         request.can_allow = true;
         request.command = None;
         assert_eq!(
-            approval(&request, &CardToken::new("request-1"), "missing-command")
-                .1
-                .len(),
+            split(approval(
+                &request,
+                &CardToken::new("request-1"),
+                "missing-command",
+            ))
+            .1
+            .len(),
             1
         );
         request.command = Some("echo ok".into());
         request.directory = None;
         assert_eq!(
-            approval(&request, &CardToken::new("request-1"), "missing-directory")
-                .1
-                .len(),
+            split(approval(
+                &request,
+                &CardToken::new("request-1"),
+                "missing-directory",
+            ))
+            .1
+            .len(),
             1
         );
         request.directory = Some("/workspace".into());
         request.can_allow = true;
         request.kind = crate::requests::ApprovalKind::FileChange;
-        let (card, commands) = approval(&request, &CardToken::new("request-1"), "card-4");
+        let (card, commands) = split(approval(&request, &CardToken::new("request-1"), "card-4"));
         assert!(card.body.contains("尚未提供逐文件修改详情"));
         assert_eq!(commands.len(), 1);
         request.kind = crate::requests::ApprovalKind::WriteStdin;
         request.command = Some("`".repeat(4096));
         request.directory = request.command.clone();
         request.reason = request.command.clone();
-        let (card, commands) = approval(&request, &CardToken::new("request-1"), "card-5");
+        let (card, commands) = split(approval(&request, &CardToken::new("request-1"), "card-5"));
         assert!(card.body.len() < 24 * 1024);
         assert_eq!(commands.len(), 1);
     }
@@ -631,7 +705,7 @@ mod tests {
     -> Result<(), &'static str> {
         let now = Instant::now();
         let deadline = now + std::time::Duration::from_secs(600);
-        let (panel, commands) = help("view");
+        let (panel, commands) = split(help("view"));
         let mut actions = Actions::default();
         actions.insert(
             commands
@@ -655,8 +729,25 @@ mod tests {
             now,
         );
         let mut views = Views::default();
-        views.insert("source".into(), panel);
-        assert!(views.next_update(&actions, now, &(0, None)).is_none());
+        views.insert(
+            "source".into(),
+            CardView {
+                panel,
+                kind: CardKind::Interaction,
+            },
+        );
+        assert!(
+            views
+                .next_update(
+                    &actions,
+                    now,
+                    &TaskSnapshot {
+                        next_task: 0,
+                        active: None
+                    }
+                )
+                .is_none()
+        );
         let click = Click {
             token: CardToken::new("view-0"),
             source: "source".into(),
@@ -669,11 +760,25 @@ mod tests {
                     "chat",
                     std::path::Path::new("/root"),
                     now,
-                    &(0, None)
+                    &TaskSnapshot {
+                        next_task: 0,
+                        active: None
+                    },
                 )
                 .is_none()
         );
-        assert!(views.next_update(&actions, now, &(0, None)).is_none());
+        assert!(
+            views
+                .next_update(
+                    &actions,
+                    now,
+                    &TaskSnapshot {
+                        next_task: 0,
+                        active: None
+                    }
+                )
+                .is_none()
+        );
         assert_eq!(
             actions.take(
                 &click,
@@ -681,18 +786,46 @@ mod tests {
                 "chat",
                 std::path::Path::new("/root"),
                 now,
-                &(0, None)
+                &TaskSnapshot {
+                    next_task: 0,
+                    active: None
+                },
             ),
             Some("/status".into())
         );
         let (_, updated) = views
-            .next_update(&actions, now, &(0, None))
+            .next_update(
+                &actions,
+                now,
+                &TaskSnapshot {
+                    next_task: 0,
+                    active: None,
+                },
+            )
             .ok_or("consumed view")?;
         assert_eq!(updated.buttons.len(), 8);
         assert!(updated.body.contains("操作结果请查看单独回复"));
-        assert!(views.next_update(&actions, now, &(0, None)).is_none());
+        assert!(
+            views
+                .next_update(
+                    &actions,
+                    now,
+                    &TaskSnapshot {
+                        next_task: 0,
+                        active: None
+                    }
+                )
+                .is_none()
+        );
         let (_, expired) = views
-            .next_update(&actions, deadline, &(0, None))
+            .next_update(
+                &actions,
+                deadline,
+                &TaskSnapshot {
+                    next_task: 0,
+                    active: None,
+                },
+            )
             .ok_or("expired view")?;
         assert!(expired.buttons.is_empty());
         assert!(expired.body.contains("均已使用或失效"));
@@ -703,13 +836,16 @@ mod tests {
     #[test]
     fn view_updates_follow_directory_invalidation_and_stale_stop() -> Result<(), &'static str> {
         let now = Instant::now();
-        let (panel, commands) = help("view");
+        let (panel, commands) = split(help("view"));
         let mut actions = Actions::default();
         actions.insert(
             commands
                 .into_iter()
                 .map(|(token, command)| {
-                    let stop_snapshot = (command == "/stop").then_some((0, None));
+                    let stop_snapshot = (command == "/stop").then_some(TaskSnapshot {
+                        next_task: 0,
+                        active: None,
+                    });
                     (
                         token,
                         Action {
@@ -728,15 +864,35 @@ mod tests {
             now,
         );
         let mut views = Views::default();
-        views.insert("source".into(), panel);
+        views.insert(
+            "source".into(),
+            CardView {
+                panel,
+                kind: CardKind::Interaction,
+            },
+        );
         let (_, updated) = views
-            .next_update(&actions, now, &(1, None))
+            .next_update(
+                &actions,
+                now,
+                &TaskSnapshot {
+                    next_task: 1,
+                    active: None,
+                },
+            )
             .ok_or("stale stop")?;
         assert_eq!(updated.buttons.len(), 8);
         assert!(!updated.buttons.iter().any(|b| b.label.contains("停止")));
         actions.invalidate("user");
         let (_, updated) = views
-            .next_update(&actions, now, &(1, None))
+            .next_update(
+                &actions,
+                now,
+                &TaskSnapshot {
+                    next_task: 1,
+                    active: None,
+                },
+            )
             .ok_or("directory changed")?;
         assert!(updated.buttons.is_empty());
         Ok(())
@@ -746,7 +902,10 @@ mod tests {
         let now = Instant::now();
         let deadline = now + std::time::Duration::from_secs(600);
         let mut registry = Actions::default();
-        let snapshot = (2, Some(TaskId::new(0, 1)));
+        let snapshot = TaskSnapshot {
+            next_task: 2,
+            active: Some(TaskId::new(0, 1)),
+        };
         assert!(registry.insert(
             vec![(
                 CardToken::new("token"),
@@ -776,7 +935,10 @@ mod tests {
                     "chat",
                     root,
                     now,
-                    &(3, Some(TaskId::new(0, 2)))
+                    &TaskSnapshot {
+                        next_task: 3,
+                        active: Some(TaskId::new(0, 2)),
+                    },
                 )
                 .is_none()
         );
@@ -815,7 +977,7 @@ mod tests {
                 },
             ],
         };
-        let (panel, commands) = question(&q, 0, 1, &CardToken::new("token"), "panel");
+        let (panel, commands) = split(question(&q, 0, 1, &CardToken::new("token"), "panel"));
         assert!(
             panel
                 .buttons
@@ -836,7 +998,7 @@ mod tests {
             title: "登录修复".repeat(30),
             active: true,
         }];
-        let (card, commands) = threads(&entries, false, "recent");
+        let (card, commands) = split(threads(&entries, false, "recent"));
         assert!(card.body.contains(&entries[0].title));
         assert!(card.body.contains("（执行中）"));
         assert!(card.body.contains("/resume thread-1"));
@@ -847,23 +1009,23 @@ mod tests {
                 .all(|b| b.group.is_none() && b.label.chars().count() < 20)
         );
         assert_eq!(commands.last().map(|(_, c)| c.as_str()), Some("/archived"));
-        let (empty, commands) = threads(&[], true, "empty");
+        let (empty, commands) = split(threads(&[], true, "empty"));
         assert!(empty.body.contains("没有已归档会话"));
         assert_eq!(
             commands.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(),
             vec!["/archived", "/resume"]
         );
-        let (_, archived) = threads(&entries, true, "archive");
+        let (_, archived) = split(threads(&entries, true, "archive"));
         assert_eq!(archived[0].1, "/unarchive thread-1");
         assert!(!archived.iter().any(|(_, c)| c.starts_with("/archive ")));
-        let (card, _) = models(
+        let (card, _) = split(models(
             &[crate::ports::Model {
                 id: "long-model".repeat(20),
                 is_default: false,
             }],
             None,
             "models",
-        );
+        ));
         assert!(card.buttons.iter().all(|b| b.group.is_none()));
         assert!(card.body.contains("全局空闲"));
     }
@@ -875,7 +1037,7 @@ mod tests {
             title: "修复登录".into(),
             active: false,
         }];
-        let (_, thread_commands) = threads(&entries, false, "threads");
+        let (_, thread_commands) = split(threads(&entries, false, "threads"));
         assert_eq!(thread_commands[0].1, "/resume thread-1");
         assert_eq!(thread_commands[1].1, "/archive thread-1");
 
@@ -889,11 +1051,11 @@ mod tests {
                 is_default: false,
             },
         ];
-        let (model_card, model_commands) = super::models(
+        let (model_card, model_commands) = split(super::models(
             &available_models,
             Some(crate::sessions::DEFAULT_MODEL),
             "models",
-        );
+        ));
         assert_eq!(model_commands[0].1, "/model gpt-6-astra");
         assert_eq!(model_card.buttons[0].label, "gpt-6-astra");
         assert_eq!(

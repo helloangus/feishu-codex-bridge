@@ -4,7 +4,6 @@ use super::super::RuntimeError;
 use super::super::flow::{send_panel, spawn_reply, tell};
 use super::super::limits;
 use super::super::state::{CardDone, Done, ListedContent, PanelRefresh, Runtime};
-use bridge_core::task::TaskId;
 use bridge_core::view::Panel;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -32,11 +31,11 @@ impl Runtime {
             }
             CardDone::PanelSent {
                 refreshed,
-                panel,
+                card,
                 mut entries,
                 result,
             } => {
-                self.panel_sent(refreshed, panel, &mut entries, result);
+                self.panel_sent(refreshed, card, &mut entries, result);
                 Ok(())
             }
             CardDone::Listed {
@@ -94,7 +93,13 @@ impl Runtime {
             );
         }
         if let Ok(id) = &result {
-            self.cards.views.insert(id.0.clone(), panel);
+            self.cards.views.insert(
+                id.0.clone(),
+                crate::cards::CardView {
+                    panel,
+                    kind: crate::cards::CardKind::Interaction,
+                },
+            );
         }
         if let Some(pending) = self.approvals.interactions.get_mut(&token) {
             let valid = Instant::now() < pending.deadline
@@ -194,7 +199,7 @@ impl Runtime {
     fn panel_sent(
         &mut self,
         refreshed: bool,
-        panel: Panel,
+        card: crate::cards::BuiltCard,
         entries: &mut Vec<(crate::cards::CardToken, crate::cards::Action)>,
         result: Result<crate::messaging::MessageId, crate::messaging::DeliveryError>,
     ) {
@@ -202,7 +207,13 @@ impl Runtime {
             self.cards.updating_panel = false;
         }
         if let Ok(id) = result {
-            self.cards.views.insert(id.0.clone(), panel);
+            self.cards.views.insert(
+                id.0.clone(),
+                crate::cards::CardView {
+                    panel: card.panel,
+                    kind: card.kind,
+                },
+            );
             entries.retain(|(_, entry)| {
                 entry.generation == *self.cards.generations.get(&entry.user).unwrap_or(&0)
             });
@@ -224,8 +235,8 @@ impl Runtime {
         }
     }
 
-    /// Deliver a freshly built list panel, refreshing the original card when
-    /// the user asked for it.
+    /// Route a finished list request: plain text replies directly; panel
+    /// content goes through `deliver_list`, which mints the panel number.
     #[allow(clippy::too_many_arguments)]
     fn listed(
         &mut self,
@@ -234,82 +245,53 @@ impl Runtime {
         user: String,
         directory: std::path::PathBuf,
         generation: u64,
-        stop_snapshot: (u64, Option<TaskId>),
+        snapshot: crate::cards::TaskSnapshot,
         result: Result<ListedContent, crate::sessions::StartError>,
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), RuntimeError> {
+        let owner = crate::cards::Owner {
+            user,
+            chat: chat.clone(),
+            directory,
+            generation,
+            snapshot,
+        };
         match result {
             Ok(ListedContent::Text(text)) => tell(&self.delivery, &chat, text)?,
-            Ok(ListedContent::Threads { entries, archived }) => {
-                self.deliver_list(
-                    jobs,
-                    refresh,
-                    chat,
-                    user,
-                    directory,
-                    generation,
-                    stop_snapshot,
-                    crate::cards::threads(
-                        &entries,
-                        archived,
-                        &format!(
-                            "panel-{}-{}",
-                            self.settings.epoch,
-                            self.cards.next_panel + 1
-                        ),
-                    ),
-                )?;
-            }
-            Ok(ListedContent::Models { entries, current }) => {
-                self.deliver_list(
-                    jobs,
-                    refresh,
-                    chat,
-                    user,
-                    directory,
-                    generation,
-                    stop_snapshot,
-                    crate::cards::models(
-                        &entries,
-                        current.as_deref(),
-                        &format!(
-                            "panel-{}-{}",
-                            self.settings.epoch,
-                            self.cards.next_panel + 1
-                        ),
-                    ),
-                )?;
+            Ok(content @ (ListedContent::Threads { .. } | ListedContent::Models { .. })) => {
+                self.deliver_list(jobs, refresh, content, owner)?;
             }
             Err(error) => tell(&self.delivery, &chat, format!("读取会话列表失败：{error}"))?,
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Mint the next panel number, build the list card with it and deliver it
+    /// — refreshing the original card when the user asked for it. Callers
+    /// never predict the panel number; it exists only here.
     fn deliver_list(
         &mut self,
         jobs: &mut JoinSet<Done>,
         refresh: Option<String>,
-        chat: String,
-        user: String,
-        directory: std::path::PathBuf,
-        generation: u64,
-        stop_snapshot: (u64, Option<TaskId>),
-        built: (Panel, Vec<(crate::cards::CardToken, String)>),
+        content: ListedContent,
+        owner: crate::cards::Owner,
     ) -> Result<(), RuntimeError> {
         self.cards.next_panel = self
             .cards
             .next_panel
             .checked_add(1)
             .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
-        let (panel, commands) = built;
-        let owner = crate::cards::Owner {
-            user,
-            chat: chat.clone(),
-            directory,
-            generation,
-            stop_snapshot,
+        let prefix = super::super::tokens::panel_prefix(self.settings.epoch, self.cards.next_panel);
+        let card = match content {
+            ListedContent::Threads { entries, archived } => {
+                crate::cards::threads(&entries, archived, &prefix)
+            }
+            ListedContent::Models { entries, current } => {
+                crate::cards::models(&entries, current.as_deref(), &prefix)
+            }
+            ListedContent::Text(_) => return Ok(()),
         };
+        let chat = owner.chat.clone();
         if let Some(source) = refresh {
             if self.cards.refreshes.len() >= limits::PANEL_REFRESHES {
                 tell(
@@ -321,8 +303,7 @@ impl Runtime {
                 self.cards.refreshes.push_back(PanelRefresh {
                     source,
                     owner,
-                    panel,
-                    commands,
+                    card,
                 });
             }
         } else {
@@ -336,8 +317,7 @@ impl Runtime {
                 jobs,
                 self.messenger.clone(),
                 owner,
-                panel,
-                commands,
+                card,
             );
         }
         Ok(())

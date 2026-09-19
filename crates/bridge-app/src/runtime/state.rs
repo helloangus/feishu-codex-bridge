@@ -95,8 +95,7 @@ pub(crate) enum FileDelivery {
 pub(crate) struct PanelRefresh {
     pub(crate) source: String,
     pub(crate) owner: crate::cards::Owner,
-    pub(crate) panel: Panel,
-    pub(crate) commands: Vec<(CardToken, String)>,
+    pub(crate) card: crate::cards::BuiltCard,
 }
 
 pub(crate) enum ListedContent {
@@ -248,7 +247,7 @@ pub(crate) enum CardDone {
     PanelUpdated,
     PanelSent {
         refreshed: bool,
-        panel: Panel,
+        card: crate::cards::BuiltCard,
         entries: Vec<(CardToken, crate::cards::Action)>,
         result: Result<MessageId, DeliveryError>,
     },
@@ -258,7 +257,7 @@ pub(crate) enum CardDone {
         user: String,
         directory: PathBuf,
         generation: u64,
-        stop_snapshot: (u64, Option<TaskId>),
+        stop_snapshot: crate::cards::TaskSnapshot,
         result: Result<ListedContent, sessions::StartError>,
     },
 }
@@ -299,6 +298,27 @@ pub(crate) struct CardBook {
     pub(crate) updating_panel: bool,
     pub(crate) next_panel: u64,
     pub(crate) plan_offer: Option<crate::plans::Offer>,
+}
+
+impl CardBook {
+    /// Whether a clicked button may fire — the single validation path for
+    /// card actions. A button survives five checks ([`cards::Actions::take`]):
+    /// the token exists; it belongs to this user in this chat and directory;
+    /// it was delivered by this exact message; it is unexpired; and, for
+    /// buttons bound to a [`crate::cards::TaskSnapshot`] (stop and plan
+    /// actions), that snapshot still matches the task track.
+    pub(crate) fn resolve_click(
+        &mut self,
+        click: &crate::cards::Click,
+        user: &str,
+        chat: &str,
+        directory: &std::path::Path,
+        now: Instant,
+        snapshot: &crate::cards::TaskSnapshot,
+    ) -> Option<String> {
+        self.actions
+            .take(click, user, chat, directory, now, snapshot)
+    }
 }
 
 /// Approval and question interactions plus their buffered protocol context.
@@ -423,14 +443,15 @@ impl Runtime {
     }
 
     /// The snapshot card actions compare themselves against.
-    pub(crate) fn card_snapshot(&self) -> (u64, Option<TaskId>) {
-        (
-            self.tasks.next_task,
-            self.tasks
+    pub(crate) fn card_snapshot(&self) -> crate::cards::TaskSnapshot {
+        crate::cards::TaskSnapshot {
+            next_task: self.tasks.next_task,
+            active: self
+                .tasks
                 .active
                 .as_ref()
                 .map(|active| active.spec.id.clone()),
-        )
+        }
     }
 
     /// Bookkeeping that runs between every event: archive sync, expiries,
@@ -551,8 +572,8 @@ impl Runtime {
                 Some(value) => value,
                 None => return,
             };
-            let prefix = format!("panel-{}-{}", self.settings.epoch, self.cards.next_panel);
-            let (panel, commands) = match &pending.request.kind {
+            let prefix = super::tokens::panel_prefix(self.settings.epoch, self.cards.next_panel);
+            let card = match &pending.request.kind {
                 RequestKind::Approval(request) => crate::cards::approval(request, &token, &prefix),
                 RequestKind::Questions { questions, .. } => crate::cards::question(
                     &questions[pending.question],
@@ -567,14 +588,14 @@ impl Runtime {
             jobs.spawn(async move {
                 let result = timeout(
                     limits::MESSAGE_TIMEOUT,
-                    messenger.send_panel(chat, panel.clone()),
+                    messenger.send_panel(chat, card.panel.clone()),
                 )
                 .await
                 .unwrap_or(Err(DeliveryError::Transport));
                 Done::Card(CardDone::ApprovalSent {
                     token,
-                    panel,
-                    commands,
+                    panel: card.panel,
+                    commands: card.commands,
                     result,
                 })
             });
@@ -592,8 +613,7 @@ impl Runtime {
                 jobs,
                 self.messenger.clone(),
                 refresh.owner,
-                refresh.panel,
-                refresh.commands,
+                refresh.card,
             );
             return;
         }
@@ -706,9 +726,9 @@ impl Runtime {
             Some(value) => value,
             None => return,
         };
-        let (panel, commands) = crate::plans::panel(
+        let card = crate::plans::panel(
             offer,
-            &format!("panel-{}-{}", self.settings.epoch, self.cards.next_panel),
+            &super::tokens::panel_prefix(self.settings.epoch, self.cards.next_panel),
         );
         let owner = crate::cards::Owner {
             user: offer.task.session.user.clone(),
@@ -719,7 +739,10 @@ impl Runtime {
                 .generations
                 .get(&offer.task.session.user)
                 .unwrap_or(&0),
-            stop_snapshot: (self.tasks.next_task, None),
+            snapshot: crate::cards::TaskSnapshot {
+                next_task: self.tasks.next_task,
+                active: None,
+            },
         };
         super::flow::send_panel(
             &self.diagnostics,
@@ -727,8 +750,7 @@ impl Runtime {
             jobs,
             self.messenger.clone(),
             owner,
-            panel,
-            commands,
+            card,
         );
     }
 

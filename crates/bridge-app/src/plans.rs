@@ -10,14 +10,8 @@ pub struct Offer {
     pub deadline: tokio::time::Instant,
 }
 
-pub fn panel(
-    offer: &Offer,
-    prefix: &str,
-) -> (
-    bridge_core::view::Panel,
-    Vec<(crate::cards::CardToken, String)>,
-) {
-    crate::cards::panel(
+pub fn panel(offer: &Offer, prefix: &str) -> crate::cards::BuiltCard {
+    let (panel, commands) = crate::cards::panel(
         "Plan 已完成，请确认下一步",
         format!(
             "{}\n\n请选择直接实施、清空上下文后实施，或继续讨论。实施会关闭 Plan 模式；继续讨论保持 Plan 模式。仅本人在原聊天、目录和会话中操作，10 分钟有效。新任务或会话设置变更会使本计划失效。",
@@ -38,5 +32,10 @@ pub fn panel(
             ),
         ],
         prefix,
-    )
+    );
+    crate::cards::BuiltCard {
+        panel,
+        commands,
+        kind: crate::cards::CardKind::Interaction,
+    }
 }

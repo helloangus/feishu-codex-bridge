@@ -114,10 +114,10 @@ impl Runtime {
                                 .next_token
                                 .checked_add(1)
                                 .ok_or(RuntimeError::Capacity("审批编号耗尽"))?;
-                            let token = crate::cards::CardToken::new(format!(
-                                "approval-{}-{}",
-                                self.settings.epoch, self.approvals.next_token
-                            ));
+                            let token = super::tokens::approval(
+                                self.settings.epoch,
+                                self.approvals.next_token,
+                            );
                             let owner = crate::cards::Owner {
                                 user: self
                                     .tasks
@@ -148,7 +148,7 @@ impl Runtime {
                                             .copied()
                                     })
                                     .unwrap_or(0),
-                                stop_snapshot: self.card_snapshot(),
+                                snapshot: self.card_snapshot(),
                             };
                             let pending = Pending {
                                 waiting_text: false,

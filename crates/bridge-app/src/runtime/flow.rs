@@ -12,7 +12,7 @@ use crate::{
     ports::TurnRef,
     presentation::Request as DeliveryRequest,
 };
-use bridge_core::{ExecutionMode, view::Panel};
+use bridge_core::ExecutionMode;
 use std::sync::Arc;
 use tokio::{
     sync::mpsc,
@@ -64,9 +64,13 @@ pub(crate) fn send_panel(
     jobs: &mut JoinSet<Done>,
     messenger: Arc<dyn Messenger>,
     owner: crate::cards::Owner,
-    panel: Panel,
-    commands: Vec<(crate::cards::CardToken, String)>,
+    card: crate::cards::BuiltCard,
 ) -> bool {
+    let crate::cards::BuiltCard {
+        panel,
+        commands,
+        kind,
+    } = card;
     if !can_spawn(jobs, false) {
         return false;
     }
@@ -136,10 +140,11 @@ pub(crate) fn send_panel(
             );
         }
         let entries = commands
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|(token, command)| {
                 let stop_snapshot = if command == "/stop" || command.starts_with("/plan-action ") {
-                    Some(owner.stop_snapshot.clone())
+                    Some(owner.snapshot.clone())
                 } else {
                     None
                 };
@@ -160,7 +165,11 @@ pub(crate) fn send_panel(
             .collect();
         Done::Card(CardDone::PanelSent {
             refreshed: source.is_some(),
-            panel,
+            card: crate::cards::BuiltCard {
+                panel,
+                commands,
+                kind,
+            },
             entries,
             result,
         })
@@ -237,7 +246,7 @@ pub(crate) fn event(
                     task: active.spec.clone(),
                     thread: active.turn.as_ref()?.thread_id.clone(),
                     text: text.clone(),
-                    token: crate::cards::CardToken::new(format!("plan-{}", active.spec.id)),
+                    token: super::tokens::plan(&active.spec.id),
                     sent: false,
                     deadline: Instant::now() + limits::INTERACTION_TIMEOUT,
                 })

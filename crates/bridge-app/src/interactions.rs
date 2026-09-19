@@ -418,7 +418,10 @@ mod tests {
             chat: "chat".into(),
             directory: "/workspace".into(),
             generation: 3,
-            stop_snapshot: (0, None),
+            snapshot: crate::cards::TaskSnapshot {
+                next_task: 0,
+                active: None,
+            },
         }
     }
     fn task() -> bridge_core::task::TaskId {

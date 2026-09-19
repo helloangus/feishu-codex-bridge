@@ -79,7 +79,7 @@ impl Runtime {
         let mut approval_source = None;
         if let Some(click) = input.card.take() {
             let snapshot = self.card_snapshot();
-            let Some(command) = self.cards.actions.take(
+            let Some(command) = self.cards.resolve_click(
                 &click,
                 &input.user,
                 &input.chat,
@@ -103,7 +103,7 @@ impl Runtime {
                 self.cards.views.remove(&click.source);
                 refresh = Some(click.source.clone());
             }
-            input.id = format!("card:{}", click.token);
+            input.id = super::tokens::click_receipt(&click.token);
             input.text = Some(command);
         }
         let text = input.text.as_deref().unwrap_or("").trim().to_owned();
@@ -178,16 +178,16 @@ impl Runtime {
                         .next_panel
                         .checked_add(1)
                         .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
-                    let (panel, commands) = crate::cards::help(&format!(
-                        "panel-{}-{}",
-                        self.settings.epoch, self.cards.next_panel
+                    let card = crate::cards::help(&super::tokens::panel_prefix(
+                        self.settings.epoch,
+                        self.cards.next_panel,
                     ));
                     let owner = crate::cards::Owner {
                         user: input.user.clone(),
                         chat: input.chat.clone(),
                         directory: current.clone(),
                         generation: *self.cards.generations.get(&input.user).unwrap_or(&0),
-                        stop_snapshot: self.card_snapshot(),
+                        snapshot: self.card_snapshot(),
                     };
                     send_panel(
                         &self.diagnostics,
@@ -195,8 +195,7 @@ impl Runtime {
                         jobs,
                         self.messenger.clone(),
                         owner,
-                        panel,
-                        commands,
+                        card,
                     );
                 }
             }
