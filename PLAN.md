@@ -72,9 +72,9 @@
 
 ### L `refactor/local-safeio` — 安全边界与测试契约
 
-- [ ] 新增 `bridge-local/src/safeio.rs`：统一 NOFOLLOW 逐组件走路径（现三份重复）、原子发布（现两份重复）与 `pinned_path`；`bridge-cli` 的五处安全打开改用。
-- [ ] `async_state.rs` 校验常量化并提取助手，`key()` 持久化格式成文；`snapshot.rs::scan_excluding` 拆分职责并命名 20MB 上限。
-- [ ] `fake_codex_runtime.rs` 顶部补 mode→行为→信号文件契约表；`runtime_flows.rs` 按 mode 拆分断言函数。
+- [x] 新增 `bridge-local/src/safeio.rs`：统一 NOFOLLOW 逐组件走路径（现三份重复）、原子发布（现两份重复）与 `pinned_path`；`bridge-cli` 的五处安全打开改用。
+- [x] `async_state.rs` 校验常量化并提取助手，`key()` 持久化格式成文；`snapshot.rs::scan_excluding` 拆分职责并命名 20MB 上限。
+- [x] `fake_codex_runtime.rs` 顶部补 mode→行为→信号文件契约表；`runtime_flows.rs` 按 mode 拆分断言函数。
 - [ ] 文件访问安全边界一节（威胁模型与原语清单）与测试架构节进入文档。
 
 ### M `docs/architecture-home` — 文档总装与词汇表
