@@ -1,5 +1,8 @@
 //! Serial answer and preview delivery. Platform JSON stays in the messenger adapter.
-use crate::messaging::{DeliveryError, MessageId, Messenger};
+use crate::{
+    diagnostics::Diagnostics,
+    messaging::{DeliveryError, MessageId, Messenger},
+};
 use bridge_core::view::{Panel, Tone};
 use tokio::time::{Duration, timeout};
 
@@ -90,7 +93,14 @@ pub struct Presentation {
     failed_task: Option<String>,
 }
 impl Presentation {
-    pub async fn progress(&mut self, m: &dyn Messenger, task: String, chat: String, text: String) {
+    pub async fn progress(
+        &mut self,
+        diagnostics: &Diagnostics,
+        m: &dyn Messenger,
+        task: String,
+        chat: String,
+        text: String,
+    ) {
         if self.failed_task.as_deref() == Some(&task) {
             return;
         }
@@ -113,7 +123,12 @@ impl Presentation {
             Ok(Ok(id)) => self.preview = Some((task, id)),
             _ => {
                 self.failed_task = Some(task);
-                eprintln!("{{\"event\":\"progress_delivery_failed\"}}");
+                diagnostics.emit(
+                    crate::diagnostics::Event::DeliveryFailed,
+                    crate::diagnostics::Status::Failed,
+                    None,
+                    0,
+                );
             }
         }
     }
@@ -268,10 +283,22 @@ mod tests {
     -> Result<(), DeliveryError> {
         let m = Fake::default();
         let mut p = Presentation::default();
-        p.progress(&m, "task".into(), "chat".into(), "first".into())
-            .await;
-        p.progress(&m, "task".into(), "chat".into(), "second".into())
-            .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "first".into(),
+        )
+        .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "second".into(),
+        )
+        .await;
         p.answer(
             &m,
             "task".into(),
@@ -308,10 +335,22 @@ mod tests {
         let m = Fake::default();
         let mut p = Presentation::default();
         m.fail_panel.store(true, Ordering::Relaxed);
-        p.progress(&m, "task".into(), "chat".into(), "first".into())
-            .await;
-        p.progress(&m, "task".into(), "chat".into(), "second".into())
-            .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "first".into(),
+        )
+        .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "second".into(),
+        )
+        .await;
         assert_eq!(m.events().len(), 1);
         p.answer(&m, "task".into(), "chat".into(), "final".into())
             .await?;
@@ -321,8 +360,14 @@ mod tests {
                 .is_some_and(|e| e.starts_with("text:") && e.contains("final"))
         );
         m.fail_panel.store(false, Ordering::Relaxed);
-        p.progress(&m, "next".into(), "chat".into(), "new".into())
-            .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "next".into(),
+            "chat".into(),
+            "new".into(),
+        )
+        .await;
         assert!(
             m.events()
                 .last()
@@ -334,13 +379,31 @@ mod tests {
     async fn failed_preview_update_does_not_suppress_final_parts() -> Result<(), DeliveryError> {
         let m = Fake::default();
         let mut p = Presentation::default();
-        p.progress(&m, "task".into(), "chat".into(), "first".into())
-            .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "first".into(),
+        )
+        .await;
         m.fail_update.store(true, Ordering::Relaxed);
-        p.progress(&m, "task".into(), "chat".into(), "second".into())
-            .await;
-        p.progress(&m, "task".into(), "chat".into(), "third".into())
-            .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "second".into(),
+        )
+        .await;
+        p.progress(
+            &Diagnostics::noop(),
+            &m,
+            "task".into(),
+            "chat".into(),
+            "third".into(),
+        )
+        .await;
         assert_eq!(m.events().len(), 2);
         p.answer(&m, "task".into(), "chat".into(), "文".repeat(6000))
             .await?;

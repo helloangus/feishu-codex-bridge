@@ -1,7 +1,8 @@
 //! Feishu REST implementation with shared authentication and bounded transfers.
 use crate::cards;
+use bridge_app::files::ResourceFetcher;
 use bridge_app::messaging::{
-    DeliveryError, DeliveryFuture, MessageId, Messenger, ResourceFetcher, ResourceKind, ResourceRef,
+    DeliveryError, DeliveryFuture, MessageId, Messenger, ResourceKind, ResourceRef,
 };
 use bridge_core::view::Panel;
 use futures_util::StreamExt;
@@ -207,6 +208,10 @@ async fn checked(response: reqwest::Response) -> Result<Value, DeliveryError> {
 }
 
 impl Messenger for FeishuRest {
+    /// Feishu carries interactive cards, so answers use the rich path.
+    fn rich_output(&self) -> bool {
+        true
+    }
     fn send_panel(&self, chat: String, panel: Panel) -> DeliveryFuture<'_, MessageId> {
         Box::pin(async move {
             self.message(chat, "interactive", cards::render(&panel))

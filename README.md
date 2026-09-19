@@ -37,21 +37,16 @@
 ## 开发验证
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked -- --test-threads=1
-cargo build -p bridge-cli --bin bridge --locked
-cargo doc --workspace --no-deps --locked
-cargo xtask check-boundaries
-bash -n setup.sh start.sh package.sh
-git diff --check
+cargo xtask check
 ```
 
-测试不读取真实配置、不访问外部服务、不启动长期服务；网络协议测试使用本地 socket。协议假进程和 schema 校验由 Rust 测试工具完成，脚本入口测试仍使用 Shell 替身。开发约定见 [开发指南](docs/development.md)，当前系统边界见 [架构说明](docs/architecture.md)。
+统一入口依次执行 fmt、Clippy（`-D warnings`）、串行 workspace 测试、产品构建、rustdoc（warnings 视为错误）、依赖边界、仓库卫生、Shell 语法、diff 检查和打包结构校验；`cargo xtask fetch` 预取依赖后可用 `cargo xtask check --offline` 完全离线执行。发布打包使用 `cargo xtask package [输出目录]`，根目录 `package.sh` 是它的转发入口。
+
+测试不读取真实配置、不访问外部服务、不启动长期服务；网络协议测试使用本地 socket。协议假进程和 schema 校验由 Rust 测试工具完成，协议 fixture、生产序列化与真实解码均对照 `schemas/` 下版本化 schema 校验，协议基线版本集中在 `bridge_codex::protocol::CODEX_SCHEMA_BASELINE`。开发约定见 [开发指南](docs/development.md)，当前系统边界见 [架构说明](docs/architecture.md)。
 
 ## 整改交接
 
-[PLAN.md](PLAN.md) 是当前工程整改清单，记录已发现的问题、修改方向与验收条件。未勾选的项目尚未实现，包括新的 xtask 命令；接手修改前先阅读交接状态，不沿用已经删除的迁移计划或过渡期设计说明。
+[PLAN.md](PLAN.md) 是当前工程整改清单，记录已发现的问题、修改方向与验收条件。未勾选的项目尚未实现；接手修改前先阅读交接状态，不沿用已经删除的迁移计划或过渡期设计说明。
 
 ## 发布状态
 

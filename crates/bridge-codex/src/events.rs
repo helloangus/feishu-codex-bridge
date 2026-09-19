@@ -1,4 +1,5 @@
-//! Notifications mapped against the 0.153.4 schema; no current-task fallback.
+//! Notifications mapped against the pinned protocol baseline (`crate::protocol`);
+//! no current-task fallback.
 use bridge_app::{
     events::{AgentEvent, TurnOutcome},
     ports::{BackendError, TurnRef},

@@ -1,9 +1,12 @@
 //! Bounded snapshots and delivery classification. Never upload engineering text.
+//!
+//! The snapshot data model lives in [`bridge_app::files`]; this module owns the
+//! scanning, diffing and safe-open algorithms over it.
+use bridge_app::files::{Entry, FileDiff, FileKind, Limits, Snapshot};
 use rustix::fs::{Mode, OFlags, openat};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::{
-    collections::BTreeMap,
     fs::File,
     io::{self, Read},
     path::{Component, Path},
@@ -33,13 +36,6 @@ const ARTIFACT_EXTS: &[&str] = &[
     "ppt", "pptx", "odt", "ods", "mp3", "wav", "ogg", "m4a", "mp4", "mov", "webm", "zip", "tar",
     "gz", "bz2", "xz", "7z",
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    Ignore,
-    Text,
-    Artifact,
-}
 
 pub fn file_kind(relative: &Path) -> FileKind {
     if relative.components().any(|part| match part {
@@ -98,39 +94,6 @@ pub fn open_regular(root: &File, relative: &Path) -> io::Result<File> {
         ));
     }
     Ok(directory)
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Limits {
-    pub files: usize,
-    pub text_bytes: usize,
-    pub entries: usize,
-    pub diff_chars: usize,
-}
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            files: 200,
-            text_bytes: 256 * 1024,
-            entries: 10_000,
-            diff_chars: 20_000,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub kind: FileKind,
-    pub bytes: u64,
-    pub modified: Option<std::time::SystemTime>,
-    pub text: Option<String>,
-    pub skipped: Option<String>,
-    pub digest: Option<[u8; 32]>,
-}
-#[derive(Debug, Default)]
-pub struct Snapshot {
-    pub files: BTreeMap<std::path::PathBuf, Entry>,
-    pub complete: bool,
 }
 
 pub fn scan(root: &Path, limits: Limits) -> io::Result<Snapshot> {
@@ -241,12 +204,6 @@ pub fn scan_excluding(
         result.files.insert(relative.into(), state);
     }
     Ok(result)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct FileDiff {
-    pub path: std::path::PathBuf,
-    pub content: String,
 }
 
 fn changed(old: Option<&Entry>, new: &Entry) -> bool {

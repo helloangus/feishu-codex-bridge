@@ -6,9 +6,32 @@ use thiserror::Error;
 
 pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 
-#[derive(Debug, Error, PartialEq, Eq)]
+/// Category of a durable-state failure. The error's `Display` stays one safe
+/// user message; the kind preserves the underlying cause for operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreFailureKind {
+    Io,
+    Format,
+    Version(u32),
+    Locked,
+    Uncertain,
+    InvalidMessage,
+}
+
+#[derive(Debug, Error)]
 #[error("状态保存或读取失败")]
-pub struct SessionStoreError;
+pub struct SessionStoreError {
+    kind: StoreFailureKind,
+}
+
+impl SessionStoreError {
+    pub fn new(kind: StoreFailureKind) -> Self {
+        Self { kind }
+    }
+    pub fn kind(&self) -> &StoreFailureKind {
+        &self.kind
+    }
+}
 
 pub type StoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SessionStoreError>> + Send + 'a>>;

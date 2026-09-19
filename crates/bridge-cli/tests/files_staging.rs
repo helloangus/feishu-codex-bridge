@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used)] // Assertions and fake recording locks only.
+use bridge_app::files::{Attachment, Deliveries, ResourceFetcher, TaskFiles};
 use bridge_app::messaging::*;
 use bridge_core::view::Panel;
-use bridge_local::delivery::Delivery;
+use bridge_local::workspace_files::WorkspaceFiles;
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -91,8 +92,13 @@ async fn stage_images_then_diff_and_upload_only_changed_artifacts() -> Result {
         bytes: b"\x89PNG\r\n\x1a\nbody".to_vec(),
         ..Fake::default()
     });
-    let delivery =
-        Delivery::new(fake.clone(), fake.clone()).excluding(vec![root.join("custom-state")]);
+    let delivery = Deliveries::new(
+        bridge_app::diagnostics::Diagnostics::noop(),
+        Arc::new(WorkspaceFiles),
+        fake.clone(),
+        fake.clone(),
+    )
+    .excluding(vec![root.join("custom-state")]);
     fs::write(root.join("main.rs"), "old\n")?;
     fs::write(root.join("same.pdf"), b"same")?;
     let prepared = delivery
@@ -164,7 +170,12 @@ async fn failed_or_invalid_download_never_publishes_partial_files() -> Result {
             fail,
             ..Fake::default()
         });
-        let delivery = Delivery::new(fake.clone(), fake);
+        let delivery = Deliveries::new(
+            bridge_app::diagnostics::Diagnostics::noop(),
+            Arc::new(WorkspaceFiles),
+            fake.clone(),
+            fake,
+        );
         assert!(
             delivery
                 .prepare_files(
@@ -175,6 +186,8 @@ async fn failed_or_invalid_download_never_publishes_partial_files() -> Result {
                 .await
                 .is_err()
         );
+        // Nothing may have been published under the inbox, whatever failed.
+        fs::create_dir_all(temp.path().join("feishu-inbox"))?;
         assert_eq!(fs::read_dir(temp.path().join("feishu-inbox"))?.count(), 0);
     }
     Ok(())
@@ -187,7 +200,12 @@ async fn ordinary_files_use_prompt_paths_and_oversized_downloads_are_discarded()
         bytes: b"plain data".to_vec(),
         ..Fake::default()
     });
-    let delivery = Delivery::new(fake.clone(), fake);
+    let delivery = Deliveries::new(
+        bridge_app::diagnostics::Diagnostics::noop(),
+        Arc::new(WorkspaceFiles),
+        fake.clone(),
+        fake,
+    );
     let result = delivery
         .prepare_files(
             "file".into(),
@@ -203,7 +221,12 @@ async fn ordinary_files_use_prompt_paths_and_oversized_downloads_are_discarded()
         reported_size: Some(21 * 1024 * 1024),
         ..Fake::default()
     });
-    let delivery = Delivery::new(fake.clone(), fake);
+    let delivery = Deliveries::new(
+        bridge_app::diagnostics::Diagnostics::noop(),
+        Arc::new(WorkspaceFiles),
+        fake.clone(),
+        fake,
+    );
     assert!(matches!(
         delivery
             .prepare_files(
@@ -227,7 +250,12 @@ async fn inbox_symlink_rejected_and_upload_failure_reported_once() -> Result {
         fail: true,
         ..Fake::default()
     });
-    let delivery = Delivery::new(fake.clone(), fake.clone());
+    let delivery = Deliveries::new(
+        bridge_app::diagnostics::Diagnostics::noop(),
+        Arc::new(WorkspaceFiles),
+        fake.clone(),
+        fake.clone(),
+    );
     assert!(
         delivery
             .prepare_files(
@@ -259,7 +287,12 @@ async fn inbox_symlink_rejected_and_upload_failure_reported_once() -> Result {
 async fn oversized_artifacts_do_not_consume_the_ten_delivery_slots() -> Result {
     let temp = tempfile::tempdir()?;
     let fake = Arc::new(Fake::default());
-    let delivery = Delivery::new(fake.clone(), fake.clone());
+    let delivery = Deliveries::new(
+        bridge_app::diagnostics::Diagnostics::noop(),
+        Arc::new(WorkspaceFiles),
+        fake.clone(),
+        fake.clone(),
+    );
     delivery
         .prepare_files("task".into(), temp.path().into(), vec![])
         .await?;
@@ -286,8 +319,13 @@ async fn generated_images_are_thread_scoped_and_deduplicated_with_workspace() ->
     fs::create_dir(generated.path().join("thread"))?;
     fs::write(generated.path().join("thread/old.png"), b"old")?;
     let fake = Arc::new(Fake::default());
-    let delivery =
-        Delivery::new(fake.clone(), fake.clone()).generated_images(Some(generated.path().into()));
+    let delivery = Deliveries::new(
+        bridge_app::diagnostics::Diagnostics::noop(),
+        Arc::new(WorkspaceFiles),
+        fake.clone(),
+        fake.clone(),
+    )
+    .generated_images(Some(generated.path().into()));
     delivery
         .prepare_files("task".into(), temp.path().into(), vec![])
         .await?;

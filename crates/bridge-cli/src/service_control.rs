@@ -6,6 +6,64 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Supervisor control actions; the single-byte wire encoding lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCommand {
+    Phase,
+    Pid,
+    Stop,
+}
+impl ControlCommand {
+    fn byte(self) -> u8 {
+        match self {
+            Self::Phase => b's',
+            Self::Pid => b'p',
+            Self::Stop => b'x',
+        }
+    }
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            b's' => Some(Self::Phase),
+            b'p' => Some(Self::Pid),
+            b'x' => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
+/// Supervisor control responses; unknown payloads are surfaced verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlResponse {
+    Phase(String),
+    Pid(String),
+    Stopping,
+    Invalid,
+}
+impl ControlResponse {
+    fn parse(payload: String) -> Self {
+        match payload.as_str() {
+            "stopping" => Self::Stopping,
+            "invalid" => Self::Invalid,
+            digits if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                Self::Pid(payload)
+            }
+            _ => Self::Phase(payload),
+        }
+    }
+    pub fn as_phase(&self) -> Option<&str> {
+        match self {
+            Self::Phase(phase) => Some(phase),
+            _ => None,
+        }
+    }
+    pub fn as_pid(&self) -> Option<u32> {
+        match self {
+            Self::Pid(pid) => pid.parse().ok(),
+            _ => None,
+        }
+    }
+}
+
 pub fn command_lock(state: &Path) -> io::Result<std::fs::File> {
     use fs2::FileExt;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -33,7 +91,7 @@ pub fn command_lock(state: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-pub async fn request(state: &Path, command: u8) -> io::Result<String> {
+pub async fn request(state: &Path, command: ControlCommand) -> io::Result<ControlResponse> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let socket = if crate::supervisor::guard_running(state)? {
             "runtime/guard.sock"
@@ -41,13 +99,16 @@ pub async fn request(state: &Path, command: u8) -> io::Result<String> {
             "runtime/control.sock"
         };
         let mut stream = UnixStream::connect(state.join(socket)).await?;
-        stream.write_all(&[command]).await?;
+        stream.write_all(&[command.byte()]).await?;
         let mut bytes = Vec::new();
         stream.take(4097).read_to_end(&mut bytes).await?;
         if bytes.len() > 4096 {
             return Err(io::Error::other("control response too large"));
         }
-        String::from_utf8(bytes).map_err(io::Error::other)
+        let payload = String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "control response is not UTF-8")
+        })?;
+        Ok(ControlResponse::parse(payload))
     })
     .await
     .map_err(|_| io::Error::other("supervisor control timed out"))?
@@ -64,18 +125,18 @@ pub async fn serve(
             result = listener.accept() => result?,
         };
         let result = tokio::time::timeout(Duration::from_secs(1), async {
-            let command = stream.read_u8().await?;
+            let command = ControlCommand::from_byte(stream.read_u8().await?);
             let response = match command {
-                b's' => phase
+                Some(ControlCommand::Phase) => phase
                     .lock()
                     .map_err(|_| io::Error::other("phase poisoned"))?
                     .clone(),
-                b'p' => std::process::id().to_string(),
-                b'x' => {
+                Some(ControlCommand::Pid) => std::process::id().to_string(),
+                Some(ControlCommand::Stop) => {
                     cancel.cancel();
                     "stopping".into()
                 }
-                _ => "invalid".into(),
+                None => "invalid".into(),
             };
             stream.write_all(response.as_bytes()).await
         })
@@ -90,7 +151,7 @@ pub async fn stop(state: &Path) -> io::Result<()> {
     if !crate::supervisor::is_running(state)? {
         return Ok(());
     }
-    if request(state, b'x').await? != "stopping" {
+    if request(state, ControlCommand::Stop).await? != ControlResponse::Stopping {
         return Err(io::Error::other("stop not acknowledged"));
     }
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -136,8 +197,12 @@ pub async fn start(config: &Path, state: &Path) -> io::Result<()> {
                 return Err(io::Error::other("supervisor exited during startup"));
             }
             if crate::supervisor::is_running(state)? {
-                if let Ok(pid) = request(state, b'p').await {
-                    if Some(pid.parse::<u32>().map_err(io::Error::other)?) == child.id() {
+                if let Some(pid) = request(state, ControlCommand::Pid)
+                    .await
+                    .ok()
+                    .and_then(|response| response.as_pid())
+                {
+                    if Some(pid) == child.id() {
                         return Ok(());
                     }
                 }
@@ -151,9 +216,13 @@ pub async fn start(config: &Path, state: &Path) -> io::Result<()> {
         other => {
             // Do not kill a supervisor that may already own descendants. Request
             // orderly shutdown only if the responder is the child we launched.
-            if let Ok(pid) = request(state, b'p').await {
-                if pid.parse::<u32>().ok() == child.id() {
-                    let _ = request(state, b'x').await;
+            if let Some(pid) = request(state, ControlCommand::Pid)
+                .await
+                .ok()
+                .and_then(|response| response.as_pid())
+            {
+                if Some(pid) == child.id() {
+                    let _ = request(state, ControlCommand::Stop).await;
                     let _ = tokio::time::timeout(Duration::from_secs(30), child.wait()).await;
                 }
             }
@@ -181,8 +250,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let phase = std::sync::Arc::new(std::sync::Mutex::new("backoff:8".into()));
         let task = tokio::spawn(serve(listener, cancel.clone(), phase));
-        assert_eq!(request(tmp.path(), b's').await?, "backoff:8");
-        assert_eq!(request(tmp.path(), b'x').await?, "stopping");
+        assert_eq!(
+            request(tmp.path(), ControlCommand::Phase).await?,
+            ControlResponse::Phase("backoff:8".into())
+        );
+        assert_eq!(
+            request(tmp.path(), ControlCommand::Stop).await?,
+            ControlResponse::Stopping
+        );
         task.await.map_err(io::Error::other)??;
         assert!(cancel.is_cancelled());
         Ok(())
@@ -204,10 +279,21 @@ mod tests {
         let cancel = CancellationToken::new();
         let phase = std::sync::Arc::new(std::sync::Mutex::new("backoff:4".into()));
         let task = tokio::spawn(serve(listener, cancel.clone(), phase));
-        assert_eq!(request(tmp.path(), b's').await?, "backoff:4");
-        assert_eq!(request(tmp.path(), b'?').await?, "invalid");
+        assert_eq!(
+            request(tmp.path(), ControlCommand::Phase).await?,
+            ControlResponse::Phase("backoff:4".into())
+        );
+        // An unknown wire byte must stay rejected by the responder itself.
+        let mut raw = UnixStream::connect(tmp.path().join("runtime/control.sock")).await?;
+        raw.write_all(b"?").await?;
+        let mut bytes = Vec::new();
+        raw.read_to_end(&mut bytes).await?;
+        assert_eq!(bytes, b"invalid");
         assert!(!cancel.is_cancelled());
-        assert_eq!(request(tmp.path(), b'x').await?, "stopping");
+        assert_eq!(
+            request(tmp.path(), ControlCommand::Stop).await?,
+            ControlResponse::Stopping
+        );
         task.await.map_err(io::Error::other)??;
         assert!(cancel.is_cancelled());
         Ok(())

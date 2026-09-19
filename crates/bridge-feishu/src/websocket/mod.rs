@@ -163,9 +163,15 @@ pub struct Client {
     app_id: String,
     app_secret: String,
     policy: Policy,
+    diagnostics: bridge_app::diagnostics::Diagnostics,
 }
 impl Client {
-    pub fn new(app_id: String, app_secret: String, proxy: Option<&str>) -> Result<Self, Error> {
+    pub fn new(
+        app_id: String,
+        app_secret: String,
+        proxy: Option<&str>,
+        diagnostics: bridge_app::diagnostics::Diagnostics,
+    ) -> Result<Self, Error> {
         if app_id.is_empty() || app_secret.is_empty() {
             return Err(Error::Authentication);
         }
@@ -186,6 +192,7 @@ impl Client {
             app_id,
             app_secret,
             policy,
+            diagnostics,
         })
     }
     async fn discover(&self) -> Result<Endpoint, Error> {
@@ -221,7 +228,7 @@ impl Client {
         cancel: CancellationToken,
     ) -> Result<(), Error> {
         let client = std::sync::Arc::new(self);
-        reconnect(&incoming, &cancel, |config| {
+        reconnect(&client.diagnostics, &incoming, &cancel, |config| {
             let client = client.clone();
             let incoming = incoming.clone();
             let cancel = cancel.clone();
@@ -242,6 +249,7 @@ impl Client {
                     config,
                     incoming.clone(),
                     cancel.clone(),
+                    &client.diagnostics,
                 )
                 .await;
                 Ok((started.elapsed() >= Duration::from_secs(60), result))
@@ -255,6 +263,7 @@ type Attempt<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(bool, Result<(), Error>), Error>> + Send + 'a>,
 >;
 async fn reconnect<F>(
+    diagnostics: &bridge_app::diagnostics::Diagnostics,
     incoming: &mpsc::Sender<Received>,
     cancel: &CancellationToken,
     mut attempt: F,
@@ -274,7 +283,7 @@ where
             return Ok(());
         }
         {
-            use bridge_app::diagnostics::{Event, Status, emit};
+            use bridge_app::diagnostics::{Event, Status};
             let status = match &result {
                 Ok(()) => Status::Ok,
                 Err(Error::Transport) => Status::Transport,
@@ -284,7 +293,7 @@ where
                 Err(Error::Overloaded) => Status::Overloaded,
                 Err(Error::Exhausted) => Status::Exhausted,
             };
-            emit(Event::Reconnect, status, None, attempts as usize);
+            diagnostics.emit(Event::Reconnect, status, None, attempts as usize);
         }
         match result {
             Err(Error::Authentication) | Err(Error::Proxy) | Err(Error::Overloaded) => {
@@ -297,7 +306,6 @@ where
             return Err(Error::Exhausted);
         }
         connection(incoming, ConnectionState::Reconnecting)?;
-        eprintln!("{{\"event\":\"feishu_native_reconnecting\"}}");
         let delay = if attempts == 1 {
             Duration::from_secs_f64(rand::random::<f64>() * config.reconnect_nonce as f64)
         } else {
@@ -336,6 +344,7 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     config: &mut ClientConfig,
     incoming: mpsc::Sender<Received>,
     cancel: CancellationToken,
+    diagnostics: &bridge_app::diagnostics::Diagnostics,
 ) -> Result<(), Error> {
     config.validate()?;
     let mut fragments = Fragments::default();
@@ -347,7 +356,7 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
             _=cancel.cancelled()=>{let _=timeout(Duration::from_secs(1),socket.close(None)).await;return Ok(());},
             _=tokio::time::sleep_until(next_ping)=>{
                 if last_pong.elapsed()>Duration::from_secs(config.ping_interval.saturating_mul(2)+5) {
-                    bridge_app::diagnostics::emit(bridge_app::diagnostics::Event::HeartbeatTimeout,bridge_app::diagnostics::Status::Transport,None,0);
+                    diagnostics.emit(bridge_app::diagnostics::Event::HeartbeatTimeout,bridge_app::diagnostics::Status::Transport,None,0);
                     return Err(Error::Transport);
                 }
                 write(&mut socket,Frame::ping(service)).await?;next_ping=Instant::now()+Duration::from_secs(config.ping_interval);

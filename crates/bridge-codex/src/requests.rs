@@ -344,14 +344,17 @@ mod tests {
 #[cfg(test)]
 mod fixture_tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use crate::protocol::{fixture_dir, testing};
+    use std::{collections::BTreeMap, error::Error, fs};
+    /// The recorded request fixtures drive the real decoder, and the replies
+    /// the production mapping produces must stay equal to the recorded baseline
+    /// and conform to the pinned response schemas.
     #[test]
-    fn schema_checked_fixtures_are_the_payloads_used_by_rust()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let cases: Vec<Value> = serde_json::from_str(include_str!(
-            "../../../fixtures/codex/0.153.4/server-requests.json"
-        ))?;
-        for case in cases {
+    fn schema_checked_fixtures_are_the_payloads_used_by_rust() -> Result<(), Box<dyn Error>> {
+        let cases: Vec<Value> =
+            serde_json::from_slice(&fs::read(fixture_dir().join("server-requests.json"))?)?;
+        for case in &cases {
+            let schema = case["schema"].as_str().ok_or("missing schema")?;
             let request = decode(
                 1,
                 case["method"].as_str().ok_or("missing method")?,
@@ -361,8 +364,95 @@ mod fixture_tests {
                 RequestKind::Approval(_) => AgentReply::Approve(false),
                 RequestKind::Questions { .. } => AgentReply::Answers(BTreeMap::new()),
             };
-            assert_eq!(payload(&request.kind, reply)?, case["reply"]);
+            let produced = payload(&request.kind, reply)?;
+            testing::validate(&format!("{schema}Params.json"), &case["params"])?;
+            testing::validate(&format!("{schema}Response.json"), &produced)?;
+            assert_eq!(produced, case["reply"]);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use crate::protocol::testing;
+    use std::{collections::BTreeMap, error::Error};
+    fn command_approval(extra: Value) -> Result<AgentRequest, BackendError> {
+        let mut params =
+            json!({"threadId":"t","turnId":"u","itemId":"i","startedAtMs":1,"command":"echo test"});
+        let fields = extra.as_object().ok_or(BackendError::Incompatible)?;
+        for (key, value) in fields {
+            params[key] = value.clone();
+        }
+        decode(2, "item/commandExecution/requestApproval", params)
+    }
+    /// Approval replies are emitted only as plain accept/decline; the pinned
+    /// response schema validates every wire payload the mapping can produce.
+    /// `acceptForSession` is schema-valid but intentionally unreachable.
+    #[test]
+    fn approval_reply_payloads_stay_within_pinned_response_schemas() -> Result<(), Box<dyn Error>> {
+        let request = command_approval(json!({}))?;
+        let accept = payload(&request.kind, AgentReply::Approve(true))?;
+        assert_eq!(accept, json!({"decision":"accept"}));
+        testing::validate("CommandExecutionRequestApprovalResponse.json", &accept)?;
+        let decline = payload(&request.kind, AgentReply::Approve(false))?;
+        assert_eq!(decline, json!({"decision":"decline"}));
+        testing::validate("CommandExecutionRequestApprovalResponse.json", &decline)?;
+        let write_stdin = command_approval(json!({"kind":"writeStdin"}))?;
+        let decline = payload(&write_stdin.kind, AgentReply::Approve(false))?;
+        testing::validate("CommandExecutionRequestApprovalResponse.json", &decline)?;
+        let file_change = decode(
+            2,
+            "item/fileChange/requestApproval",
+            json!({"threadId":"t","turnId":"u","itemId":"i","startedAtMs":1}),
+        )?;
+        let decline = payload(&file_change.kind, AgentReply::Approve(false))?;
+        assert_eq!(decline, json!({"decision":"decline"}));
+        testing::validate("FileChangeRequestApprovalResponse.json", &decline)?;
+        // Schema-valid session-scoped decisions exist, but no AgentReply maps
+        // to them, and sessions without the plain accept decision stay
+        // decline-only instead of being approved.
+        testing::validate(
+            "CommandExecutionRequestApprovalResponse.json",
+            &json!({"decision":"acceptForSession"}),
+        )?;
+        let session_only =
+            command_approval(json!({"availableDecisions":["acceptForSession","decline"]}))?;
+        assert!(payload(&session_only.kind, AgentReply::Approve(true)).is_err());
+        let decline = payload(&session_only.kind, AgentReply::Approve(false))?;
+        testing::validate("CommandExecutionRequestApprovalResponse.json", &decline)?;
+        Ok(())
+    }
+    /// Per-question answers, including free-text answers for `other` fields,
+    /// serialize into the pinned experimental response schema.
+    #[test]
+    fn question_answer_payloads_stay_within_pinned_response_schema() -> Result<(), Box<dyn Error>> {
+        let request = decode(
+            2,
+            "item/tool/requestUserInput",
+            json!({"threadId":"t","turnId":"u","itemId":"i","isBlocking":true,"questions":[
+                {"id":"q","header":"h","question":"Choose","options":[{"label":"a","description":"first"}]},
+                {"id":"r","header":"h","question":"Describe","isOther":true}
+            ]}),
+        )?;
+        let answers = AgentReply::Answers(BTreeMap::from([
+            ("q".into(), vec!["a".into()]),
+            ("r".into(), vec!["自由文本".into()]),
+        ]));
+        let produced = payload(&request.kind, answers)?;
+        assert_eq!(
+            produced,
+            json!({"answers":{"q":{"answers":["a"]},"r":{"answers":["自由文本"]}}})
+        );
+        testing::validate("ToolRequestUserInputResponse.json", &produced)?;
+        // Unanswered questions still produce an empty, schema-valid answer list.
+        let produced = payload(&request.kind, AgentReply::Answers(BTreeMap::new()))?;
+        testing::validate("ToolRequestUserInputResponse.json", &produced)?;
+        assert_eq!(
+            produced,
+            json!({"answers":{"q":{"answers":[]},"r":{"answers":[]}}})
+        );
         Ok(())
     }
 }

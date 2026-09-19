@@ -99,8 +99,9 @@ pub fn attachments(
     message_id: &str,
     kind: &str,
     content: &serde_json::Value,
-) -> Vec<bridge_app::messaging::Attachment> {
-    use bridge_app::messaging::{Attachment, ResourceKind, ResourceRef};
+) -> Vec<bridge_app::files::Attachment> {
+    use bridge_app::files::Attachment;
+    use bridge_app::messaging::{ResourceKind, ResourceRef};
     if kind == "post" {
         let post = post_body(content);
         let mut result = Vec::new();

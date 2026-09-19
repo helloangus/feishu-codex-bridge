@@ -296,9 +296,10 @@ fn turn_params(input: &TurnInput) -> Result<Value, BackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn every_turn_has_explicit_mode_and_sandbox() -> Result<(), BackendError> {
-        let mut input = TurnInput {
+    use crate::protocol::{fixture_dir, testing};
+    use std::{error::Error, fs};
+    fn turn_input() -> TurnInput {
+        TurnInput {
             thread_id: "t".into(),
             directory: "/tmp/project".into(),
             prompt: "hello".into(),
@@ -306,23 +307,23 @@ mod tests {
             model: "available-model".into(),
             mode: ExecutionMode::Plan,
             sandbox: Sandbox::WorkspaceWrite,
-        };
+        }
+    }
+    fn recorded_fixture(name: &str) -> Result<Value, Box<dyn Error>> {
+        Ok(serde_json::from_slice(&fs::read(
+            fixture_dir().join(name),
+        )?)?)
+    }
+    #[test]
+    fn every_turn_has_explicit_mode_and_sandbox() -> Result<(), BackendError> {
+        let mut input = turn_input();
         let plan = turn_params(&input)?;
-        let expected: Value = serde_json::from_str(include_str!(
-            "../../../fixtures/codex/0.153.4/turn-start-plan.json"
-        ))
-        .map_err(|_| BackendError::Incompatible)?;
-        assert_eq!(plan, expected);
         assert_eq!(plan["collaborationMode"]["mode"], "plan");
         assert_eq!(plan["sandboxPolicy"]["networkAccess"], false);
+        assert_eq!(plan["sandboxPolicy"]["writableRoots"][0], plan["cwd"]);
         assert_eq!(plan["approvalPolicy"], "on-request");
         assert_eq!(plan["input"][1]["type"], "localImage");
         input.mode = ExecutionMode::Execute;
-        let expected: Value = serde_json::from_str(include_str!(
-            "../../../fixtures/codex/0.153.4/turn-start-default.json"
-        ))
-        .map_err(|_| BackendError::Incompatible)?;
-        assert_eq!(turn_params(&input)?, expected);
         assert_eq!(turn_params(&input)?["collaborationMode"]["mode"], "default");
         input.sandbox = Sandbox::DangerFullAccess;
         assert_eq!(
@@ -331,6 +332,26 @@ mod tests {
         );
         input.model.clear();
         assert!(turn_params(&input).is_err());
+        Ok(())
+    }
+    /// The production serializer is the contract: its output must stay equal to
+    /// the recorded fixture baseline and conform to the pinned vendor schema.
+    /// Both checks are needed because the schema alone permits extra fields.
+    #[test]
+    fn serialized_turn_params_match_recorded_fixtures_and_pinned_schema()
+    -> Result<(), Box<dyn Error>> {
+        let mut input = turn_input();
+        let plan = turn_params(&input)?;
+        assert_eq!(plan, recorded_fixture("turn-start-plan.json")?);
+        testing::validate("TurnStartParams.json", &plan)?;
+        input.mode = ExecutionMode::Execute;
+        let default = turn_params(&input)?;
+        assert_eq!(default, recorded_fixture("turn-start-default.json")?);
+        testing::validate("TurnStartParams.json", &default)?;
+        input.sandbox = Sandbox::DangerFullAccess;
+        let danger = turn_params(&input)?;
+        testing::validate("TurnStartParams.json", &danger)?;
+        assert_eq!(danger["sandboxPolicy"], json!({"type":"dangerFullAccess"}));
         Ok(())
     }
     #[test]

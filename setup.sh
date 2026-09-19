@@ -5,8 +5,6 @@ set +x
 bridge_repo="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 bridge_mode="${1:-}"
 bridge_no_start=0
-bridge_requires_pairing=0
-bridge_pairing_code_prompted=0
 case "$bridge_mode" in
   --help|-h)
     printf '%s\n' \
@@ -18,7 +16,6 @@ case "$bridge_mode" in
     exit 0
     ;;
   --check)
-    command -v codex >/dev/null || { printf '%s\n' '未找到 codex，请先安装并登录。' >&2; exit 1; }
     exec "${BRIDGE_RUST_BIN:-$bridge_repo/target/debug/bridge}" config check --file "${BRIDGE_RUST_CONFIG:-$bridge_repo/bridge.toml}" ;;
   --no-start) bridge_no_start=1 ;;
   '') ;;
@@ -66,7 +63,6 @@ fi
 command -v cargo >/dev/null || { printf '%s\n' 'Rust 安装后仍未找到 cargo；请重新打开终端后再运行。' >&2; exit 1; }
 command -v rustup >/dev/null || { printf '%s\n' 'Rust 安装后仍未找到 rustup；请重新打开终端后再运行。' >&2; exit 1; }
 command -v cc >/dev/null || { printf '%s\n' '未找到 C 编译器；请安装 clang 或 build-essential 后重试。' >&2; exit 1; }
-command -v codex >/dev/null || { printf '%s\n' '请先安装并登录 Codex CLI。' >&2; exit 1; }
 (cd -- "$bridge_repo" && cargo build -p bridge-cli --bin bridge --locked)
 bridge_binary="${BRIDGE_RUST_BIN:-$bridge_repo/target/debug/bridge}"
 bridge_config="${BRIDGE_RUST_CONFIG:-$bridge_repo/bridge.toml}"
@@ -121,30 +117,10 @@ if [[ "$bridge_no_start" == "1" ]]; then
   printf '%s\n' '准备完成。启动：./start.sh start；状态：./start.sh status。'
   exit 0
 fi
-if [[ ! -t 0 ]]; then
-  [[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" ]] || { printf '%s\n' '非交互启动需要设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET。' >&2; exit 1; }
-else
-  if [[ -z "${FEISHU_APP_ID:-}" ]]; then read -r -p '飞书 App ID：' FEISHU_APP_ID; fi
-  if [[ -z "${FEISHU_APP_SECRET:-}" ]]; then read -r -s -p '飞书 App Secret：' FEISHU_APP_SECRET; printf '\n'; fi
-  if [[ -z "${FEISHU_PAIRING_CODE:-}" ]]; then
-    printf '%s\n' '可在另一个终端生成配对码：openssl rand -hex 16'
-    read -r -s -p '配对码（首次或无白名单时必填，16–256 字节且不能含空白；已有白名单/已配对用户可留空）：' FEISHU_PAIRING_CODE
-    printf '\n'
-    bridge_pairing_code_prompted=1
-  fi
-fi
-[[ -n "${FEISHU_APP_ID:-}" && -n "${FEISHU_APP_SECRET:-}" ]] || { printf '%s\n' '飞书 App ID 和 App Secret 不能为空。' >&2; exit 1; }
-bridge_pairing_bytes="$(printf '%s' "${FEISHU_PAIRING_CODE:-}" | LC_ALL=C wc -c)"
-if [[ -n "${FEISHU_PAIRING_CODE:-}" && ( "$bridge_pairing_bytes" -lt 16 || "$bridge_pairing_bytes" -gt 256 || "$FEISHU_PAIRING_CODE" =~ [[:space:]] ) ]]; then
-  printf '%s\n' '配对码无效：必须为 16–256 字节且不能包含空白。' >&2
-  exit 1
-fi
-if [[ "$bridge_requires_pairing" == "1" && -z "${FEISHU_PAIRING_CODE:-}" ]]; then
-  printf '%s\n' '未设置白名单时，配对码不能为空。' >&2
-  exit 1
-fi
-export FEISHU_APP_ID FEISHU_APP_SECRET FEISHU_PAIRING_CODE
-if [[ "$bridge_pairing_code_prompted" == "1" ]]; then
-  export BRIDGE_RUST_PAIRING_CODE_PROMPTED=1
-fi
+# Credential reading, hidden input and validation live in the Rust CLI and
+# follow the environment variable names declared by the configuration.
+bridge_credentials_output="$("$bridge_binary" credentials --file "$bridge_config" --print)" || exit 1
+eval "$bridge_credentials_output"
+unset bridge_credentials_output
+printf '%s\n' '凭据已就绪。若当前飞书用户尚未授权，请在飞书私聊机器人发送：/pair <配对码>'
 exec "$bridge_repo/start.sh" start

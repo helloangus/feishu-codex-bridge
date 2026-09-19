@@ -2,6 +2,7 @@
 pub mod cards;
 pub mod diagnostics;
 pub mod directories;
+pub mod files;
 pub mod plans;
 pub mod presentation;
 use bridge_core::{SessionKey, task::TaskSpec};
@@ -146,8 +147,8 @@ impl Scheduler {
     }
 
     /// A stale completion cannot free a newer task's execution slot.
-    pub fn finish(&mut self, task_id: &str) -> bool {
-        if self.active.as_ref().is_some_and(|t| t.id == task_id) {
+    pub fn finish(&mut self, task_id: &bridge_core::task::TaskId) -> bool {
+        if self.active.as_ref().is_some_and(|t| t.id == *task_id) {
             self.active = None;
             return true;
         }
@@ -190,10 +191,10 @@ impl Scheduler {
     pub fn queued(&self) -> usize {
         self.queue.len()
     }
-    pub fn has_task(&self, id: &str) -> bool {
-        self.active.as_ref().is_some_and(|s| s.id == id)
-            || self.queue.iter().any(|s| s.id == id)
-            || self.pending.values().any(|(_, s, _)| s.id == id)
+    pub fn has_task(&self, id: &bridge_core::task::TaskId) -> bool {
+        self.active.as_ref().is_some_and(|s| s.id == *id)
+            || self.queue.iter().any(|s| s.id == *id)
+            || self.pending.values().any(|(_, s, _)| s.id == *id)
     }
     pub fn pending_admissions(&self) -> usize {
         self.pending.len()
@@ -222,9 +223,9 @@ mod tests {
             Ok(true)
         }
     }
-    fn task(id: &str) -> TaskSpec {
+    fn task(id: u64) -> TaskSpec {
         TaskSpec {
-            id: id.into(),
+            id: bridge_core::task::TaskId::new(1, id),
             session: SessionKey::new("user", "/tmp/project"),
             chat: "chat".into(),
             prompt: "hello".into(),
@@ -240,14 +241,14 @@ mod tests {
             ..Journal::default()
         };
         assert!(matches!(
-            scheduler.admit(&mut journal, "m1", task("1")),
+            scheduler.admit(&mut journal, "m1", task(1)),
             Err(AdmissionError::Persistence(_))
         ));
         assert_eq!(scheduler.queued(), 0);
         journal.fail = false;
-        assert_eq!(scheduler.admit(&mut journal, "m1", task("1")), Ok(true));
+        assert_eq!(scheduler.admit(&mut journal, "m1", task(1)), Ok(true));
         assert_eq!(
-            scheduler.admit(&mut journal, "m2", task("2")),
+            scheduler.admit(&mut journal, "m2", task(2)),
             Err(AdmissionError::Full)
         );
         assert_eq!(journal.ids, ["m1"]);
@@ -256,23 +257,26 @@ mod tests {
     fn fifo_duplicate_and_stale_completion() {
         let mut scheduler = Scheduler::new(4);
         let mut journal = Journal::default();
-        assert_eq!(scheduler.admit(&mut journal, "m1", task("1")), Ok(true));
-        assert_eq!(
-            scheduler.admit(&mut journal, "m1", task("duplicate")),
-            Ok(false)
-        );
-        assert_eq!(scheduler.admit(&mut journal, "m2", task("2")), Ok(true));
+        assert_eq!(scheduler.admit(&mut journal, "m1", task(1)), Ok(true));
+        assert_eq!(scheduler.admit(&mut journal, "m1", task(1)), Ok(false));
+        assert_eq!(scheduler.admit(&mut journal, "m2", task(2)), Ok(true));
         assert!(!scheduler.begin_session_mutation());
-        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("1"));
+        assert_eq!(
+            scheduler.start_next().map(|t| t.id.as_str().to_owned()),
+            Some("1:1".to_owned())
+        );
         assert!(scheduler.start_next().is_none());
-        assert!(!scheduler.finish("old"));
-        assert!(scheduler.finish("1"));
-        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("2"));
+        assert!(!scheduler.finish(&bridge_core::task::TaskId::new(1, 99)));
+        assert!(scheduler.finish(&bridge_core::task::TaskId::new(1, 1)));
+        assert_eq!(
+            scheduler.start_next().map(|t| t.id.as_str().to_owned()),
+            Some("1:2".to_owned())
+        );
     }
     #[test]
     fn invalidation_precedes_queue_and_pending_admissions_without_racing_active_work() {
         let mut scheduler = Scheduler::new(4);
-        let ticket = match scheduler.reserve("message".into(), task("1")) {
+        let ticket = match scheduler.reserve("message".into(), task(1)) {
             Ok(ticket) => ticket,
             Err(error) => panic!("unexpected reservation failure: {error:?}"),
         };
@@ -283,9 +287,12 @@ mod tests {
         scheduler.end_session_mutation();
         assert!(scheduler.begin_invalidation());
         scheduler.end_session_mutation();
-        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("1"));
+        assert_eq!(
+            scheduler.start_next().map(|t| t.id.as_str().to_owned()),
+            Some("1:1".to_owned())
+        );
         assert!(!scheduler.begin_invalidation());
-        assert!(scheduler.finish("1"));
+        assert!(scheduler.finish(&bridge_core::task::TaskId::new(1, 1)));
         assert!(scheduler.begin_session_mutation());
         assert!(!scheduler.begin_invalidation());
     }
@@ -295,48 +302,54 @@ mod tests {
         let mut journal = Journal::default();
         assert!(scheduler.begin_session_mutation());
         assert_eq!(
-            scheduler.admit(&mut journal, "m", task("1")),
+            scheduler.admit(&mut journal, "m", task(1)),
             Err(AdmissionError::SessionMutation)
         );
         assert!(journal.ids.is_empty());
         scheduler.end_session_mutation();
-        assert_eq!(scheduler.admit(&mut journal, "m", task("1")), Ok(true));
+        assert_eq!(scheduler.admit(&mut journal, "m", task(1)), Ok(true));
         assert_eq!(
             scheduler.cancel_queued(&SessionKey::new("other", "/tmp/project")),
             0
         );
-        assert_eq!(scheduler.cancel_queued(&task("1").session), 1);
+        assert_eq!(scheduler.cancel_queued(&task(1).session), 1);
     }
 
     #[test]
     fn asynchronous_claims_preserve_fifo_when_disk_results_arrive_out_of_order()
     -> Result<(), AdmissionError<()>> {
         let mut scheduler = Scheduler::new(2);
-        let first = scheduler.reserve("m1".into(), task("1"))?;
-        let second = scheduler.reserve("m2".into(), task("2"))?;
+        let first = scheduler.reserve("m1".into(), task(1))?;
+        let second = scheduler.reserve("m2".into(), task(2))?;
         assert!(matches!(
-            scheduler.reserve("m3".into(), task("3")),
+            scheduler.reserve("m3".into(), task(3)),
             Err(AdmissionError::Full)
         ));
         assert!(!scheduler.begin_session_mutation());
         assert!(scheduler.commit_admission(second, true));
         assert!(scheduler.start_next().is_none());
         assert!(scheduler.commit_admission(first, true));
-        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("1"));
-        assert!(scheduler.finish("1"));
-        assert_eq!(scheduler.start_next().map(|t| t.id.as_str()), Some("2"));
+        assert_eq!(
+            scheduler.start_next().map(|t| t.id.as_str().to_owned()),
+            Some("1:1".to_owned())
+        );
+        assert!(scheduler.finish(&bridge_core::task::TaskId::new(1, 1)));
+        assert_eq!(
+            scheduler.start_next().map(|t| t.id.as_str().to_owned()),
+            Some("1:2".to_owned())
+        );
         Ok(())
     }
 
     #[test]
     fn cancellation_and_failed_claim_never_enqueue_late_work() -> Result<(), AdmissionError<()>> {
         let mut scheduler = Scheduler::new(2);
-        let first = scheduler.reserve("m1".into(), task("1"))?;
-        assert_eq!(scheduler.cancel_queued(&task("1").session), 1);
+        let first = scheduler.reserve("m1".into(), task(1))?;
+        assert_eq!(scheduler.cancel_queued(&task(1).session), 1);
         assert!(!scheduler.commit_admission(first, true));
-        let second = scheduler.reserve("m2".into(), task("2"))?;
+        let second = scheduler.reserve("m2".into(), task(2))?;
         scheduler.abort_admission(second);
-        let duplicate = scheduler.reserve("m3".into(), task("3"))?;
+        let duplicate = scheduler.reserve("m3".into(), task(3))?;
         assert!(!scheduler.commit_admission(duplicate, false));
         assert!(scheduler.start_next().is_none());
         assert!(scheduler.begin_session_mutation());

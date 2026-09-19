@@ -1,4 +1,5 @@
 use super::*;
+use bridge_app::diagnostics::Diagnostics;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -29,7 +30,7 @@ async fn retry_limit_counts_short_connections_and_rediscovers_each_time() {
     let cancel = CancellationToken::new();
     let attempts = Arc::new(AtomicUsize::new(0));
     let count = attempts.clone();
-    let result = reconnect(&tx, &cancel, move |config| {
+    let result = reconnect(&Diagnostics::noop(), &tx, &cancel, move |config| {
         count.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             config.reconnect_count = 2;
@@ -57,7 +58,7 @@ async fn closed_socket_is_replaced_with_new_endpoint_and_session()
     let attempts = count.clone();
     let events = tx.clone();
     let task = tokio::spawn(async move {
-        reconnect(&tx,&stop,move |config| {
+        reconnect(&Diagnostics::noop(), &tx,&stop,move |config| {
                 let n=attempts.fetch_add(1,Ordering::SeqCst);let events=events.clone();
                 Box::pin(async move {
                     // Each attempt receives fresh discovery credentials and a separate socket.
@@ -74,7 +75,8 @@ async fn closed_socket_is_replaced_with_new_endpoint_and_session()
                         if n==0 {server.close(None).await.map_err(|_|Error::Transport)?;} else {peer_cancel.cancel();}
                         Ok::<_,Error>(())
                     };
-                    let (result,peer)=tokio::join!(session(client,endpoint.service,config,events,session_cancel),peer);peer?;
+                    let diagnostics = &Diagnostics::noop();
+                    let (result,peer)=tokio::join!(session(client,endpoint.service,config,events,session_cancel,diagnostics),peer);peer?;
                     if n==1 {return Err(Error::Authentication);} // Terminal fixture disposition after reconnection.
                     Ok((false,result))
                 })
@@ -105,16 +107,18 @@ async fn closed_socket_is_replaced_with_new_endpoint_and_session()
 async fn permanent_errors_do_not_retry_and_cancel_interrupts_pending_dial() {
     let (tx, _rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
-    let result = reconnect(&tx, &cancel, |_| {
+    let result = reconnect(&Diagnostics::noop(), &tx, &cancel, |_| {
         Box::pin(async { Err(Error::Authentication) })
     })
     .await;
     assert!(matches!(result, Err(Error::Authentication)));
     let stop = cancel.clone();
-    let task =
-        tokio::spawn(
-            async move { reconnect(&tx, &stop, |_| Box::pin(std::future::pending())).await },
-        );
+    let task = tokio::spawn(async move {
+        reconnect(&Diagnostics::noop(), &tx, &stop, |_| {
+            Box::pin(std::future::pending())
+        })
+        .await
+    });
     tokio::task::yield_now().await;
     cancel.cancel();
     assert!(matches!(
@@ -129,7 +133,7 @@ async fn stable_connection_resets_failure_budget_and_backoff_is_cancellable() {
     let stop = cancel.clone();
     let counter = Arc::new(AtomicUsize::new(0));
     let count = counter.clone();
-    let result = reconnect(&tx, &cancel, move |config| {
+    let result = reconnect(&Diagnostics::noop(), &tx, &cancel, move |config| {
         let n = count.fetch_add(1, Ordering::SeqCst);
         let stop = stop.clone();
         Box::pin(async move {

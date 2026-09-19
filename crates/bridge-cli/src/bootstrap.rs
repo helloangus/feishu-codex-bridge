@@ -1,6 +1,7 @@
-//! Foreground MVP composition. No shell config execution or automatic replay.
-use crate::{AccessMode, Config, Sandbox};
-use bridge_app::{ports, runtime};
+//! Foreground composition of the native bridge: Feishu ingress, Codex app
+//! server, durable state and the application runtime.
+use crate::{AccessMode, Config, credentials::valid_pairing_code, valid_env_name};
+use bridge_app::runtime;
 use bridge_codex::process::AppServer;
 use bridge_feishu::{ingress::Event, rest::FeishuRest, websocket};
 use bridge_local::{async_state::AsyncState, state::JsonStore};
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 fn credential(name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !valid_env_name(name) {
         return Err("凭据环境变量名称无效".into());
     }
     std::env::var(name)
@@ -26,25 +27,10 @@ fn credential(name: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn optional_credential(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !valid_env_name(name) {
         return Err("凭据环境变量名称无效".into());
     }
     Ok(std::env::var(name).ok().filter(|value| !value.is_empty()))
-}
-
-/// Only locally registered opaque actions enter the runtime; raw card commands
-/// cannot bypass message/owner validation or become ordinary chat text.
-pub fn decode_card_click(
-    source: String,
-    action: &serde_json::Value,
-) -> Option<bridge_app::cards::Click> {
-    use bridge_core::view::ButtonAction;
-    match bridge_feishu::decode_action(&action.to_string()).ok()? {
-        ButtonAction::Interaction { token, choice } if choice == "run" && !source.is_empty() => {
-            Some(bridge_app::cards::Click { token, source })
-        }
-        _ => None,
-    }
 }
 
 /// Stable App ID-derived lock shared by every native service entry point.
@@ -68,23 +54,54 @@ pub fn app_lock(directory: &Path, app_id: &str) -> Result<File, Box<dyn std::err
 }
 
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let feishu = config.feishu.as_ref().ok_or("run 需要 [feishu] 配置")?;
-    let app_id = credential(&feishu.app_id_env)?;
-    let secret = credential(&feishu.app_secret_env)?;
+    let fail_early = |stage: &'static str, error: &'static str| -> &'static str {
+        bridge_app::diagnostics::startup_record(stage);
+        error
+    };
+    let feishu = config
+        .feishu
+        .as_ref()
+        .ok_or_else(|| fail_early("config", "run 需要 [feishu] 配置"))?;
+    let app_id = credential(&feishu.app_id_env)
+        .map_err(|_| fail_early("credentials", "凭据环境变量不可用"))?;
+    let secret = credential(&feishu.app_secret_env)
+        .map_err(|_| fail_early("credentials", "凭据环境变量不可用"))?;
     let lock_dir = match std::env::var_os("CODEX_SERVICE_GLOBAL_STATE") {
         Some(value) => PathBuf::from(value),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("缺少 HOME，无法取得全局锁位置")?)
-            .join(".feishu-codex-bridge"),
+        None => PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or_else(|| fail_early("lock", "缺少 HOME，无法取得全局锁位置"))?,
+        )
+        .join(".feishu-codex-bridge"),
     };
-    let _lock = app_lock(&lock_dir, &app_id)?;
-    let health = Arc::new(std::sync::Mutex::new(crate::health::Health::start(
-        &config.workspace.state_dir,
-    )?));
-    bridge_app::diagnostics::install(Box::new(crate::logging::Log::open(
-        &config.workspace.state_dir.join("runtime"),
-    )?))
-    .map_err(|_| "日志输出已经初始化，拒绝重复运行")?;
-    bridge_app::diagnostics::emit(
+    let _lock = app_lock(&lock_dir, &app_id).inspect_err(|_| {
+        bridge_app::diagnostics::startup_record("lock");
+    })?;
+    let health = Arc::new(std::sync::Mutex::new(
+        crate::health::Health::start(&config.workspace.state_dir).inspect_err(|_| {
+            bridge_app::diagnostics::startup_record("health");
+        })?,
+    ));
+    let diagnostics = bridge_app::diagnostics::Diagnostics::new(Box::new(
+        crate::logging::Log::open(&config.workspace.state_dir.join("runtime")).inspect_err(
+            |_| {
+                bridge_app::diagnostics::startup_record("diagnostics");
+            },
+        )?,
+    ));
+    std::panic::set_hook({
+        let diagnostics = diagnostics.clone();
+        // Panic payloads can contain remote data. Record occurrence without it.
+        Box::new(move |_| {
+            diagnostics.emit(
+                bridge_app::diagnostics::Event::Panic,
+                bridge_app::diagnostics::Status::Failed,
+                None,
+                0,
+            )
+        })
+    });
+    diagnostics.emit(
         bridge_app::diagnostics::Event::RuntimeStarted,
         bridge_app::diagnostics::Status::Ok,
         None,
@@ -100,9 +117,10 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(optional_credential)
         .transpose()?;
     let pairing_code = pairing_code.flatten();
-    if pairing_code.as_ref().is_some_and(|code| {
-        code.len() < 16 || code.len() > 256 || code.chars().any(char::is_whitespace)
-    }) {
+    if pairing_code
+        .as_ref()
+        .is_some_and(|code| !valid_pairing_code(code))
+    {
         return Err("配对码需为 16–256 字节且不含空白，请修改指定的环境变量".into());
     }
     if config.access.mode == AccessMode::Restricted && allowed.is_empty() && pairing_code.is_none()
@@ -127,7 +145,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let epoch = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())
         .unwrap_or_else(|_| u64::from(std::process::id()));
     let directory = fs::canonicalize(&config.workspace.cwd)?;
-    let connection = websocket::Client::new(app_id, secret, proxy.as_deref())?;
+    let connection = websocket::Client::new(app_id, secret, proxy.as_deref(), diagnostics.clone())?;
     let root = fs::canonicalize(&config.workspace.root)?;
     let mut server = AppServer::spawn(
         &config.codex.executable,
@@ -155,9 +173,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     })
     .await;
     match reconciliation {
-        Ok(Ok(removed)) => {
-            eprintln!("{{\"event\":\"archive_reconciled\",\"removed_bindings\":{removed}}}")
-        }
+        Ok(Ok(removed)) => diagnostics.emit(
+            bridge_app::diagnostics::Event::ArchiveReconciled,
+            bridge_app::diagnostics::Status::Ok,
+            None,
+            removed,
+        ),
         failure => {
             let _ = server.shutdown().await;
             return Err(match failure {
@@ -168,7 +189,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let cancel = CancellationToken::new();
-    let heartbeat = tokio::spawn(crate::health::heartbeat(health.clone(), cancel.clone()));
+    let heartbeat = tokio::spawn(crate::health::heartbeat(
+        health.clone(),
+        cancel.clone(),
+        diagnostics.clone(),
+    ));
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let (input_tx, input_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(256);
@@ -180,100 +205,69 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     });
     let stop = cancel.clone();
     let connection_health = health.clone();
+    let gateway_diagnostics = diagnostics.clone();
     let gateway = tokio::spawn(async move {
+        let diagnostics = &gateway_diagnostics;
         let mut healthy = true;
         while let Some(received) = incoming_rx.recv().await {
-            let (id, user, chat, text, card, attachments) = match received.event {
-                Event::Connection { state } => {
-                    eprintln!("{{\"event\":\"feishu_connection\",\"state\":\"{state:?}\"}}");
-                    bridge_app::diagnostics::emit(
-                        match state {
-                            bridge_feishu::ingress::ConnectionState::Starting => {
-                                bridge_app::diagnostics::Event::ConnectionStarting
-                            }
-                            bridge_feishu::ingress::ConnectionState::Connected => {
-                                bridge_app::diagnostics::Event::ConnectionEstablished
-                            }
-                            bridge_feishu::ingress::ConnectionState::Reconnecting => {
-                                bridge_app::diagnostics::Event::ConnectionReconnecting
-                            }
-                        },
-                        bridge_app::diagnostics::Status::Ok,
-                        None,
-                        0,
-                    );
-                    let phase = match state {
-                        bridge_feishu::ingress::ConnectionState::Starting => {
-                            crate::health::Phase::Starting
+            // Feishu payloads become application inputs inside the ingress;
+            // this loop only routes lifecycle state and bounded admission.
+            let connection = match received.event {
+                Event::Connection { state } => state,
+                _ => {
+                    if let Some(input) = received.into_runtime_input() {
+                        if input_tx.try_send(input).is_err() {
+                            diagnostics.emit(
+                                bridge_app::diagnostics::Event::Overloaded,
+                                bridge_app::diagnostics::Status::Overloaded,
+                                None,
+                                0,
+                            );
                         }
-                        bridge_feishu::ingress::ConnectionState::Connected => {
-                            crate::health::Phase::Connected
-                        }
-                        bridge_feishu::ingress::ConnectionState::Reconnecting => {
-                            crate::health::Phase::Reconnecting
-                        }
-                    };
-                    if connection_health
-                        .lock()
-                        .map_err(|_| ())
-                        .and_then(|mut h| h.set(phase).map_err(|_| ()))
-                        .is_err()
-                    {
-                        eprintln!("{{\"event\":\"health_write_failed\"}}");
-                        healthy = false;
-                        stop.cancel();
-                        break;
                     }
                     continue;
                 }
-                Event::Message {
-                    message_id,
-                    user_id,
-                    chat_id,
-                    message_type,
-                    content,
-                    ..
-                } => {
-                    let text = bridge_feishu::message_text(&message_type, &content);
-                    let attachments =
-                        bridge_feishu::attachments(&message_id, &message_type, &content);
-                    (message_id, user_id, chat_id, text, None, attachments)
+            };
+            diagnostics.emit(
+                match connection {
+                    bridge_feishu::ingress::ConnectionState::Starting => {
+                        bridge_app::diagnostics::Event::ConnectionStarting
+                    }
+                    bridge_feishu::ingress::ConnectionState::Connected => {
+                        bridge_app::diagnostics::Event::ConnectionEstablished
+                    }
+                    bridge_feishu::ingress::ConnectionState::Reconnecting => {
+                        bridge_app::diagnostics::Event::ConnectionReconnecting
+                    }
+                },
+                bridge_app::diagnostics::Status::Ok,
+                None,
+                0,
+            );
+            let phase = match connection {
+                bridge_feishu::ingress::ConnectionState::Starting => crate::health::Phase::Starting,
+                bridge_feishu::ingress::ConnectionState::Connected => {
+                    crate::health::Phase::Connected
                 }
-                Event::Card {
-                    message_id,
-                    user_id,
-                    chat_id,
-                    action,
-                } => {
-                    let card = decode_card_click(message_id.clone(), &action);
-                    (
-                        format!("card:{message_id}"),
-                        user_id,
-                        chat_id,
-                        None,
-                        card,
-                        vec![],
-                    )
+                bridge_feishu::ingress::ConnectionState::Reconnecting => {
+                    crate::health::Phase::Reconnecting
                 }
             };
-            let accept = Box::new(move |accepted| {
-                if let Some(receipt) = received.acceptance {
-                    receipt.complete(accepted);
-                }
-            });
-            if input_tx
-                .try_send(runtime::Input {
-                    attachments,
-                    card,
-                    id,
-                    user,
-                    chat,
-                    text,
-                    accept,
-                })
+            if connection_health
+                .lock()
+                .map_err(|_| ())
+                .and_then(|mut h| h.set(phase).map_err(|_| ()))
                 .is_err()
             {
-                eprintln!("{{\"event\":\"input_overloaded\"}}");
+                diagnostics.emit(
+                    bridge_app::diagnostics::Event::HealthWriteFailed,
+                    bridge_app::diagnostics::Status::Failed,
+                    None,
+                    0,
+                );
+                healthy = false;
+                stop.cancel();
+                break;
             }
         }
         stop.cancel();
@@ -309,38 +303,41 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         stop.cancel();
     });
-    eprintln!("{{\"event\":\"rust_runtime_started\"}}");
+    let files = Arc::new(
+        bridge_app::files::Deliveries::new(
+            diagnostics.clone(),
+            Arc::new(bridge_local::workspace_files::WorkspaceFiles),
+            messenger.clone(),
+            messenger.clone(),
+        )
+        .excluding(vec![config.workspace.state_dir.clone()])
+        .generated_images(
+            std::env::var_os("CODEX_GENERATED_IMAGES")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("CODEX_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+                        })
+                        .map(|home| home.join("generated_images"))
+                }),
+        ),
+    );
     let result = runtime::run(
         runtime::Settings {
             root,
             directory,
             allowed,
             open_access: config.access.mode == AccessMode::Open,
-            sandbox: match config.codex.sandbox {
-                Sandbox::WorkspaceWrite => ports::Sandbox::WorkspaceWrite,
-                Sandbox::DangerFullAccess => ports::Sandbox::DangerFullAccess,
-            },
+            sandbox: config.codex.sandbox.into(),
             epoch,
         },
+        diagnostics.clone(),
         backend,
         store,
-        Arc::new(
-            bridge_local::delivery::Delivery::new(messenger.clone(), messenger)
-                .excluding(vec![config.workspace.state_dir.clone()])
-                .generated_images(
-                    std::env::var_os("CODEX_GENERATED_IMAGES")
-                        .map(PathBuf::from)
-                        .or_else(|| {
-                            std::env::var_os("CODEX_HOME")
-                                .map(PathBuf::from)
-                                .or_else(|| {
-                                    std::env::var_os("HOME")
-                                        .map(|home| PathBuf::from(home).join(".codex"))
-                                })
-                                .map(|home| home.join("generated_images"))
-                        }),
-                ),
-        ),
+        messenger,
+        files,
         input_rx,
         event_rx,
         cancel.clone(),
@@ -366,7 +363,19 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         || !matches!(heartbeat_result, Ok(Ok(())))
         || !matches!(agent_result, Ok(Ok(())))
     {
+        diagnostics.emit(
+            bridge_app::diagnostics::Event::RuntimeExit,
+            bridge_app::diagnostics::Status::Failed,
+            None,
+            0,
+        );
         return Err("连接或后台任务异常退出；未自动重启任务".into());
     }
+    diagnostics.emit(
+        bridge_app::diagnostics::Event::RuntimeExit,
+        bridge_app::diagnostics::Status::Ok,
+        None,
+        0,
+    );
     Ok(())
 }
