@@ -19,12 +19,12 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         match done {
             Done::PlanAction {
-                input,
+                mut input,
                 task,
                 result,
             } => {
                 self.scheduler.end_session_mutation();
-                (input.accept)(true);
+                input.ack.settle(true);
                 match result {
                     Ok(true) => {
                         if let Some(task) = task {
@@ -210,13 +210,13 @@ impl Runtime {
                 }
             }
             Done::DirectoryClaim {
-                input,
+                mut input,
                 current,
                 target,
                 result,
             } => match result {
                 Ok(true) => {
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
@@ -240,11 +240,11 @@ impl Runtime {
                 }
                 Ok(false) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(true);
+                    input.ack.settle(true);
                 }
                 Err(()) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -349,12 +349,12 @@ impl Runtime {
                 }
             },
             Done::CreationClaim {
-                input,
+                mut input,
                 creation,
                 result,
             } => match result {
                 Ok(true) if Instant::now() < creation.deadline => {
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
@@ -380,7 +380,7 @@ impl Runtime {
                 }
                 Ok(new) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     if new {
                         tell(
                             &self.delivery,
@@ -391,7 +391,7 @@ impl Runtime {
                 }
                 Err(()) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -452,12 +452,12 @@ impl Runtime {
                 }),
             )?,
             Done::CompactClaim {
-                input,
+                mut input,
                 session,
                 result,
             } => match result {
                 Ok(true) => {
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     self.next_task = self
                         .next_task
                         .checked_add(1)
@@ -524,11 +524,11 @@ impl Runtime {
                 }
                 Ok(false) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(true);
+                    input.ack.settle(true);
                 }
                 Err(()) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -658,13 +658,13 @@ impl Runtime {
                 }
             }
             Done::PreferenceClaim {
-                input,
+                mut input,
                 session,
                 change,
                 result,
             } => match result {
                 Ok(true) => {
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
@@ -694,11 +694,11 @@ impl Runtime {
                 }
                 Ok(false) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(true);
+                    input.ack.settle(true);
                 }
                 Err(()) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -724,14 +724,14 @@ impl Runtime {
                 self.scheduler.end_session_mutation();
             }
             Done::ThreadClaim {
-                input,
+                mut input,
                 session,
                 thread,
                 action,
                 result,
             } => match result {
                 Ok(true) => {
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     if !can_spawn(jobs, false) {
                         self.scheduler.end_session_mutation();
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
@@ -763,11 +763,11 @@ impl Runtime {
                 }
                 Ok(false) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(true);
+                    input.ack.settle(true);
                 }
                 Err(()) => {
                     self.scheduler.end_session_mutation();
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -839,11 +839,11 @@ impl Runtime {
                 }
                 Err(error) => tell(&self.delivery, &chat, format!("读取会话列表失败：{error}"))?,
             },
-            Done::Reset { input, result } => {
+            Done::Reset { mut input, result } => {
                 self.scheduler.end_session_mutation();
                 match result {
                     Ok(new) => {
-                        (input.accept)(true);
+                        input.ack.settle(true);
                         if new {
                             tell(
                                 &self.delivery,
@@ -853,7 +853,7 @@ impl Runtime {
                         }
                     }
                     Err(()) => {
-                        (input.accept)(false);
+                        input.ack.settle(false);
                         tell(
                             &self.delivery,
                             &input.chat,
@@ -864,19 +864,19 @@ impl Runtime {
             }
             Done::Admission {
                 ticket,
-                input,
+                mut input,
                 result,
             } => match result {
                 Ok(new) => {
                     let queued = self.scheduler.commit_admission(ticket, new);
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     if queued {
                         tell(&self.delivery, &input.chat, "请求已接收。")?;
                     }
                 }
                 Err(_) => {
                     self.scheduler.abort_admission(ticket);
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     tell(
                         &self.delivery,
                         &input.chat,

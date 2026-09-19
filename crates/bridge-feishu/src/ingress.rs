@@ -35,15 +35,11 @@ pub fn decode_card_click(source: String, action: &Value) -> Option<Click> {
 
 impl Received {
     /// Convert one received Feishu message or card click into application
-    /// input; the acceptance receipt completes when the runtime rejects it.
+    /// input; the runtime settles the carried [`Ack`](runtime::Ack) exactly
+    /// once and the receipt completes the Feishu event acknowledgement.
     /// Connection events are lifecycle-only and convert to nothing.
     pub fn into_runtime_input(self) -> Option<runtime::Input> {
-        let acceptance = self.acceptance;
-        let accept = move |accepted: bool| {
-            if let Some(receipt) = acceptance {
-                receipt.complete(accepted);
-            }
-        };
+        let ack = runtime::Ack::from_receipt(self.acceptance.map(|receipt| receipt.0));
         match self.event {
             Event::Message {
                 message_id,
@@ -59,7 +55,7 @@ impl Received {
                 user: user_id,
                 chat: chat_id,
                 text: crate::message_text(&message_type, &content),
-                accept: Box::new(accept),
+                ack,
             }),
             Event::Card {
                 message_id,
@@ -73,7 +69,7 @@ impl Received {
                 user: user_id,
                 chat: chat_id,
                 text: None,
-                accept: Box::new(accept),
+                ack,
             }),
             Event::Connection { .. } => None,
         }

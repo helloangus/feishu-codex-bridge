@@ -23,9 +23,7 @@ async fn submit(
         user: user.into(),
         chat: "chat".into(),
         text,
-        accept: Box::new(move |accepted| {
-            let _ = ack.send(accepted);
-        }),
+        ack: runtime::Ack::from_receipt(Some(ack)),
     })
     .await?;
     assert!(wait.await?);

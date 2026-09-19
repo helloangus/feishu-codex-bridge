@@ -174,9 +174,7 @@ impl Harness {
                 chat: chat.into(),
                 text,
                 card,
-                accept: Box::new(move |accepted| {
-                    let _ = ack.send(accepted);
-                }),
+                ack: runtime::Ack::from_receipt(Some(ack)),
             })
             .await
             .map_err(|_| "input closed")?;

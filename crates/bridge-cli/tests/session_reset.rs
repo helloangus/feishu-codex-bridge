@@ -21,9 +21,7 @@ async fn send(tx: &mpsc::Sender<Input>, id: &str, text: &str) -> Result<bool, Bo
         user: "owner".into(),
         chat: "chat".into(),
         text: Some(text.into()),
-        accept: Box::new(move |accepted| {
-            let _ = ack.send(accepted);
-        }),
+        ack: runtime::Ack::from_receipt(Some(ack)),
     })
     .await?;
     Ok(wait.await?)

@@ -32,7 +32,7 @@ impl Runtime {
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), RuntimeError> {
         if input.id.is_empty() || input.user.is_empty() || input.chat.is_empty() {
-            (input.accept)(false);
+            input.ack.settle(false);
             return Ok(());
         }
         if input.card.is_none()
@@ -49,7 +49,7 @@ impl Runtime {
                 &input.chat,
                 "当前飞书用户尚未授权。如管理员启用了配对，请发送 /pair <配对码>；否则请联系管理员加入白名单。",
             )?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         let current = self
@@ -59,12 +59,12 @@ impl Runtime {
             .clone();
         if input.attachments.len() > limits::ATTACHMENTS_PER_MESSAGE {
             tell(&self.delivery, &input.chat, "单条消息最多接收 10 个附件。")?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         if !input.attachments.is_empty() {
             if input.card.is_some() {
-                (input.accept)(false);
+                input.ack.settle(false);
                 return Ok(());
             }
             let text = input
@@ -91,7 +91,7 @@ impl Runtime {
                     &input.chat,
                     "卡片操作无效、已使用或已过期；请重新发送 /help 或 /cd <路径>。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             };
             approval_source = Some(click.source.clone());
@@ -131,7 +131,7 @@ impl Runtime {
                 &input.chat,
                 "正在整理本轮成果，请交付结束后再修改会话、目录或设置。",
             )?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         if text.starts_with("/answer ") || text.starts_with("/answer-skip ") {
@@ -198,7 +198,7 @@ impl Runtime {
                     );
                 }
             }
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         if let Ok(Command::ConfirmDirectory(token)) = &command {
@@ -211,12 +211,12 @@ impl Runtime {
                     &input.chat,
                     "创建确认无效、已过期或不属于当前用户/聊天/目录；请重新发送 /cd <路径>。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             };
             if !can_spawn(jobs, false) {
                 tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             if !self.scheduler.begin_session_mutation() {
@@ -225,7 +225,7 @@ impl Runtime {
                     &input.chat,
                     "有任务执行中、排队或目录正在更新；请空闲后在有效期内再次确认。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             self.confirmations.remove(token);
@@ -248,12 +248,12 @@ impl Runtime {
                         &input.chat,
                         "目录参数无效：最多 4096 字节，不能包含换行或控制字符。",
                     )?;
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     return Ok(());
                 }
                 if !can_spawn(jobs, false) {
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     return Ok(());
                 }
                 if !self.scheduler.begin_session_mutation() {
@@ -262,7 +262,7 @@ impl Runtime {
                         &input.chat,
                         "有任务执行中、排队或目录正在更新；请等待完成或先 /stop，再切换目录。",
                     )?;
-                    (input.accept)(true);
+                    input.ack.settle(true);
                     return Ok(());
                 }
                 let target = target.clone();
@@ -292,7 +292,7 @@ impl Runtime {
                         });
                     }
                 }
-                (input.accept)(true);
+                input.ack.settle(true);
             }
             return Ok(());
         }
@@ -307,13 +307,13 @@ impl Runtime {
                 &input.chat,
                 "保存的目录已越出工作区；请使用 /cd <工作区内绝对路径> 重新选择。",
             )?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         if text == "/compact" {
             if !can_spawn(jobs, false) {
                 tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             if !self.scheduler.begin_session_mutation() {
@@ -322,7 +322,7 @@ impl Runtime {
                     &input.chat,
                     "有任务执行中、排队或会话正在更新；请等待完成或先 /stop，再压缩上下文。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             let store = self.store.clone();
@@ -358,7 +358,7 @@ impl Runtime {
         if text == "/new" {
             if !can_spawn(jobs, false) {
                 tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             if !self.scheduler.begin_session_mutation() {
@@ -367,7 +367,7 @@ impl Runtime {
                     &input.chat,
                     "有任务执行中、排队或会话正在更新；请等待完成或先 /stop，再发送 /new。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             let store = self.store.clone();
@@ -393,19 +393,19 @@ impl Runtime {
         }
         if text.len() > limits::INPUT_BYTES {
             tell(&self.delivery, &input.chat, "输入超过 32 KiB 上限。")?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         self.admit_task(input, text, session, current, jobs).await
     }
 
-    async fn handle_pairing(&mut self, input: super::Input) -> Result<(), RuntimeError> {
+    async fn handle_pairing(&mut self, mut input: super::Input) -> Result<(), RuntimeError> {
         if self.pairing_window.elapsed() >= limits::PAIRING_WINDOW {
             self.pairing_window = Instant::now();
             self.pairing_attempts = 0;
         }
         if self.pairing_attempts >= limits::PAIRING_ATTEMPTS {
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         self.pairing_attempts += 1;
@@ -431,7 +431,7 @@ impl Runtime {
                     &input.chat,
                     "配对成功，后续消息可使用机器人。发送 /help 查看功能。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
             }
             Ok(false) => {
                 tell(
@@ -439,7 +439,7 @@ impl Runtime {
                     &input.chat,
                     "配对未成功，请核对配对码或联系管理员。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
             }
             Err(_) => {
                 tell(
@@ -447,7 +447,7 @@ impl Runtime {
                     &input.chat,
                     "配对保存失败，尚未授权，请稍后重试。",
                 )?;
-                (input.accept)(false);
+                input.ack.settle(false);
             }
         }
         Ok(())
@@ -455,7 +455,7 @@ impl Runtime {
 
     async fn handle_plan_action(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         text: String,
         approval_source: Option<String>,
         current: PathBuf,
@@ -478,7 +478,7 @@ impl Runtime {
                 &input.chat,
                 "计划操作无效或已过期，请重新生成计划并使用原卡片。",
             )?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         if matches!(self.files, FileDelivery::Delivering)
@@ -489,7 +489,7 @@ impl Runtime {
                 &input.chat,
                 "有任务或成果交付进行中，请空闲后重新生成计划。",
             )?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         if !can_spawn(jobs, false) {
@@ -499,7 +499,7 @@ impl Runtime {
                 &input.chat,
                 "系统繁忙，请稍后重新生成计划。",
             )?;
-            (input.accept)(true);
+            input.ack.settle(true);
             return Ok(());
         }
         let offer = self
@@ -586,7 +586,7 @@ impl Runtime {
 
     async fn handle_answer(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         text: String,
         approval_source: Option<String>,
         current: PathBuf,
@@ -643,13 +643,13 @@ impl Runtime {
                 )?;
             }
         }
-        (input.accept)(true);
+        input.ack.settle(true);
         Ok(())
     }
 
     async fn handle_choice(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         text: String,
         approval_source: Option<String>,
         current: PathBuf,
@@ -710,7 +710,7 @@ impl Runtime {
                         parts[1], question
                     ),
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             Choice::Invalid => {
@@ -721,13 +721,13 @@ impl Runtime {
                 )?;
             }
         }
-        (input.accept)(true);
+        input.ack.settle(true);
         Ok(())
     }
 
     async fn handle_approve(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         token: &str,
         allow: bool,
         approval_source: Option<String>,
@@ -766,13 +766,13 @@ impl Runtime {
                 )?;
             }
         }
-        (input.accept)(true);
+        input.ack.settle(true);
         Ok(())
     }
 
     async fn handle_preferences(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         command: Result<Command, bridge_core::command::ParseError>,
         refresh: Option<String>,
         session: SessionKey,
@@ -793,7 +793,7 @@ impl Runtime {
         if let Some(change) = change {
             if !can_spawn(jobs, false) {
                 tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             if !self.scheduler.begin_session_mutation() {
@@ -802,7 +802,7 @@ impl Runtime {
                     &input.chat,
                     "有任务执行中、排队或设置正在更新；请等待完成或先 /stop，再修改设置。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             let store = self.store.clone();
@@ -873,14 +873,14 @@ impl Runtime {
                     });
                 }
             }
-            (input.accept)(true);
+            input.ack.settle(true);
         }
         Ok(())
     }
 
     async fn handle_threads(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         command: Result<Command, bridge_core::command::ParseError>,
         refresh: Option<String>,
         session: SessionKey,
@@ -900,12 +900,12 @@ impl Runtime {
                     &input.chat,
                     "会话 ID 无效，请复制 /resume 或 /archived 列表中的完整命令。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             if !can_spawn(jobs, false) {
                 tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             if !self.scheduler.begin_session_mutation() {
@@ -914,7 +914,7 @@ impl Runtime {
                     &input.chat,
                     "有任务执行中、排队或会话正在更新；请等待完成或先 /stop，再操作会话。",
                 )?;
-                (input.accept)(true);
+                input.ack.settle(true);
                 return Ok(());
             }
             let store = self.store.clone();
@@ -963,14 +963,14 @@ impl Runtime {
                     });
                 }
             }
-            (input.accept)(true);
+            input.ack.settle(true);
         }
         Ok(())
     }
 
     async fn handle_simple_command(
         &mut self,
-        input: super::Input,
+        mut input: super::Input,
         text: String,
         session: SessionKey,
         current: PathBuf,
@@ -1048,7 +1048,7 @@ impl Runtime {
                 }
             }
         }
-        (input.accept)(true);
+        input.ack.settle(true);
         Ok(())
     }
 
@@ -1086,7 +1086,7 @@ impl Runtime {
                         &input.chat,
                         "任务队列繁忙，请稍后重新发送。",
                     )?;
-                    (input.accept)(false);
+                    input.ack.settle(false);
                     return Ok(());
                 }
                 let store = self.store.clone();
@@ -1105,7 +1105,7 @@ impl Runtime {
                     &input.chat,
                     "任务队列繁忙，请稍后重新发送。",
                 )?;
-                (input.accept)(false);
+                input.ack.settle(false);
             }
         }
         Ok(())

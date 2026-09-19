@@ -97,9 +97,7 @@ async fn send(tx: &mpsc::Sender<Input>, id: &str, user: &str, text: &str, files:
         } else {
             vec![]
         },
-        accept: Box::new(move |value| {
-            let _ = ack.send(value);
-        }),
+        ack: runtime::Ack::from_receipt(Some(ack)),
     })
     .await
     .map_err(|_| "input closed")?;

@@ -4,6 +4,22 @@
 //! in `state::Runtime`, input handling in `input`, protocol events in
 //! `protocol`, background completion in `jobs` and timers in `timers`.
 //! Serial admission, ownership checks and bounded channels are preserved.
+//!
+//! Task and channel topology of one run (see `docs/architecture.md` for the
+//! rendered diagram):
+//!
+//! ```text
+//! bridge-cli bootstrap                 runtime::run
+//! ─────────────────────                ─────────────────────────────────────
+//! transport ──incoming(128)──▶ gateway ──input(64)──▶ ┌───────────────┐
+//! agent ──────event(256)─────▶───────────────────────▶│ select! loop  │
+//!                                                     │ (state::      │
+//! heartbeat ─▶ health file        ┌─delivery(128)──▶  │ Runtime)      │
+//! signal ────▶ cancel             │  sender task      └──────┬────────┘
+//!                                 ▼                          │ jobs(128)
+//!                            Messenger(REST) ◀── spawns ─────┘
+//! ```
+mod ack;
 mod flow;
 mod input;
 mod jobs;
@@ -12,6 +28,7 @@ mod protocol;
 mod state;
 mod timers;
 
+pub use ack::Ack;
 pub use state::{Settings, Store};
 
 use crate::{
@@ -66,7 +83,8 @@ pub struct Input {
     pub chat: String,
     /// None denotes media or a separately validated card; never an ordinary task.
     pub text: Option<String>,
-    pub accept: Box<dyn FnOnce(bool) + Send>,
+    /// Settled exactly once per input; dropping rejects. See [`Ack`].
+    pub ack: Ack,
 }
 
 /// All network and persistence work is spawned; the owner remains responsive

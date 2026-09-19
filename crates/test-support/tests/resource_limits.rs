@@ -138,7 +138,7 @@ fn input(id: &str, text: &str) -> Input {
         user: "allowed".into(),
         chat: "chat".into(),
         text: Some(text.into()),
-        accept: Box::new(|_| {}),
+        ack: runtime::Ack::detached(),
     }
 }
 

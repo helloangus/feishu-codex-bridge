@@ -10,3 +10,4 @@ feishu-inbox/
 bridge.toml
 .bridge-state/
 dist/
+.zcode/

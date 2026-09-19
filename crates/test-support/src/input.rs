@@ -1,9 +1,9 @@
 //! Runtime `Input` construction shared by behavior tests.
 //!
-//! Every caller used to re-declare the acknowledgement closure; these helpers
+//! Every caller used to re-declare the acknowledgement plumbing; these helpers
 //! keep one canonical construction and return the admission result receiver.
 
-use bridge_app::{cards::Click, files::Attachment, runtime::Input};
+use bridge_app::{cards::Click, files::Attachment, runtime, runtime::Input};
 use std::error::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -25,9 +25,7 @@ pub fn make_input(
             user: user.to_owned(),
             chat: chat.to_owned(),
             text,
-            accept: Box::new(move |accepted| {
-                let _ = ack.send(accepted);
-            }),
+            ack: runtime::Ack::from_receipt(Some(ack)),
         },
         wait,
     )
