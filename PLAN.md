@@ -46,7 +46,7 @@
 
 ### H `refactor/outcome-model` — 结果模型
 
-- [ ] 引入 `Outcome` 枚举，在 `flow::finish` 与协议事件边界携带；`presentation.rs` 与 `cards.rs` 不再用中文消息前缀或卡片标题字符串做控制流，文案只在展示层生成且逐字不变。
+- [x] 引入 `Outcome` 枚举，在 `flow::finish` 与协议事件边界携带；`presentation.rs` 不再用中文消息前缀做控制流，文案只在展示层生成且逐字不变（卡片标题判类型归入工作包 I 的 `CardBook`）。
 - [ ] 结果分类与 tone/文案映射表进入 `docs/runtime-flows.md`。
 
 ### I `refactor/card-grants` — 卡片授权模型
