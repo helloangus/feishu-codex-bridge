@@ -51,10 +51,10 @@
 
 ### I `refactor/card-grants` — 卡片授权模型
 
-- [ ] 新增 `runtime/tokens.rs`：`panel-`/`cd-`/`approval-`/`plan-`/`card:` 五种令牌格式的唯一铸造点。
-- [ ] `CardBook` 成为卡片校验唯一入口，文档写明统一失效规则（签发绑定 source+generation+任务快照、一次性消费、deadline、停止快照比对）。
-- [ ] 无名元组 `stop_snapshot: (u64, Option<TaskId>)` 改为具名 `TaskSnapshot`。
-- [ ] `deliver_list` 参数收敛，删除调用方 `next_panel + 1` 预言。
+- [x] 新增 `runtime/tokens.rs`：`panel-`/`cd-`/`approval-`/`plan-`/`card:` 五种令牌格式的唯一铸造点。
+- [x] `CardBook` 成为卡片校验唯一入口，文档写明统一失效规则（签发绑定 source+generation+任务快照、一次性消费、deadline、停止快照比对）。
+- [x] 无名元组 `stop_snapshot: (u64, Option<TaskId>)` 改为具名 `TaskSnapshot`。
+- [x] `deliver_list` 参数收敛，删除调用方 `next_panel + 1` 预言。
 - [ ] 卡片令牌生命周期时序图进入文档。
 
 ### J `refactor/supervision-plane` — 监督与控制平面
