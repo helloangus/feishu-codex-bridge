@@ -38,11 +38,11 @@
 
 ### G `refactor/runtime-bus` — 运行时总线与组件化
 
-- [ ] `Done` 按因果流分域为 Session/Task/Card/Delivery 子枚举；`JoinSet<Done>` 单通道结构不变；`handle_done`（约 995 行、26 分支）改为分派加按域处理，每个函数不超过 100 行。
-- [ ] `Runtime` 的 29 个字段收拢为 Admission、TaskTrack、CardBook、SessionBook、Presentation 五个命名组件；组件方法只修改自身字段，跨组件读取通过显式参数。
-- [ ] `Input.accept` 闭包改为具名 `Ack` 句柄（Drop 即 NAK，与现状每路径恰好结算一次等价），`bridge-feishu` ingress 同步改造。
-- [ ] 运行时数据流图（6 个异步任务与 4 条有界通道及容量）进入 `docs/architecture.md`；ASCII 拓扑图进入 `runtime/mod.rs` 模块文档；`Ack` 契约成文。
-- [ ] 魔法数 `64`（`jobs.rs`）改用 `limits::EARLY_PROTOCOL_EVENTS`。
+- [x] `Done` 按因果流分域为 Session/Task/Card/Delivery 子枚举；`JoinSet<Done>` 单通道结构不变；`handle_done`（约 995 行、26 分支）改为分派加按域处理，每个函数不超过 100 行。
+- [x] `Runtime` 的 29 个字段收拢为 Admission、TaskTrack、CardBook、SessionBook、Presentation 五个命名组件；组件方法只修改自身字段，跨组件读取通过显式参数。
+- [x] `Input.accept` 闭包改为具名 `Ack` 句柄（Drop 即 NAK，与现状每路径恰好结算一次等价），`bridge-feishu` ingress 同步改造。
+- [x] 运行时数据流图（6 个异步任务与 4 条有界通道及容量）进入 `docs/architecture.md`；ASCII 拓扑图进入 `runtime/mod.rs` 模块文档；`Ack` 契约成文。
+- [x] 魔法数 `64`（`jobs.rs`）改用 `limits::EARLY_PROTOCOL_EVENTS`。
 
 ### H `refactor/outcome-model` — 结果模型
 
