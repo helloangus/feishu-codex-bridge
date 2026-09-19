@@ -680,29 +680,11 @@ pub fn enforce_clean_tree(facts: &RepoFacts, allow_dirty: bool) -> Result<(), St
 
 /// Build the host release binary and publish a verified package.
 pub fn run_command(args: &[String]) -> Result<(), String> {
-    let mut allow_dirty = false;
-    let mut output_dir: Option<String> = None;
-    for arg in args {
-        match arg.as_str() {
-            "--allow-dirty" => allow_dirty = true,
-            "--release" => {} // release is the only supported packaging profile
-            "--help" | "-h" => {
-                print_usage();
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
-                return Err(format!(
-                    "unknown package option '{other}'; see 'cargo xtask package --help'"
-                ));
-            }
-            other => {
-                if output_dir.is_some() {
-                    return Err("package accepts at most one output directory".to_string());
-                }
-                output_dir = Some(other.to_string());
-            }
-        }
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return Ok(());
     }
+    let (allow_dirty, output_dir) = parse_args(args)?;
     let facts = collect_repo_facts()?;
     let mut configured: Vec<(String, String)> = Vec::new();
     if let Some(value) = std::env::var("CARGO_BUILD_TARGET")
@@ -727,6 +709,62 @@ pub fn run_command(args: &[String]) -> Result<(), String> {
         }
         None => facts.root.join("dist"),
     };
+    let executable = build_release_binary(&facts)?;
+    let info = BuildInfo {
+        package: "bridge-cli".to_string(),
+        version: facts.package_version.clone(),
+        commit: facts.commit.clone(),
+        dirty: facts.dirty,
+        allow_dirty,
+        dirty_files: facts.dirty_files.clone(),
+        target: facts.rustc.host.clone(),
+        profile: "release".to_string(),
+        rustc_version: facts.rustc.version_line.clone(),
+        cargo_version: facts.cargo_version.clone(),
+    };
+    let inputs = PackageInputs {
+        executable,
+        example_toml: facts.root.join("bridge.example.toml"),
+        deployment_doc: facts.root.join("docs/deployment.md"),
+    };
+    let staging = create_staging_dir(&output)?;
+    assemble_and_publish(&staging, &output, &inputs, &info)?;
+    println!("published package: {}", output.display());
+    println!("files: {}", PACKAGE_FILES.join(", "));
+    println!(
+        "host-only build ({}, release); no cross-compilation was performed",
+        facts.rustc.host
+    );
+    Ok(())
+}
+
+/// Parse package CLI options; `--release` is accepted but is already the
+/// only profile. Returns (allow_dirty, output directory).
+fn parse_args(args: &[String]) -> Result<(bool, Option<String>), String> {
+    let mut allow_dirty = false;
+    let mut output_dir: Option<String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--allow-dirty" => allow_dirty = true,
+            "--release" => {}
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown package option '{other}'; see 'cargo xtask package --help'"
+                ));
+            }
+            other => {
+                if output_dir.is_some() {
+                    return Err("package accepts at most one output directory".to_string());
+                }
+                output_dir = Some(other.to_string());
+            }
+        }
+    }
+    Ok((allow_dirty, output_dir))
+}
+
+/// Build the release binary and return its path from the build messages.
+fn build_release_binary(facts: &RepoFacts) -> Result<std::path::PathBuf, String> {
     println!(
         "==> xtask package: cargo build -p bridge-cli --bin bridge --release --locked -j 1 (host {})",
         facts.rustc.host
@@ -761,32 +799,7 @@ pub fn run_command(args: &[String]) -> Result<(), String> {
             executable.display()
         ));
     }
-    let info = BuildInfo {
-        package: "bridge-cli".to_string(),
-        version: facts.package_version.clone(),
-        commit: facts.commit.clone(),
-        dirty: facts.dirty,
-        allow_dirty,
-        dirty_files: facts.dirty_files.clone(),
-        target: facts.rustc.host.clone(),
-        profile: "release".to_string(),
-        rustc_version: facts.rustc.version_line.clone(),
-        cargo_version: facts.cargo_version.clone(),
-    };
-    let inputs = PackageInputs {
-        executable,
-        example_toml: facts.root.join("bridge.example.toml"),
-        deployment_doc: facts.root.join("docs/deployment.md"),
-    };
-    let staging = create_staging_dir(&output)?;
-    assemble_and_publish(&staging, &output, &inputs, &info)?;
-    println!("published package: {}", output.display());
-    println!("files: {}", PACKAGE_FILES.join(", "));
-    println!(
-        "host-only build ({}, release); no cross-compilation was performed",
-        facts.rustc.host
-    );
-    Ok(())
+    Ok(executable)
 }
 
 fn print_usage() {

@@ -10,7 +10,7 @@ use test_support::{
     actor::{Actor, ActorConfig},
     diagnostics,
     input::submit,
-    messenger::{MessengerOptions, RecordingMessenger, expect_chat_text},
+    messenger::{MessengerHandles, MessengerOptions, RecordingMessenger, expect_chat_text},
 };
 
 fn options() -> MessengerOptions {
@@ -88,10 +88,13 @@ async fn compact_scenario(mode: &str) -> Result<(), Box<dyn Error>> {
         drop(initial);
         let store = Arc::new(AsyncState::new(JsonStore::open(&state_path)?));
         if mode == "storage" {
+            // The `storage` scenario is implemented here, not in the fake:
+            // replacing the journal file with a directory makes every durable
+            // write fail.
             std::fs::create_dir(state_path.join("seen-messages.json"))?;
         }
         let (messenger, mut output) = RecordingMessenger::recorded("", options());
-        let actor = Actor::start(
+        let mut actor = Actor::start(
             ActorConfig {
                 executable: test_support::fake_codex_runtime!(),
                 args: vec!["compact".into(), mode.into()],
@@ -109,131 +112,212 @@ async fn compact_scenario(mode: &str) -> Result<(), Box<dyn Error>> {
         )
         .await?;
         if mode == "storage" {
-            let accepted = submit(
-                &actor.input,
-                "compact",
-                "allowed",
-                "chat",
-                Some("/compact".into()),
-                None,
-                Vec::new(),
-            )
-            .await?;
-            assert!(!accepted);
-            expect_chat_text(&mut output, "chat", "压缩请求保存失败").await?;
-            assert!(!temp.path().join("preparation").exists());
-            actor.cancel.cancel();
-            actor.worker.await??;
-            actor.server.await??;
+            assert_storage_failure(&mut actor, &mut output, &temp).await?;
             return Ok(());
         }
         actor.send_text("compact", "allowed", "/compact").await?;
-        if mode == "prepare_stop" {
-            while !tokio::fs::try_exists(temp.path().join("preparation")).await? {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        match mode {
+            "prepare_stop" => {
+                assert_prepare_stop(&mut actor, &mut output, &temp).await?;
             }
-            actor.send_text("prepare-stop", "allowed", "/stop").await?;
-            expect_chat_text(&mut output, "chat", "已请求停止当前任务").await?;
-            actor
-                .send_text("release-read", "allowed", "/models")
-                .await?;
-            expect_chat_text(&mut output, "chat", "准备阶段已停止，未启动压缩").await?;
-            assert!(!temp.path().join("compactions").exists());
-        } else if matches!(mode, "empty" | "foreign" | "active" | "wrong_resume") {
-            expect_chat_text(&mut output, "chat", "压缩准备失败").await?;
-            assert!(!temp.path().join("compactions").exists());
-        } else if mode == "uncertain" {
-            expect_chat_text(&mut output, "chat", "压缩启动结果不确定").await?;
-            assert!(actor.worker.await?.is_err());
-            actor.cancel.cancel();
-            actor.server.await??;
-            assert_eq!(
-                std::fs::read_to_string(temp.path().join("compactions"))?,
-                "compact\n"
-            );
-            return Ok(());
-        } else if mode == "rejected" {
-            expect_chat_text(&mut output, "chat", "压缩请求被拒绝").await?;
-        } else if mode == "early" {
-            expect_chat_text(&mut output, "chat", "上下文压缩完成").await?;
-        } else {
-            expect_chat_text(&mut output, "chat", "正在等待完成").await?;
-            actor.send_text("status", "allowed", "/status").await?;
-            let status = expect_chat_text(&mut output, "chat", "上下文压缩中").await?;
-            assert!(!status.contains("上下文压缩完成"));
-            actor.send_text("busy", "allowed", "/new").await?;
-            expect_chat_text(&mut output, "chat", "有任务执行中").await?;
-            actor.send_text("again", "allowed", "/compact").await?;
-            expect_chat_text(&mut output, "chat", "有任务执行中").await?;
-            let accepted = submit(
-                &actor.input,
-                "blocked-task",
-                "allowed",
-                "chat",
-                Some("must not run".into()),
-                None,
-                Vec::new(),
-            )
-            .await?;
-            assert!(!accepted);
-            expect_chat_text(&mut output, "chat", "任务队列繁忙").await?;
-            actor.send_text("other-stop", "other", "/stop").await?;
-            expect_chat_text(&mut output, "chat", "没有可停止").await?;
-            assert!(!temp.path().join("compact-interrupts").exists());
-            if mode == "stop" {
-                actor.send_text("stop", "allowed", "/stop").await?;
-                expect_chat_text(&mut output, "chat", "上下文压缩已停止").await?;
-                assert_eq!(
-                    std::fs::read_to_string(temp.path().join("compact-interrupts"))?,
-                    "interrupt\n"
-                );
-            } else {
-                actor.send_text("finish", "allowed", "/models").await?;
-                expect_chat_text(
-                    &mut output,
-                    "chat",
-                    if mode == "failed" {
-                        "上下文压缩失败：fake compact error"
-                    } else {
-                        "上下文压缩完成"
-                    },
-                )
-                .await?;
+            "empty" | "foreign" | "active" | "wrong_resume" => {
+                assert_prepare_failed(&mut output, &temp).await?;
+            }
+            "uncertain" => {
+                assert_uncertain(&mut actor, &mut output, &temp).await?;
+                return Ok(());
+            }
+            "rejected" => {
+                expect_chat_text(&mut output, "chat", "压缩请求被拒绝").await?;
+            }
+            "early" => {
+                expect_chat_text(&mut output, "chat", "上下文压缩完成").await?;
+            }
+            _ => {
+                assert_running_session(&mut actor, &mut output, &temp, mode).await?;
             }
         }
-        actor.send_text("compact", "allowed", "/compact").await?;
-        actor.send_text("idle", "allowed", "/status").await?;
-        expect_chat_text(&mut output, "chat", "空闲").await?;
-        assert_eq!(
-            store.thread(key).await?,
-            if mode == "empty" {
-                None
-            } else {
-                Some("thread".into())
-            }
-        );
-        if !matches!(
-            mode,
-            "empty" | "foreign" | "active" | "wrong_resume" | "prepare_stop"
-        ) {
-            assert_eq!(
-                std::fs::read_to_string(temp.path().join("compactions"))?,
-                "compact\n"
-            );
-            assert_eq!(
-                std::fs::read_to_string(temp.path().join("preparation"))?,
-                "thread/read\nthread/resume\n"
-            );
-        }
+        assert_returns_to_idle(&mut actor, &mut output, &store, &key, mode).await?;
+        assert_signal_files(&temp, mode)?;
         actor.cancel.cancel();
-        actor.worker.await??;
-        actor.server.await??;
+        let (worker, server) = actor.stop().await;
+        worker??;
+        server??;
         drop(store);
         let reopened = AsyncState::new(JsonStore::open(&state_path)?);
         assert!(!bridge_app::sessions::DurableJournal::claim(&reopened, "compact".into()).await?);
         Ok::<_, Box<dyn Error>>(())
     })
     .await??;
+    Ok(())
+}
+
+type CompactTemp = tempfile::TempDir;
+
+async fn assert_storage_failure(
+    actor: &mut Actor,
+    output: &mut MessengerHandles,
+    temp: &CompactTemp,
+) -> Result<(), Box<dyn Error>> {
+    let accepted = submit(
+        &actor.input,
+        "compact",
+        "allowed",
+        "chat",
+        Some("/compact".into()),
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert!(!accepted);
+    expect_chat_text(output, "chat", "压缩请求保存失败").await?;
+    assert!(!temp.path().join("preparation").exists());
+    let (worker, server) = actor.stop().await;
+    worker??;
+    server??;
+    Ok(())
+}
+
+async fn assert_prepare_stop(
+    actor: &mut Actor,
+    output: &mut MessengerHandles,
+    temp: &CompactTemp,
+) -> Result<(), Box<dyn Error>> {
+    while !tokio::fs::try_exists(temp.path().join("preparation")).await? {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    actor.send_text("prepare-stop", "allowed", "/stop").await?;
+    expect_chat_text(output, "chat", "已请求停止当前任务").await?;
+    actor
+        .send_text("release-read", "allowed", "/models")
+        .await?;
+    expect_chat_text(output, "chat", "准备阶段已停止，未启动压缩").await?;
+    assert!(!temp.path().join("compactions").exists());
+    Ok(())
+}
+
+async fn assert_prepare_failed(
+    output: &mut MessengerHandles,
+    temp: &CompactTemp,
+) -> Result<(), Box<dyn Error>> {
+    expect_chat_text(output, "chat", "压缩准备失败").await?;
+    assert!(!temp.path().join("compactions").exists());
+    Ok(())
+}
+
+async fn assert_uncertain(
+    actor: &mut Actor,
+    output: &mut MessengerHandles,
+    temp: &CompactTemp,
+) -> Result<(), Box<dyn Error>> {
+    expect_chat_text(output, "chat", "压缩启动结果不确定").await?;
+    let mut worker = std::mem::replace(
+        &mut actor.worker,
+        tokio::task::spawn(std::future::ready(Ok(()))),
+    );
+    assert!((&mut worker).await?.is_err());
+    actor.cancel.cancel();
+    let mut server = std::mem::replace(
+        &mut actor.server,
+        tokio::task::spawn(std::future::ready(Ok(()))),
+    );
+    (&mut server).await??;
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("compactions"))?,
+        "compact\n"
+    );
+    Ok(())
+}
+
+/// The happy path plus every guard that must refuse interference while the
+/// compaction is running.
+async fn assert_running_session(
+    actor: &mut Actor,
+    output: &mut MessengerHandles,
+    temp: &CompactTemp,
+    mode: &str,
+) -> Result<(), Box<dyn Error>> {
+    expect_chat_text(output, "chat", "正在等待完成").await?;
+    actor.send_text("status", "allowed", "/status").await?;
+    let status = expect_chat_text(output, "chat", "上下文压缩中").await?;
+    assert!(!status.contains("上下文压缩完成"));
+    actor.send_text("busy", "allowed", "/new").await?;
+    expect_chat_text(output, "chat", "有任务执行中").await?;
+    actor.send_text("again", "allowed", "/compact").await?;
+    expect_chat_text(output, "chat", "有任务执行中").await?;
+    let accepted = submit(
+        &actor.input,
+        "blocked-task",
+        "allowed",
+        "chat",
+        Some("must not run".into()),
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert!(!accepted);
+    expect_chat_text(output, "chat", "任务队列繁忙").await?;
+    actor.send_text("other-stop", "other", "/stop").await?;
+    expect_chat_text(output, "chat", "没有可停止").await?;
+    assert!(!temp.path().join("compact-interrupts").exists());
+    if mode == "stop" {
+        actor.send_text("stop", "allowed", "/stop").await?;
+        expect_chat_text(output, "chat", "上下文压缩已停止").await?;
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("compact-interrupts"))?,
+            "interrupt\n"
+        );
+    } else {
+        actor.send_text("finish", "allowed", "/models").await?;
+        expect_chat_text(
+            output,
+            "chat",
+            if mode == "failed" {
+                "上下文压缩失败：fake compact error"
+            } else {
+                "上下文压缩完成"
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn assert_returns_to_idle(
+    actor: &mut Actor,
+    output: &mut MessengerHandles,
+    store: &Arc<AsyncState>,
+    key: &bridge_core::SessionKey,
+    mode: &str,
+) -> Result<(), Box<dyn Error>> {
+    actor.send_text("compact", "allowed", "/compact").await?;
+    actor.send_text("idle", "allowed", "/status").await?;
+    expect_chat_text(output, "chat", "空闲").await?;
+    assert_eq!(
+        store.thread(key.clone()).await?,
+        if mode == "empty" {
+            None
+        } else {
+            Some("thread".into())
+        }
+    );
+    Ok(())
+}
+
+fn assert_signal_files(temp: &CompactTemp, mode: &str) -> Result<(), Box<dyn Error>> {
+    if !matches!(
+        mode,
+        "empty" | "foreign" | "active" | "wrong_resume" | "prepare_stop"
+    ) {
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("compactions"))?,
+            "compact\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("preparation"))?,
+            "thread/read\nthread/resume\n"
+        );
+    }
     Ok(())
 }
 

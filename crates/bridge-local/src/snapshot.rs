@@ -3,7 +3,7 @@
 //! The snapshot data model lives in [`bridge_app::files`]; this module owns the
 //! scanning, diffing and safe-open algorithms over it.
 use bridge_app::files::{Entry, FileDiff, FileKind, Limits, Snapshot};
-use rustix::fs::{Mode, OFlags, openat};
+
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::{
@@ -66,34 +66,10 @@ pub fn file_kind(relative: &Path) -> FileKind {
     }
 }
 
-/// Open every relative path component without following symlinks. Nonblocking
-/// final open prevents a swapped FIFO from hanging the scanner.
+/// Open every relative path component without following symlinks; see
+/// [`crate::safeio`] for the shared threat model.
 pub fn open_regular(root: &File, relative: &Path) -> io::Result<File> {
-    let parts: Vec<_> = relative.components().collect();
-    if parts.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
-    }
-    let mut directory = root.try_clone()?;
-    for (index, component) in parts.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "non-relative path",
-            ));
-        };
-        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-        if index + 1 < parts.len() {
-            flags |= OFlags::DIRECTORY;
-        }
-        directory = File::from(openat(&directory, Path::new(name), flags, Mode::empty())?);
-    }
-    if !directory.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    Ok(directory)
+    crate::safeio::open_regular(root, relative)
 }
 
 pub fn scan(root: &Path, limits: Limits) -> io::Result<Snapshot> {
@@ -160,50 +136,67 @@ pub fn scan_excluding(
             skipped: None,
             digest: None,
         };
-        if kind == FileKind::Artifact && metadata.len() <= 20 * 1024 * 1024 {
-            let mut hash = Sha256::new();
-            let mut reader = Read::by_ref(&mut file).take(20 * 1024 * 1024 + 1);
-            let mut buffer = [0u8; 64 * 1024];
-            let mut count = 0u64;
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        state.digest = Some(hash.finalize().into());
-                        break;
-                    }
-                    Ok(n) => {
-                        count += n as u64;
-                        hash.update(&buffer[..n]);
-                    }
-                    Err(_) => {
-                        result.complete = false;
-                        break;
-                    }
-                }
-                if count > 20 * 1024 * 1024 {
-                    result.complete = false;
-                    break;
-                }
-            }
+        if kind == FileKind::Artifact
+            && metadata.len() <= ARTIFACT_HASH_LIMIT
+            && hash_artifact(&mut file, &mut state).is_err()
+        {
+            result.complete = false;
         }
         if kind == FileKind::Text {
-            let mut bytes = Vec::new();
-            match Read::by_ref(&mut file)
-                .take(limits.text_bytes.saturating_add(1) as u64)
-                .read_to_end(&mut bytes)
-            {
-                Err(_) => state.skipped = Some("无法读取".into()),
-                Ok(_) if bytes.len() > limits.text_bytes => state.skipped = Some("文件过大".into()),
-                Ok(_) if bytes.contains(&0) => state.skipped = Some("二进制文件".into()),
-                Ok(_) => match String::from_utf8(bytes) {
-                    Ok(text) => state.text = Some(text),
-                    Err(_) => state.skipped = Some("非 UTF-8 文本".into()),
-                },
-            }
+            read_text_entry(&mut file, limits.text_bytes, &mut state);
         }
         result.files.insert(relative.into(), state);
     }
     Ok(result)
+}
+
+/// Largest artifact that is hashed instead of only measured.
+const ARTIFACT_HASH_LIMIT: u64 = 20 * 1024 * 1024;
+
+/// SHA-256 an artifact file, marking the entry incomplete when it exceeds
+/// [`ARTIFACT_HASH_LIMIT`] mid-read or the read fails.
+fn hash_artifact(file: &mut File, state: &mut Entry) -> io::Result<()> {
+    let mut hash = Sha256::new();
+    let mut reader = Read::by_ref(file).take(ARTIFACT_HASH_LIMIT + 1);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut count = 0u64;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                state.digest = Some(hash.finalize().into());
+                return Ok(());
+            }
+            Ok(n) => {
+                count += n as u64;
+                hash.update(&buffer[..n]);
+            }
+            Err(error) => return Err(error),
+        }
+        if count > ARTIFACT_HASH_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "artifact too large",
+            ));
+        }
+    }
+}
+
+/// Read a bounded text entry and classify why it is not renderable; the skip
+/// reasons are user-facing labels, not error reports.
+fn read_text_entry(file: &mut File, text_bytes: usize, state: &mut Entry) {
+    let mut bytes = Vec::new();
+    match Read::by_ref(file)
+        .take(text_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+    {
+        Err(_) => state.skipped = Some("无法读取".into()),
+        Ok(_) if bytes.len() > text_bytes => state.skipped = Some("文件过大".into()),
+        Ok(_) if bytes.contains(&0) => state.skipped = Some("二进制文件".into()),
+        Ok(_) => match String::from_utf8(bytes) {
+            Ok(text) => state.text = Some(text),
+            Err(_) => state.skipped = Some("非 UTF-8 文本".into()),
+        },
+    }
 }
 
 fn changed(old: Option<&Entry>, new: &Entry) -> bool {

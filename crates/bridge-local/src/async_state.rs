@@ -104,10 +104,35 @@ fn invalid() -> SessionStoreError {
     SessionStoreError::new(StoreFailureKind::InvalidMessage)
 }
 
+/// Max directory text length. Mirrors `bridge_app::runtime::limits::PATH_BYTES`
+/// (which is crate-private); the two must change together.
+const PATH_BYTES: usize = 4_096;
+/// Max user, pairing-code and model identifier lengths. Mirrors
+/// `bridge_app::runtime::limits::PAIRING_CODE_BYTES`.
+const NAME_BYTES: usize = 256;
+
+/// A directory request is a single line of bounded bytes.
+fn validate_path_input(input: &str) -> Result<(), SessionStoreError> {
+    if input.is_empty() || input.len() > PATH_BYTES || input.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// Only a missing path can request creation, never files or denied I/O.
+fn missing_or_invalid(target: &Path) -> Result<(), SessionStoreError> {
+    match std::fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+
 fn io_failure() -> SessionStoreError {
     SessionStoreError::new(StoreFailureKind::Io)
 }
 
+/// The persisted binding key: `{user}:{workspace}`. This exact format IS the
+/// on-disk state.json key, so it must never change encoding.
 fn key(session: &SessionKey) -> Result<String, SessionStoreError> {
     let cwd = session.workspace.to_str().ok_or_else(invalid)?;
     if session.user.is_empty() || !session.workspace.is_absolute() {
@@ -143,9 +168,7 @@ impl DirectoryStore for AsyncState {
     ) -> StoreFuture<'_, Option<PathBuf>> {
         Box::pin(async move {
             self.run(move |_| {
-                if input.is_empty() || input.len() > 4096 || input.chars().any(char::is_control) {
-                    return Err(invalid());
-                }
+                validate_path_input(&input)?;
                 let workspace = workspace(&root)?;
                 if !Path::new(&input).is_absolute() {
                     validate_snapshot(&root, &current)?;
@@ -159,11 +182,7 @@ impl DirectoryStore for AsyncState {
                 let target = workspace
                     .resolve_proposed(&current, Path::new(&input))
                     .map_err(|_| io_failure())?;
-                // Only a missing path can request creation, never files or denied I/O.
-                match std::fs::symlink_metadata(&target) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err(invalid()),
-                }
+                missing_or_invalid(&target)?;
                 target.to_str().ok_or_else(invalid)?;
                 Ok(Some(target))
             })
@@ -181,11 +200,8 @@ impl DirectoryStore for AsyncState {
     ) -> StoreFuture<'_, PathBuf> {
         Box::pin(async move {
             self.run(move |store| {
-                if user.is_empty()
-                    || input.is_empty()
-                    || input.len() > 4096
-                    || input.chars().any(char::is_control)
-                {
+                validate_path_input(&input)?;
+                if user.is_empty() {
                     return Err(invalid());
                 }
                 let workspace = workspace(&root)?;
@@ -197,10 +213,7 @@ impl DirectoryStore for AsyncState {
                 {
                     return Err(invalid());
                 }
-                match std::fs::symlink_metadata(&target) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    _ => return Err(invalid()),
-                }
+                missing_or_invalid(&target)?;
                 let value = target.to_str().ok_or_else(invalid)?.to_owned();
                 workspace
                     .create_confirmed(&target)
@@ -281,11 +294,8 @@ impl DirectoryStore for AsyncState {
     ) -> StoreFuture<'_, PathBuf> {
         Box::pin(async move {
             self.run(move |store| {
-                if user.is_empty()
-                    || input.is_empty()
-                    || input.len() > 4096
-                    || input.chars().any(char::is_control)
-                {
+                validate_path_input(&input)?;
+                if user.is_empty() {
                     return Err(invalid());
                 }
                 let input = Path::new(&input);
@@ -312,10 +322,10 @@ impl SessionStore for AsyncState {
             let Some(expected) = &self.pairing_code else {
                 return Ok(false);
             };
-            if expected.len() < 16 || expected.len() > 256 || code.len() > 256 {
+            if expected.len() < 16 || expected.len() > NAME_BYTES || code.len() > NAME_BYTES {
                 return Ok(false);
             }
-            if user.is_empty() || user.len() > 256 || user.chars().any(char::is_control) {
+            if user.is_empty() || user.len() > NAME_BYTES || user.chars().any(char::is_control) {
                 return Ok(false);
             }
             let mut difference = expected.len() ^ code.len();
@@ -369,7 +379,7 @@ impl SessionStore for AsyncState {
                 let mut next = store.state().clone();
                 match change {
                     PreferenceChange::Model(Some(model)) => {
-                        if model.is_empty() || model.len() > 256 {
+                        if model.is_empty() || model.len() > NAME_BYTES {
                             return Err(invalid());
                         }
                         next.models.insert(key, model);

@@ -14,6 +14,8 @@ use bridge_app::{
     runtime,
 };
 use bridge_codex::process::AppServer;
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::{collections::BTreeSet, error::Error, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +48,32 @@ pub struct Actor {
     pub worker: tokio::task::JoinHandle<Result<(), runtime::RuntimeError>>,
     /// Event-forwarding task; owns the fake process and shuts it down.
     pub server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Actor {
+    /// Cancel the runtime and join both tasks. Returns the worker's runtime
+    /// result and the server task's join result; the server task itself stays
+    /// joined through `server_result` because JoinHandle awaits by value.
+    pub async fn stop(
+        &mut self,
+    ) -> (
+        Result<Result<(), runtime::RuntimeError>, tokio::task::JoinError>,
+        Result<std::io::Result<()>, tokio::task::JoinError>,
+    ) {
+        self.cancel.cancel();
+        // Take the handles out; the caller drops `self` right after anyway.
+        let mut worker = std::mem::replace(
+            &mut self.worker,
+            tokio::task::spawn(std::future::ready(Ok(()))),
+        );
+        let mut server = std::mem::replace(
+            &mut self.server,
+            tokio::task::spawn(std::future::ready(Ok(()))),
+        );
+        let worker_result = poll_fn(|cx| Pin::new(&mut worker).poll(cx)).await;
+        let server_result = poll_fn(|cx| Pin::new(&mut server).poll(cx)).await;
+        (worker_result, server_result)
+    }
 }
 
 impl Actor {

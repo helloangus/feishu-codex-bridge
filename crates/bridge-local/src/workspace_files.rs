@@ -36,25 +36,10 @@ fn safe_name(name: &str) -> String {
     }
 }
 
-/// Open every path component without following symlinks; rejects relative or
-/// special paths so later operations stay inside the intended directory.
+/// Open every path component without following symlinks; see
+/// [`crate::safeio`] for the shared threat model.
 fn safe_directory(path: &Path) -> io::Result<File> {
-    if !path.is_absolute() {
-        return Err(io::Error::other("absolute directory required"));
-    }
-    use rustix::fs::{CWD, Mode, OFlags, openat};
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut file = File::from(openat(CWD, "/", flags, Mode::empty())?);
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(name) => {
-                file = File::from(openat(&file, Path::new(name), flags, Mode::empty())?)
-            }
-            _ => return Err(io::Error::other("invalid directory")),
-        }
-    }
-    Ok(file)
+    crate::safeio::open_directory(path)
 }
 
 /// Scan a safely opened directory through its pinned descriptor.
@@ -64,10 +49,7 @@ fn scan_directory(path: PathBuf, excluded: Vec<PathBuf>) -> io::Result<Snapshot>
         .iter()
         .filter_map(|p| p.strip_prefix(&path).ok().map(Path::to_path_buf))
         .collect();
-    let pinned = PathBuf::from(format!(
-        "/proc/self/fd/{}",
-        std::os::fd::AsRawFd::as_raw_fd(&root)
-    ));
+    let pinned = crate::safeio::pinned_path(&root);
     super::snapshot::scan_excluding(&pinned, Limits::default(), &relative)
 }
 

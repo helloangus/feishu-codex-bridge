@@ -26,7 +26,7 @@ impl Workspace {
     /// Walk directory descriptors without following substituted symlinks.
     /// A failure may leave already-created parents; never delete them implicitly.
     pub fn create_confirmed(&self, target: &Path) -> io::Result<()> {
-        use rustix::fs::{CWD, Mode, OFlags, mkdirat, openat};
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
         let relative = target
             .strip_prefix(&self.root)
             .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "目录越出工作区"))?;
@@ -38,17 +38,9 @@ impl Workspace {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "非规范目录"));
         }
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        // Open every root component as well, not just its final component.
-        let mut directory = fs::File::from(openat(CWD, Path::new("/"), flags, Mode::empty())?);
-        for component in self.root.components() {
-            let Component::Normal(name) = component else {
-                if component == Component::RootDir {
-                    continue;
-                }
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "非规范目录"));
-            };
-            directory = fs::File::from(openat(&directory, Path::new(name), flags, Mode::empty())?);
-        }
+        // Walk the root with the shared safeio primitive, then continue the
+        // same descriptor walk with mkdir for the missing leaf components.
+        let mut directory = crate::safeio::open_directory(&self.root)?;
         for component in relative.components() {
             let Component::Normal(name) = component else {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "非规范目录"));

@@ -1,3 +1,31 @@
+//! Fake Codex app-server process for behavior tests; `argv[1]` selects the
+//! scenario, `argv[2]` (for the `compact` scenario) the compaction mode.
+//!
+//! Scenario → behavior → signal files (written into the process CWD, which
+//! tests set to a per-case temp directory):
+//!
+//! | scenario        | behavior                                        | signals               |
+//! |-----------------|-------------------------------------------------|-----------------------|
+//! | `thread`        | normal turn; echoes thread `main`               | `started`             |
+//! | `storage`       | implemented by the *test*, not this binary: the | (none)                |
+//! |                 | test pre-replaces `seen-messages.json` with a   |                       |
+//! |                 | directory so persistence fails (see             |                       |
+//! |                 | `test-support/tests/runtime_flows.rs`)          |                       |
+//! | `hang`          | never answers `startTurn`                       | `holding`             |
+//! | `slow`          | delays replies (slow transport)                 | `started`             |
+//! | `archive`       | emits `thread/archived` notifications           | `archive-actions`     |
+//! | `flood`         | emits a burst of events before the reply        | `interrupts.jsonl`    |
+//! | `compact <mode>`| compaction variants below                       | `preparation`,        |
+//! |                 |                                                 | `compactions`,        |
+//! |                 |                                                 | `compact-interrupts`  |
+//!
+//! `compact` modes: `wrong_resume` (resume returns a different thread id),
+//! `foreign` (thread cwd is outside the workspace), `active` (thread reports
+//! busy), `prepare_stop` (stop arrives between prepare and submit),
+//! `uncertain` (submit fails with an uncertain transport error), `rejected`
+//! (submit is refused), `early` (events arrive before the turn binds),
+//! `failed` (prepare fails). The authoritative consumer of these behaviors is
+//! `test-support/tests/runtime_flows.rs`; add new modes in both places.
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
