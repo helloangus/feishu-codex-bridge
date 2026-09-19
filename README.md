@@ -44,9 +44,9 @@ cargo xtask check
 
 测试不读取真实配置、不访问外部服务、不启动长期服务；网络协议测试使用本地 socket。协议假进程和 schema 校验由 Rust 测试工具完成，协议 fixture、生产序列化与真实解码均对照 `schemas/` 下版本化 schema 校验，协议基线版本集中在 `bridge_codex::protocol::CODEX_SCHEMA_BASELINE`。开发约定见 [开发指南](docs/development.md)，当前系统边界见 [架构说明](docs/architecture.md)。
 
-## 整改交接
+## 当前状态
 
-[PLAN.md](PLAN.md) 是当前工程整改清单，记录已发现的问题、修改方向与验收条件。未勾选的项目尚未实现；接手修改前先阅读交接状态，不沿用已经删除的迁移计划或过渡期设计说明。
+工程整改与架构可述性重构均已完成并合入主分支；历史整改计划与进度记录已从仓库移除，可在 git 历史中查看。当前系统边界见 [架构说明](docs/architecture.md)，运行时序图见 [runtime-flows.md](docs/runtime-flows.md)。
 
 ## 发布状态
 

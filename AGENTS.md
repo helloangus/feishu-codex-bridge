@@ -2,7 +2,7 @@
 
 ## Active handoff
 
-Read [PLAN.md](PLAN.md) for the active remediation backlog and its acceptance criteria. Unchecked items describe intended changes, not implemented capabilities. The previous migration plan and transitional ADRs have been retired. The structure below describes current ownership; update it when implementing the planned responsibility changes instead of treating it as a prohibition on refactoring.
+[docs/architecture.md](docs/architecture.md) describes the current implementation, its diagrams and the invariants to preserve; [docs/runtime-flows.md](docs/runtime-flows.md) carries the runtime sequence diagrams. The historical remediation plan and progress records (PLAN.md, PROGRESS.md) are retired — their work is merged, and git history retains them. The structure below describes current ownership; update the architecture docs when implementing responsibility changes instead of treating them as a prohibition on refactoring.
 
 ## Structure
 
@@ -22,4 +22,4 @@ Tests must stay offline, use temporary directories and fakes, and must not chang
 
 Use stable Rust (the toolchain selected by `rust-toolchain.toml`), rustfmt, explicit error propagation, bounded channels, and typed protocol boundaries. `bridge-codex` remains the sole app-server stdin/stdout owner. Route Feishu events through the native ingress and application runtime. Never interpolate user input into shell commands. User-triggered failures must be returned through the existing card/text delivery path.
 
-Update README, relevant `docs/`, and `PLAN.md` when behavior, commands, architecture, deployment, or operational status changes. Use scoped Conventional Commit-like summaries: `feat:`, `fix:`, `test:`, and `docs:`.
+Update README and the relevant `docs/` pages when behavior, commands, architecture, deployment, or operational status changes. Use scoped Conventional Commit-like summaries: `feat:`, `fix:`, `test:`, and `docs:`.
