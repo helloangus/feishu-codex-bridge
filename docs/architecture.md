@@ -7,11 +7,11 @@
 ```mermaid
 flowchart LR
     U["用户（飞书聊天）"] <--> FS["飞书云"]
-    FS <--> FEISHU["bridge-feishu\nIngress + Messenger"]
-    FEISHU <--> APP["bridge-app\nruntime（串行）"]
-    APP <--> CODEX["bridge-codex\nJSON-RPC 唯一 stdin/stdout 拥有者"]
-    CODEX <--> CLI["Codex CLI\napp-server"]
-    APP <--> LOCAL["bridge-local\n状态与文件安全原语"]
+    FS <--> FEISHU["bridge-feishu<br/>Ingress + Messenger"]
+    FEISHU <--> APP["bridge-app<br/>runtime（串行）"]
+    APP <--> CODEX["bridge-codex<br/>JSON-RPC 唯一 stdin/stdout 拥有者"]
+    CODEX <--> CLI["Codex CLI<br/>app-server"]
+    APP <--> LOCAL["bridge-local<br/>状态与文件安全原语"]
     CLI2["bridge-cli"] -.组装与监督.-> APP
 ```
 
@@ -28,9 +28,9 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    U1["用户 shell"] -->|bridge service start| G["guard 进程\n(guard.lock, guard.sock)"]
-    G -->|spawn| S["supervise 进程\n(supervisor.lock, control.sock)"]
-    S -->|spawn + watchdog| R["run 进程\n(service.lock, health.json)"]
+    U1["用户 shell"] -->|bridge service start| G["guard 进程<br/>(guard.lock, guard.sock)"]
+    G -->|spawn| S["supervise 进程<br/>(supervisor.lock, control.sock)"]
+    S -->|spawn + watchdog| R["run 进程<br/>(service.lock, health.json)"]
     S -->|"child exit → Backoff(delay) → 重启（有界）"| S
     G -->|"supervise 异常退出 → 清理后代 → 重启（有界）"| G
     OP["运维命令"] -->|"service start/stop/status"| G
@@ -60,12 +60,12 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
-    WS["bridge-feishu\nwebsocket（transport 任务）"] -->|"incoming (128)\nmpsc"| GW["gateway 任务\nbootstrap.rs::route_events"]
+    WS["bridge-feishu<br/>websocket（transport 任务）"] -->|"incoming (128)<br/>mpsc"| GW["gateway 任务<br/>bootstrap.rs::route_events"]
     GW -->|"input (64) · runtime::Input + Ack"| LOOP
-    AG["agent 任务\napp-server 事件"] -->|"event (256) · Incoming"| LOOP["runtime::run select! 循环\n(state::Runtime)"]
-    LOOP -->|"delivery (128) · presentation::Request"| SN["sender 任务\npresentation"]
+    AG["agent 任务<br/>app-server 事件"] -->|"event (256) · Incoming"| LOOP["runtime::run select! 循环<br/>(state::Runtime)"]
+    LOOP -->|"delivery (128) · presentation::Request"| SN["sender 任务<br/>presentation"]
     SN -->|"Messenger (REST)"| FS["飞书云"]
-    LOOP -->|"JoinSet 任务（≤128）"| JB["后台任务：\nstore / backend / messenger"]
+    LOOP -->|"JoinSet 任务（≤128）"| JB["后台任务：<br/>store / backend / messenger"]
     HB["heartbeat 任务"] -->|"Health 文件"| HF["health.json"]
     SIG["signal 任务"] -->|CancellationToken| LOOP
     GW -->|ConnectionState| HF
