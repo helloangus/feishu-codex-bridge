@@ -59,9 +59,9 @@
 
 ### J `refactor/supervision-plane` — 监督与控制平面
 
-- [ ] `supervisor_state::Phase` 成为唯一权威状态机；控制 socket 从自由字符串（含 `backoff:N`）改为行 JSON 编码的枚举；删除 `health.rs` 与 `service_control.rs` 的猜测式解析。
-- [ ] `run_layer`/`supervise` 的 `action: &str` 与 `outer: bool` 改为 `Layer` 枚举；120s/45s/20s/30s 阈值常量化并互注释。
-- [ ] `bootstrap.rs::run`（约 326 行）提取归档对账与 gateway 路由循环为具名函数，合并重复的成功聚合。
+- [x] `supervisor_state::Phase` 成为唯一权威状态机；控制 socket 从自由字符串（含 `backoff:N`）改为行 JSON 编码的枚举；删除 `health.rs` 与 `service_control.rs` 的猜测式解析。
+- [x] `run_layer`/`supervise` 的 `action: &str` 与 `outer: bool` 改为 `Layer` 枚举；120s/45s/20s/30s 阈值常量化并互注释。
+- [x] `bootstrap.rs::run`（约 326 行）提取归档对账与 gateway 路由循环为具名函数，合并重复的成功聚合。
 - [ ] guard→supervise→run 进程链图与监督状态机图进入文档。
 
 ### K `refactor/transport-readability` — 传输子系统可述性
