@@ -43,7 +43,7 @@ impl Runtime {
         {
             return self.handle_pairing(input).await;
         }
-        if !self.settings.open_access && !self.allowed.contains(&input.user) {
+        if !self.settings.open_access && !self.admission.allowed.contains(&input.user) {
             tell(
                 &self.delivery,
                 &input.chat,
@@ -53,6 +53,7 @@ impl Runtime {
             return Ok(());
         }
         let current = self
+            .session_book
             .directories
             .get(&input.user)
             .unwrap_or(&self.settings.directory)
@@ -78,7 +79,7 @@ impl Runtime {
         let mut approval_source = None;
         if let Some(click) = input.card.take() {
             let snapshot = self.card_snapshot();
-            let Some(command) = self.card_actions.take(
+            let Some(command) = self.cards.actions.take(
                 &click,
                 &input.user,
                 &input.chat,
@@ -96,10 +97,10 @@ impl Runtime {
             };
             approval_source = Some(click.source.clone());
             if matches!(command.as_str(), "/resume" | "/archived" | "/models")
-                && self.card_views.is_list(&click.source)
+                && self.cards.views.is_list(&click.source)
             {
-                self.card_actions.invalidate_source(&click.source);
-                self.card_views.remove(&click.source);
+                self.cards.actions.invalidate_source(&click.source);
+                self.cards.views.remove(&click.source);
                 refresh = Some(click.source.clone());
             }
             input.id = format!("card:{}", click.token);
@@ -111,7 +112,7 @@ impl Runtime {
                 .handle_plan_action(input, text, approval_source, current, jobs)
                 .await;
         }
-        if matches!(self.files, FileDelivery::Delivering)
+        if matches!(self.tasks.files, FileDelivery::Delivering)
             && text.starts_with('/')
             && !matches!(
                 text.as_str(),
@@ -158,7 +159,7 @@ impl Runtime {
                     | "/archived"
             )
         {
-            self.plan_offer = None;
+            self.cards.plan_offer = None;
         }
         let command = Command::parse(&text);
         if let Ok(Command::Approve { token, allow }) = &command {
@@ -168,23 +169,24 @@ impl Runtime {
         }
         // Command is matched by value inside the branch handlers.
         if text == "/help" {
-            if seen_insert(&mut self.seen_commands, &input.id) {
+            if seen_insert(&mut self.admission.seen_commands, &input.id) {
                 if !self.can_spawn(jobs, false) {
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
                 } else {
-                    self.next_panel = self
+                    self.cards.next_panel = self
+                        .cards
                         .next_panel
                         .checked_add(1)
                         .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
                     let (panel, commands) = crate::cards::help(&format!(
                         "panel-{}-{}",
-                        self.settings.epoch, self.next_panel
+                        self.settings.epoch, self.cards.next_panel
                     ));
                     let owner = crate::cards::Owner {
                         user: input.user.clone(),
                         chat: input.chat.clone(),
                         directory: current.clone(),
-                        generation: *self.card_generations.get(&input.user).unwrap_or(&0),
+                        generation: *self.cards.generations.get(&input.user).unwrap_or(&0),
                         stop_snapshot: self.card_snapshot(),
                     };
                     send_panel(
@@ -202,10 +204,13 @@ impl Runtime {
             return Ok(());
         }
         if let Ok(Command::ConfirmDirectory(token)) = &command {
-            let Some(creation) =
-                self.confirmations
-                    .get(token, &input.user, &input.chat, &current, Instant::now())
-            else {
+            let Some(creation) = self.session_book.confirmations.get(
+                token,
+                &input.user,
+                &input.chat,
+                &current,
+                Instant::now(),
+            ) else {
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -219,7 +224,7 @@ impl Runtime {
                 input.ack.settle(true);
                 return Ok(());
             }
-            if !self.scheduler.begin_session_mutation() {
+            if !self.tasks.scheduler.begin_session_mutation() {
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -228,7 +233,7 @@ impl Runtime {
                 input.ack.settle(true);
                 return Ok(());
             }
-            self.confirmations.remove(token);
+            self.session_book.confirmations.remove(token);
             let store = self.store.clone();
             jobs.spawn(async move {
                 let result = store.claim(input.id.clone()).await.map_err(|_| ());
@@ -256,7 +261,7 @@ impl Runtime {
                     input.ack.settle(true);
                     return Ok(());
                 }
-                if !self.scheduler.begin_session_mutation() {
+                if !self.tasks.scheduler.begin_session_mutation() {
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -277,7 +282,7 @@ impl Runtime {
                     })
                 });
             } else {
-                if seen_insert(&mut self.seen_commands, &input.id) {
+                if seen_insert(&mut self.admission.seen_commands, &input.id) {
                     if !can_spawn(jobs, false) {
                         tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
                     } else {
@@ -316,7 +321,7 @@ impl Runtime {
                 input.ack.settle(true);
                 return Ok(());
             }
-            if !self.scheduler.begin_session_mutation() {
+            if !self.tasks.scheduler.begin_session_mutation() {
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -361,7 +366,7 @@ impl Runtime {
                 input.ack.settle(true);
                 return Ok(());
             }
-            if !self.scheduler.begin_session_mutation() {
+            if !self.tasks.scheduler.begin_session_mutation() {
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -400,15 +405,15 @@ impl Runtime {
     }
 
     async fn handle_pairing(&mut self, mut input: super::Input) -> Result<(), RuntimeError> {
-        if self.pairing_window.elapsed() >= limits::PAIRING_WINDOW {
-            self.pairing_window = Instant::now();
-            self.pairing_attempts = 0;
+        if self.admission.pairing_window.elapsed() >= limits::PAIRING_WINDOW {
+            self.admission.pairing_window = Instant::now();
+            self.admission.pairing_attempts = 0;
         }
-        if self.pairing_attempts >= limits::PAIRING_ATTEMPTS {
+        if self.admission.pairing_attempts >= limits::PAIRING_ATTEMPTS {
             input.ack.settle(true);
             return Ok(());
         }
-        self.pairing_attempts += 1;
+        self.admission.pairing_attempts += 1;
         let parts: Vec<_> = input
             .text
             .as_deref()
@@ -425,7 +430,7 @@ impl Runtime {
         };
         match self.store.pair(input.user.clone(), code).await {
             Ok(true) => {
-                self.allowed.insert(input.user.clone());
+                self.admission.allowed.insert(input.user.clone());
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -465,7 +470,7 @@ impl Runtime {
         let valid = parts.len() == 3
             && matches!(parts[2], "implement" | "fresh" | "stay")
             && approval_source.is_some()
-            && self.plan_offer.as_ref().is_some_and(|offer| {
+            && self.cards.plan_offer.as_ref().is_some_and(|offer| {
                 offer.token.as_str() == parts[1]
                     && offer.task.session.user == input.user
                     && offer.task.chat == input.chat
@@ -481,8 +486,8 @@ impl Runtime {
             input.ack.settle(true);
             return Ok(());
         }
-        if matches!(self.files, FileDelivery::Delivering)
-            || !self.scheduler.begin_session_mutation()
+        if matches!(self.tasks.files, FileDelivery::Delivering)
+            || !self.tasks.scheduler.begin_session_mutation()
         {
             tell(
                 &self.delivery,
@@ -493,7 +498,7 @@ impl Runtime {
             return Ok(());
         }
         if !can_spawn(jobs, false) {
-            self.scheduler.end_session_mutation();
+            self.tasks.scheduler.end_session_mutation();
             tell(
                 &self.delivery,
                 &input.chat,
@@ -503,16 +508,19 @@ impl Runtime {
             return Ok(());
         }
         let offer = self
+            .cards
             .plan_offer
             .take()
             .ok_or(RuntimeError::Internal("缺少计划"))?;
         let action = parts[2].to_owned();
         if let Some(source) = &approval_source {
-            self.card_actions.invalidate_source(source);
-            self.card_views
+            self.cards.actions.invalidate_source(source);
+            self.cards
+                .views
                 .note(source, "已收到选择；实际结果请查看单独回复。");
         }
-        self.next_task = self
+        self.tasks.next_task = self
+            .tasks
             .next_task
             .checked_add(1)
             .ok_or(RuntimeError::Capacity("任务标识耗尽"))?;
@@ -520,7 +528,7 @@ impl Runtime {
             None
         } else {
             Some(TaskSpec {
-                id: bridge_core::task::TaskId::new(self.settings.epoch, self.next_task),
+                id: bridge_core::task::TaskId::new(self.settings.epoch, self.tasks.next_task),
                 session: offer.task.session.clone(),
                 chat: input.chat.clone(),
                 prompt: format!("请实施以下已确认的计划：\n\n{}", offer.text),
@@ -610,8 +618,8 @@ impl Runtime {
                         .any(|c| c.is_control() && c != '\n' && c != '\t')))
         {
             if let Some(index) = index {
-                let active = self.active.as_ref();
-                outcome = self.approvals.answer_text(
+                let active = self.tasks.active.as_ref();
+                outcome = self.approvals.interactions.answer_text(
                     &crate::cards::CardToken::new(&token),
                     Claim {
                         user: &input.user,
@@ -659,8 +667,8 @@ impl Runtime {
         let mut outcome = Choice::Invalid;
         if parts.len() == 4 {
             if let Some(source) = &approval_source {
-                let active = self.active.as_ref();
-                outcome = self.approvals.answer_choice(
+                let active = self.tasks.active.as_ref();
+                outcome = self.approvals.interactions.answer_choice(
                     &crate::cards::CardToken::new(parts[1]),
                     Claim {
                         user: &input.user,
@@ -677,12 +685,15 @@ impl Runtime {
         }
         match outcome {
             Choice::Recorded { complete, finished } => {
-                self.card_actions
+                self.cards
+                    .actions
                     .invalidate_approval(&crate::cards::CardToken::new(parts[1]));
                 // The click source equals the entry source whenever the
                 // recording was accepted, so the note uses the click.
                 if let Some(source) = &approval_source {
-                    self.card_views.note(source, "本题已记录，其他按钮已失效。");
+                    self.cards
+                        .views
+                        .note(source, "本题已记录，其他按钮已失效。");
                 }
                 if complete {
                     if let Some(pending) = finished {
@@ -691,14 +702,17 @@ impl Runtime {
                 }
             }
             Choice::WaitingText => {
-                self.card_actions
+                self.cards
+                    .actions
                     .invalidate_approval(&crate::cards::CardToken::new(parts[1]));
                 if let Some(source) = &approval_source {
-                    self.card_views
+                    self.cards
+                        .views
                         .note(source, "已进入自行回答，请按单独提示发送答案。");
                 }
                 let question = self
                     .approvals
+                    .interactions
                     .get(&crate::cards::CardToken::new(parts[1]))
                     .map(|pending| pending.question)
                     .unwrap_or_default();
@@ -734,9 +748,9 @@ impl Runtime {
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), RuntimeError> {
-        let active = self.active.as_ref();
+        let active = self.tasks.active.as_ref();
         let pending = approval_source.as_deref().and_then(|source| {
-            self.approvals.approve(
+            self.approvals.interactions.approve(
                 &crate::cards::CardToken::new(token),
                 Claim {
                     user: &input.user,
@@ -750,10 +764,12 @@ impl Runtime {
         });
         match pending {
             Some(pending) => {
-                self.card_actions
+                self.cards
+                    .actions
                     .invalidate_approval(&crate::cards::CardToken::new(token));
                 if let Some(source) = &pending.source {
-                    self.card_views
+                    self.cards
+                        .views
                         .note(source, "审批选择已接收，回传结果请查看单独回复。");
                 }
                 spawn_reply(&self.diagnostics, jobs, pending, allow)?;
@@ -796,7 +812,7 @@ impl Runtime {
                 input.ack.settle(true);
                 return Ok(());
             }
-            if !self.scheduler.begin_session_mutation() {
+            if !self.tasks.scheduler.begin_session_mutation() {
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -816,7 +832,7 @@ impl Runtime {
                 })
             });
         } else {
-            if seen_insert(&mut self.seen_commands, &input.id) {
+            if seen_insert(&mut self.admission.seen_commands, &input.id) {
                 if !can_spawn(jobs, false) {
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
                 } else {
@@ -825,7 +841,7 @@ impl Runtime {
                     let chat = input.chat.clone();
                     let user = input.user.clone();
                     let directory = session.workspace.clone();
-                    let generation = *self.card_generations.get(&user).unwrap_or(&0);
+                    let generation = *self.cards.generations.get(&user).unwrap_or(&0);
                     let stop_snapshot = self.card_snapshot();
                     jobs.spawn(async move {
                         let result = async {
@@ -908,7 +924,7 @@ impl Runtime {
                 input.ack.settle(true);
                 return Ok(());
             }
-            if !self.scheduler.begin_session_mutation() {
+            if !self.tasks.scheduler.begin_session_mutation() {
                 tell(
                     &self.delivery,
                     &input.chat,
@@ -929,7 +945,7 @@ impl Runtime {
                 })
             });
         } else {
-            if seen_insert(&mut self.seen_commands, &input.id) {
+            if seen_insert(&mut self.admission.seen_commands, &input.id) {
                 if !can_spawn(jobs, false) {
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重试。")?;
                 } else {
@@ -939,7 +955,7 @@ impl Runtime {
                     let root = self.settings.root.clone();
                     let user = input.user.clone();
                     let directory = session.workspace.clone();
-                    let generation = *self.card_generations.get(&user).unwrap_or(&0);
+                    let generation = *self.cards.generations.get(&user).unwrap_or(&0);
                     let stop_snapshot = self.card_snapshot();
                     jobs.spawn(async move {
                         Done::Card(CardDone::Listed {
@@ -976,10 +992,11 @@ impl Runtime {
         current: PathBuf,
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), RuntimeError> {
-        if seen_insert(&mut self.seen_commands, &input.id) {
+        if seen_insert(&mut self.admission.seen_commands, &input.id) {
             match text.as_str() {
                 "/status" => {
                     let state = self
+                        .tasks
                         .active
                         .as_ref()
                         .map(|active| {
@@ -1005,15 +1022,15 @@ impl Runtime {
                         format!(
                             "Rust 桥接服务：{state}\n当前目录：{}\n等待：{}，保存中：{}",
                             current.display(),
-                            self.scheduler.queued(),
-                            self.scheduler.pending_admissions()
+                            self.tasks.scheduler.queued(),
+                            self.tasks.scheduler.pending_admissions()
                         ),
                     )?;
                 }
                 "/stop" => {
-                    let removed = self.scheduler.cancel_queued(&session);
+                    let removed = self.tasks.scheduler.cancel_queued(&session);
                     let mut stopping = false;
-                    if let Some(active) = self.active.as_mut().filter(|active| {
+                    if let Some(active) = self.tasks.active.as_mut().filter(|active| {
                         active.spec.session == session
                             && active.spec.chat == input.chat
                             && !active.compact_is_terminal()
@@ -1060,12 +1077,13 @@ impl Runtime {
         _current: PathBuf,
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), RuntimeError> {
-        self.next_task = self
+        self.tasks.next_task = self
+            .tasks
             .next_task
             .checked_add(1)
             .ok_or(RuntimeError::Capacity("任务标识耗尽"))?;
         let spec = TaskSpec {
-            id: bridge_core::task::TaskId::new(self.settings.epoch, self.next_task),
+            id: bridge_core::task::TaskId::new(self.settings.epoch, self.tasks.next_task),
             session,
             chat: input.chat.clone(),
             prompt: text,
@@ -1073,14 +1091,17 @@ impl Runtime {
             mode: ExecutionMode::Execute,
         };
         if !input.attachments.is_empty() {
-            self.resources
+            self.tasks
+                .resources
                 .insert(spec.id.clone(), std::mem::take(&mut input.attachments));
         }
-        match self.scheduler.reserve(input.id.clone(), spec) {
+        match self.tasks.scheduler.reserve(input.id.clone(), spec) {
             Ok(ticket) => {
                 if !can_spawn(jobs, false) {
-                    self.scheduler.abort_admission(ticket);
-                    self.resources.retain(|id, _| self.scheduler.has_task(id));
+                    self.tasks.scheduler.abort_admission(ticket);
+                    self.tasks
+                        .resources
+                        .retain(|id, _| self.tasks.scheduler.has_task(id));
                     tell(
                         &self.delivery,
                         &input.chat,

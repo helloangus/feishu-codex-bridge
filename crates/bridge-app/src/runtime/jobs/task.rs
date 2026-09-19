@@ -42,16 +42,17 @@ impl Runtime {
         task: Option<TaskSpec>,
         result: Result<bool, String>,
     ) -> Result<(), RuntimeError> {
-        self.scheduler.end_session_mutation();
+        self.tasks.scheduler.end_session_mutation();
         input.ack.settle(true);
         match result {
             Ok(true) => {
                 if let Some(task) = task {
                     let ticket = self
+                        .tasks
                         .scheduler
                         .reserve(input.id, task)
                         .map_err(|_| RuntimeError::Interaction("计划实施入队失败"))?;
-                    self.scheduler.commit_admission(ticket, true);
+                    self.tasks.scheduler.commit_admission(ticket, true);
                     tell(
                         &self.delivery,
                         &input.chat,
@@ -93,14 +94,14 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         match result {
             Ok(new) => {
-                let queued = self.scheduler.commit_admission(ticket, new);
+                let queued = self.tasks.scheduler.commit_admission(ticket, new);
                 input.ack.settle(true);
                 if queued {
                     tell(&self.delivery, &input.chat, "请求已接收。")?;
                 }
             }
             Err(_) => {
-                self.scheduler.abort_admission(ticket);
+                self.tasks.scheduler.abort_admission(ticket);
                 input.ack.settle(false);
                 tell(
                     &self.delivery,
@@ -133,26 +134,31 @@ impl Runtime {
         );
         if !can_spawn(jobs, false)
             && self
+                .tasks
                 .active
                 .as_ref()
                 .is_some_and(|active| active.spec.id == id)
         {
             super::super::flow::finish(
                 &self.diagnostics,
-                &mut self.active,
-                &mut self.scheduler,
+                &mut self.tasks.active,
+                &mut self.tasks.scheduler,
                 &self.delivery,
                 "系统繁忙，任务未启动；请稍后重试。".into(),
             )?;
             return Ok(());
         }
-        let preparing = self.active.as_mut().filter(|active| active.spec.id == id);
+        let preparing = self
+            .tasks
+            .active
+            .as_mut()
+            .filter(|active| active.spec.id == id);
         if let Some(active) = preparing {
             if active.stopping {
                 super::super::flow::finish(
                     &self.diagnostics,
-                    &mut self.active,
-                    &mut self.scheduler,
+                    &mut self.tasks.active,
+                    &mut self.tasks.scheduler,
                     &self.delivery,
                     "准备阶段已停止，未启动任务".into(),
                 )?;
@@ -177,8 +183,8 @@ impl Runtime {
                 }
                 Err(error) => super::super::flow::finish(
                     &self.diagnostics,
-                    &mut self.active,
-                    &mut self.scheduler,
+                    &mut self.tasks.active,
+                    &mut self.tasks.scheduler,
                     &self.delivery,
                     format!("准备失败：{error}"),
                 )?,
@@ -206,7 +212,11 @@ impl Runtime {
             Some(id.as_str()),
             0,
         );
-        let starting = self.active.as_mut().filter(|active| active.spec.id == id);
+        let starting = self
+            .tasks
+            .active
+            .as_mut()
+            .filter(|active| active.spec.id == id);
         if let Some(active) = starting {
             match result {
                 Ok(turn) => {
@@ -223,20 +233,20 @@ impl Runtime {
                     for item in early {
                         if let Some(offer) = super::super::flow::event(
                             &self.diagnostics,
-                            &mut self.active,
-                            &mut self.scheduler,
+                            &mut self.tasks.active,
+                            &mut self.tasks.scheduler,
                             &self.delivery,
                             item,
                         )? {
-                            self.plan_offer = Some(offer);
+                            self.cards.plan_offer = Some(offer);
                         }
                     }
                 }
                 Err(error) => {
                     super::super::flow::finish(
                         &self.diagnostics,
-                        &mut self.active,
-                        &mut self.scheduler,
+                        &mut self.tasks.active,
+                        &mut self.tasks.scheduler,
                         &self.delivery,
                         format!("启动结果未知或失败：{error}；不会自动重试。"),
                     )?;

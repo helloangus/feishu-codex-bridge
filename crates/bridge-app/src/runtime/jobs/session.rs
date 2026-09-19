@@ -108,7 +108,7 @@ impl Runtime {
         result: Result<(), sessions::SessionStoreError>,
     ) -> Result<(), RuntimeError> {
         result.map_err(RuntimeError::from)?;
-        self.scheduler.end_session_mutation();
+        self.tasks.scheduler.end_session_mutation();
         Ok(())
     }
 
@@ -126,7 +126,7 @@ impl Runtime {
             Ok(true) => {
                 input.ack.settle(true);
                 if !can_spawn(jobs, false) {
-                    self.scheduler.end_session_mutation();
+                    self.tasks.scheduler.end_session_mutation();
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                     return Ok(());
                 }
@@ -147,11 +147,11 @@ impl Runtime {
                 });
             }
             Ok(false) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(true);
             }
             Err(()) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(false);
                 tell(
                     &self.delivery,
@@ -175,7 +175,7 @@ impl Runtime {
         match result {
             Ok(None) => {
                 if !can_spawn(jobs, false) {
-                    self.scheduler.end_session_mutation();
+                    self.tasks.scheduler.end_session_mutation();
                     tell(&self.delivery, &chat, "系统繁忙，请稍后重新发送。")?;
                     return Ok(());
                 }
@@ -192,12 +192,16 @@ impl Runtime {
                 });
             }
             Ok(Some(path)) => {
-                self.scheduler.end_session_mutation();
-                self.next_confirmation = self
+                self.tasks.scheduler.end_session_mutation();
+                self.session_book.next_confirmation = self
+                    .session_book
                     .next_confirmation
                     .checked_add(1)
                     .ok_or(RuntimeError::Capacity("确认编号耗尽"))?;
-                let token = format!("cd-{}-{}", self.settings.epoch, self.next_confirmation);
+                let token = format!(
+                    "cd-{}-{}",
+                    self.settings.epoch, self.session_book.next_confirmation
+                );
                 let prompt = format!(
                     "目录不存在：{}\n确认后将创建该目录及缺失的父目录，并切换到此目录。\n\n/cd-confirm {token}\n\n仅限当前用户在此聊天确认，10 分钟内有效；超时或切换目录后失效，不会自动创建。",
                     path.display()
@@ -210,7 +214,7 @@ impl Runtime {
                     target: path,
                     deadline: Instant::now() + limits::INTERACTION_TIMEOUT,
                 };
-                if self.confirmations.insert(token.clone(), entry) {
+                if self.session_book.confirmations.insert(token.clone(), entry) {
                     if !self.can_spawn(jobs, false) {
                         tell(
                             &self.delivery,
@@ -219,7 +223,8 @@ impl Runtime {
                         )?;
                         return Ok(());
                     }
-                    self.next_panel = self
+                    self.cards.next_panel = self
+                        .cards
                         .next_panel
                         .checked_add(1)
                         .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
@@ -227,14 +232,14 @@ impl Runtime {
                         "创建目录确认",
                         prompt,
                         vec![("确认创建并切换".into(), format!("/cd-confirm {token}"))],
-                        &format!("panel-{}-{}", self.settings.epoch, self.next_panel),
+                        &format!("panel-{}-{}", self.settings.epoch, self.cards.next_panel),
                     );
                     let owner = crate::cards::Owner {
-                        generation: *self.card_generations.get(&user).unwrap_or(&0),
+                        generation: *self.cards.generations.get(&user).unwrap_or(&0),
                         user,
                         chat: chat.clone(),
                         directory: current,
-                        stop_snapshot: (self.next_task, None),
+                        stop_snapshot: (self.tasks.next_task, None),
                     };
                     super::super::flow::send_panel(
                         &self.diagnostics,
@@ -254,7 +259,7 @@ impl Runtime {
                 }
             }
             Err(_) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 tell(
                     &self.delivery,
                     &chat,
@@ -278,7 +283,7 @@ impl Runtime {
             Ok(true) if Instant::now() < creation.deadline => {
                 input.ack.settle(true);
                 if !can_spawn(jobs, false) {
-                    self.scheduler.end_session_mutation();
+                    self.tasks.scheduler.end_session_mutation();
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                     return Ok(());
                 }
@@ -301,7 +306,7 @@ impl Runtime {
                 });
             }
             Ok(new) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(true);
                 if new {
                     tell(
@@ -312,7 +317,7 @@ impl Runtime {
                 }
             }
             Err(()) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(false);
                 tell(
                     &self.delivery,
@@ -336,13 +341,13 @@ impl Runtime {
         success_suffix: &str,
         failure: &str,
     ) -> Result<(), RuntimeError> {
-        self.scheduler.end_session_mutation();
+        self.tasks.scheduler.end_session_mutation();
         match result {
             Ok(path) => {
-                self.confirmations.invalidate(&user);
-                self.card_actions.invalidate(&user);
-                *self.card_generations.entry(user.clone()).or_default() += 1;
-                self.directories.insert(user, path.clone());
+                self.session_book.confirmations.invalidate(&user);
+                self.cards.actions.invalidate(&user);
+                *self.cards.generations.entry(user.clone()).or_default() += 1;
+                self.session_book.directories.insert(user, path.clone());
                 tell(
                     &self.delivery,
                     &chat,
@@ -378,13 +383,14 @@ impl Runtime {
         match result {
             Ok(true) => {
                 input.ack.settle(true);
-                self.next_task = self
+                self.tasks.next_task = self
+                    .tasks
                     .next_task
                     .checked_add(1)
                     .ok_or(RuntimeError::Capacity("任务标识耗尽"))?;
-                let id = TaskId::new(self.settings.epoch, self.next_task);
+                let id = TaskId::new(self.settings.epoch, self.tasks.next_task);
                 let chat = input.chat.clone();
-                self.active = Some(Active {
+                self.tasks.active = Some(Active {
                     kind: ActiveKind::Compact {
                         acknowledged: false,
                         terminal: None,
@@ -414,8 +420,8 @@ impl Runtime {
                 if !can_spawn(jobs, false) {
                     super::super::flow::finish(
                         &self.diagnostics,
-                        &mut self.active,
-                        &mut self.scheduler,
+                        &mut self.tasks.active,
+                        &mut self.tasks.scheduler,
                         &self.delivery,
                         "系统繁忙，压缩未启动；请稍后重试。".into(),
                     )?;
@@ -439,11 +445,11 @@ impl Runtime {
                 });
             }
             Ok(false) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(true);
             }
             Err(()) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(false);
                 tell(
                     &self.delivery,
@@ -463,20 +469,22 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         if !can_spawn(jobs, false)
             && self
+                .tasks
                 .active
                 .as_ref()
                 .is_some_and(|active| active.is_compact() && active.spec.id == id)
         {
             super::super::flow::finish(
                 &self.diagnostics,
-                &mut self.active,
-                &mut self.scheduler,
+                &mut self.tasks.active,
+                &mut self.tasks.scheduler,
                 &self.delivery,
                 "系统繁忙，压缩未提交；请稍后重试。".into(),
             )?;
             return Ok(());
         }
         let compacting = self
+            .tasks
             .active
             .as_mut()
             .filter(|active| active.is_compact() && active.spec.id == id);
@@ -484,8 +492,8 @@ impl Runtime {
             if active.stopping {
                 super::super::flow::finish(
                     &self.diagnostics,
-                    &mut self.active,
-                    &mut self.scheduler,
+                    &mut self.tasks.active,
+                    &mut self.tasks.scheduler,
                     &self.delivery,
                     "准备阶段已停止，未启动压缩。".into(),
                 )?;
@@ -516,8 +524,8 @@ impl Runtime {
                 }
                 Err(error) => super::super::flow::finish(
                     &self.diagnostics,
-                    &mut self.active,
-                    &mut self.scheduler,
+                    &mut self.tasks.active,
+                    &mut self.tasks.scheduler,
                     &self.delivery,
                     format!("压缩准备失败：{error}；不会自动重试。"),
                 )?,
@@ -532,6 +540,7 @@ impl Runtime {
         result: Result<(), crate::ports::BackendError>,
     ) -> Result<(), RuntimeError> {
         let compacting = self
+            .tasks
             .active
             .as_mut()
             .filter(|active| active.is_compact() && active.spec.id == id);
@@ -552,8 +561,8 @@ impl Runtime {
                     if let Some(label) = terminal {
                         super::super::flow::finish(
                             &self.diagnostics,
-                            &mut self.active,
-                            &mut self.scheduler,
+                            &mut self.tasks.active,
+                            &mut self.tasks.scheduler,
                             &self.delivery,
                             label,
                         )?;
@@ -569,8 +578,8 @@ impl Runtime {
                 Err(crate::ports::BackendError::Rejected(_)) if active.turn.is_none() => {
                     super::super::flow::finish(
                         &self.diagnostics,
-                        &mut self.active,
-                        &mut self.scheduler,
+                        &mut self.tasks.active,
+                        &mut self.tasks.scheduler,
                         &self.delivery,
                         "压缩请求被拒绝；不会自动重试。".into(),
                     )?;
@@ -601,7 +610,7 @@ impl Runtime {
             Ok(true) => {
                 input.ack.settle(true);
                 if !can_spawn(jobs, false) {
-                    self.scheduler.end_session_mutation();
+                    self.tasks.scheduler.end_session_mutation();
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                     return Ok(());
                 }
@@ -628,11 +637,11 @@ impl Runtime {
                 });
             }
             Ok(false) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(true);
             }
             Err(()) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(false);
                 tell(
                     &self.delivery,
@@ -649,7 +658,7 @@ impl Runtime {
         chat: String,
         result: Result<(), sessions::StartError>,
     ) -> Result<(), RuntimeError> {
-        self.scheduler.end_session_mutation();
+        self.tasks.scheduler.end_session_mutation();
         tell(
             &self.delivery,
             &chat,
@@ -675,7 +684,7 @@ impl Runtime {
             Ok(true) => {
                 input.ack.settle(true);
                 if !can_spawn(jobs, false) {
-                    self.scheduler.end_session_mutation();
+                    self.tasks.scheduler.end_session_mutation();
                     tell(&self.delivery, &input.chat, "系统繁忙，请稍后重新发送。")?;
                     return Ok(());
                 }
@@ -704,11 +713,11 @@ impl Runtime {
                 });
             }
             Ok(false) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(true);
             }
             Err(()) => {
-                self.scheduler.end_session_mutation();
+                self.tasks.scheduler.end_session_mutation();
                 input.ack.settle(false);
                 tell(
                     &self.delivery,
@@ -728,7 +737,7 @@ impl Runtime {
         action: sessions::ThreadAction,
         result: Result<(), sessions::StartError>,
     ) -> Result<(), RuntimeError> {
-        self.scheduler.end_session_mutation();
+        self.tasks.scheduler.end_session_mutation();
         let recovery = matches!(&result, Err(sessions::StartError::Reconcile));
         let text = match result {
             Ok(()) => action.success().into(),
@@ -752,7 +761,7 @@ impl Runtime {
         mut input: super::super::Input,
         result: Result<bool, ()>,
     ) -> Result<(), RuntimeError> {
-        self.scheduler.end_session_mutation();
+        self.tasks.scheduler.end_session_mutation();
         match result {
             Ok(new) => {
                 input.ack.settle(true);

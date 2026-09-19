@@ -28,7 +28,7 @@ impl Runtime {
             Done::Task(done) => self.handle_task_done(done, jobs).await,
             Done::Card(done) => self.handle_card_done(done, jobs).await,
             Done::Delivery(DeliveryDone::FilesDelivered) => {
-                self.files = FileDelivery::Idle;
+                self.tasks.files = FileDelivery::Idle;
                 Ok(())
             }
         }

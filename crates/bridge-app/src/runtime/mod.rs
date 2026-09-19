@@ -213,7 +213,7 @@ pub async fn run(
         }
     }
     .await;
-    if let Some(active) = state.active.take() {
+    if let Some(active) = state.tasks.active.take() {
         if let Some(turn) = active.turn {
             let _ = timeout(
                 limits::SHUTDOWN_INTERRUPT_TIMEOUT,
@@ -231,7 +231,7 @@ pub async fn run(
     }
     jobs.abort_all();
     while jobs.join_next().await.is_some() {}
-    for pending in state.approvals.drain() {
+    for pending in state.approvals.interactions.drain() {
         // Only a control-capacity failure can abort a shutdown denial; the
         // timeout bounds the whole drain either way.
         if flow::spawn_reply(&diagnostics, &mut jobs, pending, false).is_err() {

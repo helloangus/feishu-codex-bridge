@@ -264,8 +264,66 @@ pub(crate) enum DeliveryDone {
     FilesDelivered,
 }
 
+/// Authorization and duplicate suppression for inbound inputs: the effective
+/// allowlist, the pairing throttle and one-time command ids.
+pub(crate) struct Admission {
+    pub(crate) allowed: BTreeSet<String>,
+    pub(crate) pairing_window: Instant,
+    pub(crate) pairing_attempts: u32,
+    pub(crate) seen_commands: BTreeMap<String, Instant>,
+}
+
+/// The single active execution plus everything that feeds it: the scheduler
+/// admitting tasks, the identity counter and staged per-task attachments.
+///
+/// Invariant: whichever flow acquires the scheduler's session-mutation gate
+/// releases it at that chain's terminal completion (see [`super::jobs`]).
+pub(crate) struct TaskTrack {
+    pub(crate) scheduler: Scheduler,
+    pub(crate) active: Option<Active>,
+    pub(crate) next_task: u64,
+    pub(crate) resources: BTreeMap<TaskId, Vec<Attachment>>,
+    pub(crate) files: FileDelivery,
+}
+
+/// Cards: minted actions, delivered views, per-user invalidation generations,
+/// the panel refresh queue and the plan-offer card.
+pub(crate) struct CardBook {
+    pub(crate) actions: crate::cards::Actions,
+    pub(crate) views: crate::cards::Views,
+    pub(crate) generations: BTreeMap<String, u64>,
+    pub(crate) refreshes: VecDeque<PanelRefresh>,
+    pub(crate) updating_panel: bool,
+    pub(crate) next_panel: u64,
+    pub(crate) plan_offer: Option<crate::plans::Offer>,
+}
+
+/// Approval and question interactions plus their buffered protocol context.
+pub(crate) struct Approvals {
+    pub(crate) interactions: Interactions,
+    pub(crate) file_changes:
+        BTreeMap<(u64, String, String, String), Vec<crate::requests::FileChange>>,
+    pub(crate) next_token: u64,
+}
+
+/// Per-user session bookkeeping: selected directories, creation confirmations
+/// and the archive-sync backlog.
+pub(crate) struct SessionBook {
+    pub(crate) directories: BTreeMap<String, PathBuf>,
+    pub(crate) confirmations: Confirmations,
+    pub(crate) next_confirmation: u64,
+    pub(crate) archived_threads: BTreeSet<String>,
+}
+
+/// Progress preview throttling shared with the delivery sender task.
+pub(crate) struct Progress {
+    pub(crate) busy: Arc<AtomicBool>,
+    pub(crate) last: Instant,
+}
+
 /// Owner of the entire run state. Methods live beside their concern:
-/// [`super::input`], [`super::protocol`], [`super::jobs`] and [`super::timers`].
+/// [`super::input`], [`super::protocol`], [`super::jobs`] and [`super::timers`];
+/// the state components own their fields and invariants.
 pub(crate) struct Runtime {
     pub(crate) settings: Settings,
     pub(crate) diagnostics: Diagnostics,
@@ -274,32 +332,12 @@ pub(crate) struct Runtime {
     pub(crate) messenger: Arc<dyn Messenger>,
     pub(crate) task_files: Arc<dyn TaskFiles>,
     pub(crate) delivery: mpsc::Sender<DeliveryRequest>,
-    pub(crate) directories: BTreeMap<String, PathBuf>,
-    pub(crate) scheduler: Scheduler,
-    pub(crate) active: Option<Active>,
-    pub(crate) next_task: u64,
-    pub(crate) resources: BTreeMap<TaskId, Vec<Attachment>>,
-    pub(crate) files: FileDelivery,
-    pub(crate) plan_offer: Option<crate::plans::Offer>,
-    pub(crate) seen_commands: BTreeMap<String, Instant>,
-    pub(crate) confirmations: Confirmations,
-    pub(crate) next_confirmation: u64,
-    pub(crate) card_actions: crate::cards::Actions,
-    pub(crate) card_views: crate::cards::Views,
-    pub(crate) updating_panel: bool,
-    pub(crate) refreshes: VecDeque<PanelRefresh>,
-    pub(crate) card_generations: BTreeMap<String, u64>,
-    pub(crate) next_panel: u64,
-    pub(crate) approvals: Interactions,
-    pub(crate) file_changes:
-        BTreeMap<(u64, String, String, String), Vec<crate::requests::FileChange>>,
-    pub(crate) next_approval: u64,
-    pub(crate) progress_busy: Arc<AtomicBool>,
-    pub(crate) last_progress: Instant,
-    pub(crate) archived_threads: BTreeSet<String>,
-    pub(crate) allowed: BTreeSet<String>,
-    pub(crate) pairing_window: Instant,
-    pub(crate) pairing_attempts: u32,
+    pub(crate) admission: Admission,
+    pub(crate) tasks: TaskTrack,
+    pub(crate) cards: CardBook,
+    pub(crate) approvals: Approvals,
+    pub(crate) session_book: SessionBook,
+    pub(crate) progress: Progress,
 }
 
 impl Runtime {
@@ -324,31 +362,43 @@ impl Runtime {
             messenger,
             task_files,
             delivery,
-            directories,
-            scheduler: Scheduler::new(limits::SCHEDULED_TASKS),
-            active: None,
-            next_task: 0,
-            resources: BTreeMap::new(),
-            files: FileDelivery::Idle,
-            plan_offer: None,
-            seen_commands: BTreeMap::new(),
-            confirmations: Confirmations::default(),
-            next_confirmation: 0,
-            card_actions: crate::cards::Actions::default(),
-            card_views: crate::cards::Views::default(),
-            updating_panel: false,
-            refreshes: VecDeque::new(),
-            card_generations: BTreeMap::new(),
-            next_panel: 0,
-            approvals: Interactions::default(),
-            file_changes: BTreeMap::new(),
-            next_approval: 0,
-            progress_busy,
-            last_progress: Instant::now(),
-            archived_threads: BTreeSet::new(),
-            allowed,
-            pairing_window: Instant::now(),
-            pairing_attempts: 0,
+            admission: Admission {
+                allowed,
+                pairing_window: Instant::now(),
+                pairing_attempts: 0,
+                seen_commands: BTreeMap::new(),
+            },
+            tasks: TaskTrack {
+                scheduler: Scheduler::new(limits::SCHEDULED_TASKS),
+                active: None,
+                next_task: 0,
+                resources: BTreeMap::new(),
+                files: FileDelivery::Idle,
+            },
+            cards: CardBook {
+                actions: crate::cards::Actions::default(),
+                views: crate::cards::Views::default(),
+                generations: BTreeMap::new(),
+                refreshes: VecDeque::new(),
+                updating_panel: false,
+                next_panel: 0,
+                plan_offer: None,
+            },
+            approvals: Approvals {
+                interactions: Interactions::default(),
+                file_changes: BTreeMap::new(),
+                next_token: 0,
+            },
+            session_book: SessionBook {
+                directories,
+                confirmations: Confirmations::default(),
+                next_confirmation: 0,
+                archived_threads: BTreeSet::new(),
+            },
+            progress: Progress {
+                busy: progress_busy,
+                last: Instant::now(),
+            },
         }
     }
 
@@ -360,7 +410,7 @@ impl Runtime {
 
     /// Whether the active task still owns this turn and accepts requests.
     pub(crate) fn turn_is_live(&self, turn: &TurnRef) -> bool {
-        self.active.as_ref().is_some_and(|active| {
+        self.tasks.active.as_ref().is_some_and(|active| {
             !active.stopping
                 && active
                     .gate
@@ -372,8 +422,11 @@ impl Runtime {
     /// The snapshot card actions compare themselves against.
     pub(crate) fn card_snapshot(&self) -> (u64, Option<TaskId>) {
         (
-            self.next_task,
-            self.active.as_ref().map(|active| active.spec.id.clone()),
+            self.tasks.next_task,
+            self.tasks
+                .active
+                .as_ref()
+                .map(|active| active.spec.id.clone()),
         )
     }
 
@@ -381,12 +434,13 @@ impl Runtime {
     /// approval card delivery, panel refreshes, file delivery and admission.
     /// Returning `Err` stops the run.
     pub(crate) async fn maintain(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), RuntimeError> {
-        if !self.archived_threads.is_empty()
+        if !self.session_book.archived_threads.is_empty()
             && self.can_spawn(jobs, false)
-            && self.scheduler.begin_invalidation()
+            && self.tasks.scheduler.begin_invalidation()
         {
-            self.plan_offer = None;
+            self.cards.plan_offer = None;
             let thread = self
+                .session_book
                 .archived_threads
                 .pop_first()
                 .ok_or(RuntimeError::Internal("缺少归档同步目标"))?;
@@ -398,17 +452,21 @@ impl Runtime {
             });
         }
         if self
+            .cards
             .plan_offer
             .as_ref()
             .is_some_and(|offer| Instant::now() >= offer.deadline)
         {
-            self.plan_offer = None;
+            self.cards.plan_offer = None;
         }
-        self.card_actions
-            .retain_plan(self.plan_offer.as_ref().map(|offer| &offer.token));
-        self.resources
-            .retain(|id: &TaskId, _| self.scheduler.has_task(id));
+        self.cards
+            .actions
+            .retain_plan(self.cards.plan_offer.as_ref().map(|offer| &offer.token));
+        self.tasks
+            .resources
+            .retain(|id: &TaskId, _| self.tasks.scheduler.has_task(id));
         let live_keys: std::collections::BTreeSet<(u64, String, String, String)> = self
+            .approvals
             .file_changes
             .keys()
             .filter(|(epoch, thread, turn, _)| {
@@ -420,7 +478,9 @@ impl Runtime {
             })
             .cloned()
             .collect();
-        self.file_changes.retain(|key, _| live_keys.contains(key));
+        self.approvals
+            .file_changes
+            .retain(|key, _| live_keys.contains(key));
         self.expire_stale_approvals(jobs)?;
         self.deliver_approval_cards(jobs);
         self.refresh_panels(jobs);
@@ -432,7 +492,7 @@ impl Runtime {
 
     fn expire_stale_approvals(&mut self, jobs: &mut JoinSet<Done>) -> Result<(), RuntimeError> {
         let alive = |pending: &Pending| {
-            self.active.as_ref().is_some_and(|active| {
+            self.tasks.active.as_ref().is_some_and(|active| {
                 active.spec.id == pending.task
                     && !active.stopping
                     && active
@@ -441,11 +501,15 @@ impl Runtime {
                         .is_some_and(|gate| gate.accepts_request(&pending.request.turn))
             })
         };
-        for token in self.approvals.stale_tokens(Instant::now(), alive) {
-            let Some(pending) = self.approvals.remove(&token) else {
+        for token in self
+            .approvals
+            .interactions
+            .stale_tokens(Instant::now(), alive)
+        {
+            let Some(pending) = self.approvals.interactions.remove(&token) else {
                 continue;
             };
-            self.card_actions.invalidate_approval(&token);
+            self.cards.actions.invalidate_approval(&token);
             if pending.is_questions() {
                 tell(
                     &self.delivery,
@@ -456,7 +520,7 @@ impl Runtime {
             }
             let message = "审批已超时或任务已结束/停止，正在回传拒绝。";
             if let Some(source) = &pending.source {
-                self.card_views.note(source, message);
+                self.cards.views.note(source, message);
             }
             tell(&self.delivery, &pending.owner.chat, message)?;
             spawn_reply(&self.diagnostics, jobs, pending, false)?;
@@ -466,24 +530,25 @@ impl Runtime {
 
     fn deliver_approval_cards(&mut self, jobs: &mut JoinSet<Done>) {
         let live = |pending: &Pending| {
-            self.active
+            self.tasks
+                .active
                 .as_ref()
                 .is_some_and(|active| active.turn.as_ref() == Some(&pending.request.turn))
         };
-        for token in self.approvals.unsent_tokens(live) {
+        for token in self.approvals.interactions.unsent_tokens(live) {
             if !self.can_spawn(jobs, false) {
                 // Retry on a later loop iteration; nothing was marked sent.
                 break;
             }
-            let Some(pending) = self.approvals.get_mut(&token) else {
+            let Some(pending) = self.approvals.interactions.get_mut(&token) else {
                 continue;
             };
             pending.card_dispatched = true;
-            self.next_panel = match self.next_panel.checked_add(1) {
+            self.cards.next_panel = match self.cards.next_panel.checked_add(1) {
                 Some(value) => value,
                 None => return,
             };
-            let prefix = format!("panel-{}-{}", self.settings.epoch, self.next_panel);
+            let prefix = format!("panel-{}-{}", self.settings.epoch, self.cards.next_panel);
             let (panel, commands) = match &pending.request.kind {
                 RequestKind::Approval(request) => crate::cards::approval(request, &token, &prefix),
                 RequestKind::Questions { questions, .. } => crate::cards::question(
@@ -514,11 +579,11 @@ impl Runtime {
     }
 
     fn refresh_panels(&mut self, jobs: &mut JoinSet<Done>) {
-        if self.updating_panel || !self.can_spawn(jobs, false) {
+        if self.cards.updating_panel || !self.can_spawn(jobs, false) {
             return;
         }
-        if let Some(refresh) = self.refreshes.pop_front() {
-            self.updating_panel = super::flow::send_panel(
+        if let Some(refresh) = self.cards.refreshes.pop_front() {
+            self.cards.updating_panel = super::flow::send_panel(
                 &self.diagnostics,
                 Some(refresh.source),
                 jobs,
@@ -531,10 +596,11 @@ impl Runtime {
         }
         let snapshot = self.card_snapshot();
         if let Some((source, panel)) =
-            self.card_views
-                .next_update(&self.card_actions, Instant::now(), &snapshot)
+            self.cards
+                .views
+                .next_update(&self.cards.actions, Instant::now(), &snapshot)
         {
-            self.updating_panel = true;
+            self.cards.updating_panel = true;
             let messenger = self.messenger.clone();
             let diagnostics = self.diagnostics.clone();
             jobs.spawn(async move {
@@ -559,16 +625,16 @@ impl Runtime {
     }
 
     fn deliver_files(&mut self, jobs: &mut JoinSet<Done>) {
-        if self.active.is_some() {
+        if self.tasks.active.is_some() {
             return;
         }
-        let FileDelivery::Holding(spec) = &self.files else {
+        let FileDelivery::Holding(spec) = &self.tasks.files else {
             return;
         };
         let spec = spec.clone();
-        self.files = FileDelivery::Delivering;
+        self.tasks.files = FileDelivery::Delivering;
         if !self.can_spawn(jobs, false) {
-            self.files = FileDelivery::Holding(spec);
+            self.tasks.files = FileDelivery::Holding(spec);
             return;
         }
         let task_files = self.task_files.clone();
@@ -609,13 +675,14 @@ impl Runtime {
     }
 
     fn deliver_plan_offer(&mut self, jobs: &mut JoinSet<Done>) {
-        if self.active.is_some() || !matches!(self.files, FileDelivery::Idle) {
+        if self.tasks.active.is_some() || !matches!(self.tasks.files, FileDelivery::Idle) {
             return;
         }
-        if self.scheduler.queued() > 0 || self.scheduler.pending_admissions() > 0 {
+        if self.tasks.scheduler.queued() > 0 || self.tasks.scheduler.pending_admissions() > 0 {
             return;
         }
         let unsent = self
+            .cards
             .plan_offer
             .as_ref()
             .filter(|offer| !offer.sent)
@@ -626,29 +693,30 @@ impl Runtime {
         if !self.can_spawn(jobs, false) {
             return;
         }
-        if let Some(offer) = self.plan_offer.as_mut() {
+        if let Some(offer) = self.cards.plan_offer.as_mut() {
             offer.sent = true;
         }
-        let Some(offer) = self.plan_offer.as_ref() else {
+        let Some(offer) = self.cards.plan_offer.as_ref() else {
             return;
         };
-        self.next_panel = match self.next_panel.checked_add(1) {
+        self.cards.next_panel = match self.cards.next_panel.checked_add(1) {
             Some(value) => value,
             None => return,
         };
         let (panel, commands) = crate::plans::panel(
             offer,
-            &format!("panel-{}-{}", self.settings.epoch, self.next_panel),
+            &format!("panel-{}-{}", self.settings.epoch, self.cards.next_panel),
         );
         let owner = crate::cards::Owner {
             user: offer.task.session.user.clone(),
             chat: offer.task.chat.clone(),
             directory: offer.task.session.workspace.clone(),
             generation: *self
-                .card_generations
+                .cards
+                .generations
                 .get(&offer.task.session.user)
                 .unwrap_or(&0),
-            stop_snapshot: (self.next_task, None),
+            stop_snapshot: (self.tasks.next_task, None),
         };
         super::flow::send_panel(
             &self.diagnostics,
@@ -662,25 +730,26 @@ impl Runtime {
     }
 
     fn start_next_task(&mut self, jobs: &mut JoinSet<Done>) {
-        if self.active.is_some() || !matches!(self.files, FileDelivery::Idle) {
+        if self.tasks.active.is_some() || !matches!(self.tasks.files, FileDelivery::Idle) {
             return;
         }
         if !self.can_spawn(jobs, false) {
             return;
         }
-        let Some(spec) = self.scheduler.start_next().cloned() else {
+        let Some(spec) = self.tasks.scheduler.start_next().cloned() else {
             return;
         };
-        self.plan_offer = None;
-        self.files = FileDelivery::Holding(spec.clone());
-        let attachments: Vec<Attachment> = self.resources.remove(&spec.id).unwrap_or_default();
+        self.cards.plan_offer = None;
+        self.tasks.files = FileDelivery::Holding(spec.clone());
+        let attachments: Vec<Attachment> =
+            self.tasks.resources.remove(&spec.id).unwrap_or_default();
         let delivery = self.delivery.clone();
         let _ = tell(
             &delivery,
             &spec.chat,
             "已开始执行；可发送 /status 或 /stop。",
         );
-        self.active = Some(Active {
+        self.tasks.active = Some(Active {
             kind: ActiveKind::Task,
             spec: spec.clone(),
             gate: None,

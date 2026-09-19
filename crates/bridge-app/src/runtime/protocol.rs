@@ -28,13 +28,17 @@ impl Runtime {
                     self.diagnostics.emit(
                         crate::diagnostics::Event::QuestionReceived,
                         crate::diagnostics::Status::Ok,
-                        self.active.as_ref().map(|active| active.spec.id.as_str()),
+                        self.tasks
+                            .active
+                            .as_ref()
+                            .map(|active| active.spec.id.as_str()),
                         questions.len(),
                     );
                 }
                 if let RequestKind::Approval(approval) = &mut request.kind {
                     if approval.kind == ApprovalKind::FileChange {
                         approval.changes = self
+                            .approvals
                             .file_changes
                             .get(&(
                                 request.turn.epoch,
@@ -46,7 +50,7 @@ impl Runtime {
                     }
                 }
                 if let RequestKind::Questions { questions, .. } = &request.kind {
-                    let plan_mode_live = self.active.as_ref().is_some_and(|active| {
+                    let plan_mode_live = self.tasks.active.as_ref().is_some_and(|active| {
                         active.spec.mode == bridge_core::ExecutionMode::Plan
                             && !active.stopping
                             && active
@@ -56,7 +60,7 @@ impl Runtime {
                     });
                     let _ = questions;
                     if !plan_mode_live {
-                        if let Some(active) = &self.active {
+                        if let Some(active) = &self.tasks.active {
                             tell(
                                 &self.delivery,
                                 &active.spec.chat,
@@ -69,7 +73,7 @@ impl Runtime {
                     }
                     let supported = questions.iter().all(crate::cards::question_supported);
                     if !supported {
-                        if let Some(active) = &self.active {
+                        if let Some(active) = &self.tasks.active {
                             tell(
                                 &self.delivery,
                                 &active.spec.chat,
@@ -87,6 +91,7 @@ impl Runtime {
                 );
                 if !valid_question_count {
                     let live_active = self
+                        .tasks
                         .active
                         .as_ref()
                         .filter(|active| {
@@ -98,39 +103,47 @@ impl Runtime {
                         })
                         .map(|active| (active.spec.id.clone(), active.spec.chat.clone()));
                     if let Some((task_id, chat)) = live_active {
-                        let can_register =
-                            !self.approvals.item_is_open(&request.turn, &request.item)
-                                && self.approvals.len() < limits::INTERACTIONS;
+                        let can_register = !self
+                            .approvals
+                            .interactions
+                            .item_is_open(&request.turn, &request.item)
+                            && self.approvals.interactions.len() < limits::INTERACTIONS;
                         if can_register {
-                            self.next_approval = self
-                                .next_approval
+                            self.approvals.next_token = self
+                                .approvals
+                                .next_token
                                 .checked_add(1)
                                 .ok_or(RuntimeError::Capacity("审批编号耗尽"))?;
                             let token = crate::cards::CardToken::new(format!(
                                 "approval-{}-{}",
-                                self.settings.epoch, self.next_approval
+                                self.settings.epoch, self.approvals.next_token
                             ));
                             let owner = crate::cards::Owner {
                                 user: self
+                                    .tasks
                                     .active
                                     .as_ref()
                                     .map(|active| active.spec.session.user.clone())
                                     .unwrap_or_default(),
                                 chat: self
+                                    .tasks
                                     .active
                                     .as_ref()
                                     .map(|active| active.spec.chat.clone())
                                     .unwrap_or_default(),
                                 directory: self
+                                    .tasks
                                     .active
                                     .as_ref()
                                     .map(|active| active.spec.session.workspace.clone())
                                     .unwrap_or_default(),
                                 generation: self
+                                    .tasks
                                     .active
                                     .as_ref()
                                     .and_then(|active| {
-                                        self.card_generations
+                                        self.cards
+                                            .generations
                                             .get(&active.spec.session.user)
                                             .copied()
                                     })
@@ -149,7 +162,7 @@ impl Runtime {
                                 card_dispatched: false,
                                 source: None,
                             };
-                            let registered = self.approvals.insert(token, pending);
+                            let registered = self.approvals.interactions.insert(token, pending);
                             debug_assert!(registered, "registration was pre-checked");
                             return Ok(());
                         }
@@ -161,7 +174,7 @@ impl Runtime {
                         // The request was never registered, so request/reply are
                         // still owned here and fall through to the denial reply.
                     }
-                } else if let Some(active) = &self.active {
+                } else if let Some(active) = &self.tasks.active {
                     tell(
                         &self.delivery,
                         &active.spec.chat,
@@ -203,13 +216,13 @@ impl Runtime {
             if !sessions::valid_thread_id(thread) {
                 return Err(RuntimeError::Internal("归档通知会话 ID 无效"));
             }
-            if !self.archived_threads.contains(thread)
-                && self.archived_threads.len() >= limits::ARCHIVED_THREADS
+            if !self.session_book.archived_threads.contains(thread)
+                && self.session_book.archived_threads.len() >= limits::ARCHIVED_THREADS
             {
                 return Err(RuntimeError::Capacity("待同步归档通知超过上限，停止运行"));
             }
-            self.archived_threads.insert(thread.clone());
-            self.plan_offer = None;
+            self.session_book.archived_threads.insert(thread.clone());
+            self.cards.plan_offer = None;
             return Ok(());
         }
         if let AgentEvent::FileChanges {
@@ -226,19 +239,21 @@ impl Runtime {
                     item.clone(),
                 );
                 // Duplicate item snapshots are ambiguous: revoke pending approvals.
-                if self.file_changes.contains_key(&key) || self.approvals.item_is_open(turn, item) {
-                    self.approvals.expire_turn(turn, item);
-                    if let Some(recorded) = self.file_changes.get_mut(&key) {
+                if self.approvals.file_changes.contains_key(&key)
+                    || self.approvals.interactions.item_is_open(turn, item)
+                {
+                    self.approvals.interactions.expire_turn(turn, item);
+                    if let Some(recorded) = self.approvals.file_changes.get_mut(&key) {
                         recorded.clear();
                     }
-                } else if self.file_changes.len() < limits::FILE_CHANGE_ITEMS {
-                    self.file_changes.insert(key, changes.clone());
+                } else if self.approvals.file_changes.len() < limits::FILE_CHANGE_ITEMS {
+                    self.approvals.file_changes.insert(key, changes.clone());
                 }
             }
             return Ok(());
         }
         if let AgentEvent::Started { turn } = &notification {
-            let compacting = self.active.as_mut().filter(|active| {
+            let compacting = self.tasks.active.as_mut().filter(|active| {
                 let expected = match &active.kind {
                     ActiveKind::Compact { thread, .. } => thread.as_ref(),
                     ActiveKind::Task => None,
@@ -275,12 +290,12 @@ impl Runtime {
                     for item in early {
                         if let Some(offer) = super::flow::event(
                             &self.diagnostics,
-                            &mut self.active,
-                            &mut self.scheduler,
+                            &mut self.tasks.active,
+                            &mut self.tasks.scheduler,
                             &self.delivery,
                             item,
                         )? {
-                            self.plan_offer = Some(offer);
+                            self.cards.plan_offer = Some(offer);
                         }
                     }
                 }
@@ -290,6 +305,7 @@ impl Runtime {
         // Remaining notifications belong to the active execution gate; early
         // events are buffered by the gate and replayed in order.
         let early = match self
+            .tasks
             .active
             .as_mut()
             .and_then(|active| active.gate.as_mut())
@@ -303,12 +319,12 @@ impl Runtime {
         if let Some(notification) = early {
             if let Some(offer) = super::flow::event(
                 &self.diagnostics,
-                &mut self.active,
-                &mut self.scheduler,
+                &mut self.tasks.active,
+                &mut self.tasks.scheduler,
                 &self.delivery,
                 notification,
             )? {
-                self.plan_offer = Some(offer);
+                self.cards.plan_offer = Some(offer);
             }
         }
         Ok(())

@@ -14,12 +14,17 @@ impl Runtime {
         jobs: &mut JoinSet<Done>,
     ) -> Result<(), RuntimeError> {
         let _ = jobs;
-        if self.messenger.rich_output() && self.last_progress.elapsed() >= limits::PROGRESS_INTERVAL
+        if self.messenger.rich_output() && self.progress.last.elapsed() >= limits::PROGRESS_INTERVAL
         {
-            self.last_progress = tokio::time::Instant::now();
-            if let Some(active) = self.active.as_ref().filter(|active| !active.is_compact()) {
+            self.progress.last = tokio::time::Instant::now();
+            if let Some(active) = self
+                .tasks
+                .active
+                .as_ref()
+                .filter(|active| !active.is_compact())
+            {
                 if self.delivery.capacity() > limits::DELIVERY_PROGRESS_RESERVE
-                    && !self.progress_busy.swap(true, Ordering::AcqRel)
+                    && !self.progress.busy.swap(true, Ordering::AcqRel)
                 {
                     let output = active
                         .plan
@@ -55,12 +60,16 @@ impl Runtime {
                         })
                         .is_err()
                     {
-                        self.progress_busy.store(false, Ordering::Release);
+                        self.progress.busy.store(false, Ordering::Release);
                     }
                 }
             }
         }
-        for creation in self.confirmations.expire(tokio::time::Instant::now()) {
+        for creation in self
+            .session_book
+            .confirmations
+            .expire(tokio::time::Instant::now())
+        {
             tell(
                 &self.delivery,
                 &creation.chat,
@@ -71,6 +80,7 @@ impl Runtime {
             )?;
         }
         if self
+            .tasks
             .active
             .as_ref()
             .is_some_and(|active| active.started.elapsed() > limits::TASK_TIMEOUT)

@@ -16,6 +16,32 @@ This describes the current implementation, including known responsibility overla
 
 Feishu events convert to application inputs inside `bridge-feishu` (`ingress::Received::into_runtime_input`); the CLI only routes lifecycle state, bounded admission and assembly. Runtime diagnostics use a typed, cloneable `bridge_app::diagnostics::Diagnostics` handle injected per run; `bridge-cli/src/logging.rs` provides the persistent, rotating infrastructure sink, and pre-diagnostics startup failures go through the bounded sanitized `startup_record` path.
 
+## Runtime dataflow
+
+One foreground run composes six async tasks around the serial runtime loop.
+Boxes are tasks, arrows are bounded channels (capacity in parentheses) or
+shared handles; every arrow below names a real symbol in the code.
+
+```mermaid
+flowchart LR
+    WS["bridge-feishu\nwebsocket (transport task)"] -->|"incoming (128)\nmpsc"| GW["gateway task\n(bootstrap.rs)"]
+    GW -->|"input (64) · runtime::Input + Ack"| LOOP
+    AG["agent task\n(app-server events)"] -->|"event (256) · Incoming"| LOOP["runtime::run select! loop\n(state::Runtime)"]
+    LOOP -->|"delivery (128) · presentation::Request"| SN["sender task\n(presentation)"]
+    SN -->|"Messenger (REST)"| FS["Feishu cloud"]
+    LOOP -->|"JoinSet jobs (≤128)"| JB["background jobs:\nstore / backend / messenger"]
+    HB["heartbeat task"] -->|"Health file"| HF["health.json"]
+    SIG["signal task"] -->|CancellationToken| LOOP
+    GW -->|ConnectionState| HF
+```
+
+Inside the loop, `state::Runtime` owns five state components — `Admission`
+(authorization, pairing throttle, command dedup), `TaskTrack` (scheduler,
+single active execution), `CardBook` (minted card actions, views,
+generations), `Approvals` (interaction manager plus buffered protocol
+context) and `SessionBook` (directories, confirmations, archive backlog) —
+and delegates completions to `jobs::{session,task,card}` by causal flow.
+
 ## Runtime invariants to preserve
 
 Ordinary tasks execute serially. Directory, session and preference changes use the scheduler's idle mutation gate; this remediation does not relax it. Task directories are captured and revalidated before execution. User/directory preferences are persisted before their in-memory selection changes.

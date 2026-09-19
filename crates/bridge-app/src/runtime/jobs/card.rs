@@ -27,7 +27,7 @@ impl Runtime {
             }
             CardDone::ApprovalReplied { outcome } => self.approval_replied(outcome),
             CardDone::PanelUpdated => {
-                self.updating_panel = false;
+                self.cards.updating_panel = false;
                 Ok(())
             }
             CardDone::PanelSent {
@@ -80,6 +80,7 @@ impl Runtime {
                     crate::diagnostics::Status::Failed
                 },
                 self.approvals
+                    .interactions
                     .get(&token)
                     .map(|pending| pending.task.as_str()),
                 panel.buttons.len(),
@@ -93,11 +94,11 @@ impl Runtime {
             );
         }
         if let Ok(id) = &result {
-            self.card_views.insert(id.0.clone(), panel);
+            self.cards.views.insert(id.0.clone(), panel);
         }
-        if let Some(pending) = self.approvals.get_mut(&token) {
+        if let Some(pending) = self.approvals.interactions.get_mut(&token) {
             let valid = Instant::now() < pending.deadline
-                && self.active.as_ref().is_some_and(|active| {
+                && self.tasks.active.as_ref().is_some_and(|active| {
                     !active.stopping
                         && active.spec.id == pending.task
                         && active.turn.as_ref() == Some(&pending.request.turn)
@@ -105,7 +106,7 @@ impl Runtime {
             let registered = if let Ok(id) = result {
                 pending.source = Some(id.0.clone());
                 valid
-                    && self.card_actions.insert(
+                    && self.cards.actions.insert(
                         commands
                             .into_iter()
                             .map(|(token, command)| {
@@ -130,7 +131,7 @@ impl Runtime {
                 false
             };
             if !registered {
-                let Some(pending) = self.approvals.remove(&token) else {
+                let Some(pending) = self.approvals.interactions.remove(&token) else {
                     return Ok(());
                 };
                 if pending.is_questions() {
@@ -198,18 +199,19 @@ impl Runtime {
         result: Result<crate::messaging::MessageId, crate::messaging::DeliveryError>,
     ) {
         if refreshed {
-            self.updating_panel = false;
+            self.cards.updating_panel = false;
         }
         if let Ok(id) = result {
-            self.card_views.insert(id.0.clone(), panel);
+            self.cards.views.insert(id.0.clone(), panel);
             entries.retain(|(_, entry)| {
-                entry.generation == *self.card_generations.get(&entry.user).unwrap_or(&0)
+                entry.generation == *self.cards.generations.get(&entry.user).unwrap_or(&0)
             });
             for (_, entry) in entries.iter_mut() {
                 entry.source = id.0.clone();
             }
             if !self
-                .card_actions
+                .cards
+                .actions
                 .insert(std::mem::take(entries), Instant::now())
             {
                 self.diagnostics.emit(
@@ -250,7 +252,11 @@ impl Runtime {
                     crate::cards::threads(
                         &entries,
                         archived,
-                        &format!("panel-{}-{}", self.settings.epoch, self.next_panel + 1),
+                        &format!(
+                            "panel-{}-{}",
+                            self.settings.epoch,
+                            self.cards.next_panel + 1
+                        ),
                     ),
                 )?;
             }
@@ -266,7 +272,11 @@ impl Runtime {
                     crate::cards::models(
                         &entries,
                         current.as_deref(),
-                        &format!("panel-{}-{}", self.settings.epoch, self.next_panel + 1),
+                        &format!(
+                            "panel-{}-{}",
+                            self.settings.epoch,
+                            self.cards.next_panel + 1
+                        ),
                     ),
                 )?;
             }
@@ -287,7 +297,8 @@ impl Runtime {
         stop_snapshot: (u64, Option<TaskId>),
         built: (Panel, Vec<(crate::cards::CardToken, String)>),
     ) -> Result<(), RuntimeError> {
-        self.next_panel = self
+        self.cards.next_panel = self
+            .cards
             .next_panel
             .checked_add(1)
             .ok_or(RuntimeError::Capacity("卡片编号耗尽"))?;
@@ -300,14 +311,14 @@ impl Runtime {
             stop_snapshot,
         };
         if let Some(source) = refresh {
-            if self.refreshes.len() >= limits::PANEL_REFRESHES {
+            if self.cards.refreshes.len() >= limits::PANEL_REFRESHES {
                 tell(
                     &self.delivery,
                     &chat,
                     "卡片刷新队列已满，请重新发送列表命令。",
                 )?;
             } else {
-                self.refreshes.push_back(PanelRefresh {
+                self.cards.refreshes.push_back(PanelRefresh {
                     source,
                     owner,
                     panel,
