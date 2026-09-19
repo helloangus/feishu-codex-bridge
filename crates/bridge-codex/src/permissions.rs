@@ -125,10 +125,19 @@ fn target(value: Target) -> Result<(String, bool), BackendError> {
     })
 }
 
-/// A well-formed but semantically unknown special path is visible, decline-only.
-pub fn profile(value: Option<&Value>) -> Result<(Option<String>, bool), BackendError> {
+/// What the card shows for one approval's extra permissions, and whether the
+/// bridge may honestly offer "allow" beside it.
+pub struct Notice {
+    pub text: String,
+    pub can_allow: bool,
+}
+
+/// Validate and bound one `additionalPermissions` profile, then render its
+/// card body. Bounds and unknown constructs are validation; the Chinese text
+/// is presentation.
+pub fn profile(value: Option<&Value>) -> Result<Option<Notice>, BackendError> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
-        return Ok((None, true));
+        return Ok(None);
     };
     let profile: Profile =
         serde_json::from_value(value.clone()).map_err(|_| BackendError::Incompatible)?;
@@ -189,9 +198,12 @@ pub fn profile(value: Option<&Value>) -> Result<(Option<String>, bool), BackendE
     if lines.len() == 1 {
         lines.push("未指定额外权限值。".into());
     }
-    let result = lines.join("\n");
-    supported &= result.len() <= 4096;
-    Ok((Some(result), supported))
+    let text = lines.join("\n");
+    supported &= text.len() <= 4096;
+    Ok(Some(Notice {
+        text,
+        can_allow: supported,
+    }))
 }
 
 pub fn context(value: Option<&Value>) -> Result<Option<String>, BackendError> {
@@ -230,9 +242,9 @@ mod tests {
             {"access":"write","path":{"type":"special","value":{"kind":"tmpdir"}}},
             {"access":"read","path":{"type":"special","value":{"kind":"slash_tmp"}}}
         ]}});
-        let (body, supported) = profile(Some(&value))?;
-        assert!(supported);
-        let body = body.ok_or(BackendError::Incompatible)?;
+        let notice = profile(Some(&value))?.ok_or(BackendError::Incompatible)?;
+        assert!(notice.can_allow);
+        let body = notice.text;
         for text in [
             "不限定主机",
             "/read",
@@ -281,19 +293,20 @@ mod tests {
         let value = json!({"fileSystem":{"entries":[{"access":"write","path":{
             "type":"special","value":{"kind":"unknown","path":"future-root","subpath":"nested"}
         }}]}});
-        let (body, supported) = profile(Some(&value))?;
-        assert!(!supported);
+        let notice = profile(Some(&value))?.ok_or(BackendError::Incompatible)?;
+        assert!(!notice.can_allow);
+        assert!(notice.text.contains("future-root"));
         assert!(
-            body.ok_or(BackendError::Incompatible)?
-                .contains("future-root")
+            !profile(Some(&json!({"fileSystem":{"read":["x".repeat(4096)]}})))?
+                .ok_or(BackendError::Incompatible)?
+                .can_allow
         );
-        assert!(!profile(Some(&json!({"fileSystem":{"read":["x".repeat(4096)]}})))?.1);
         for protocol in ["http", "https", "socks5Tcp", "socks5Udp"] {
             let text = context(Some(&json!({"host":"example.test","protocol":protocol})))?
                 .ok_or(BackendError::Incompatible)?;
             assert!(text.contains("example.test"));
         }
-        assert_eq!(profile(None)?, (None, true));
+        assert!(profile(None)?.is_none());
         assert_eq!(context(Some(&Value::Null))?, None);
         Ok(())
     }

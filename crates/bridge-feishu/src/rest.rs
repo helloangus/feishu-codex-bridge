@@ -154,6 +154,45 @@ impl FeishuRest {
         checked(response).await
     }
 
+    /// POST with the tenant token attached and the response status-checked.
+    /// Upload and download use the dedicated `transfers` budget instead of the
+    /// `requests` budget, so they share authentication but not concurrency.
+    async fn authenticated_post(
+        &self,
+        url: Url,
+        form: multipart::Form,
+    ) -> Result<Value, DeliveryError> {
+        let token = self.token().await?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|_| DeliveryError::Transport)?;
+        checked(response).await
+    }
+
+    /// GET a resource with the tenant token attached, checking the status
+    /// before the caller starts streaming the body.
+    async fn authenticated_get(&self, url: Url) -> Result<reqwest::Response, DeliveryError> {
+        let token = self.token().await?;
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| DeliveryError::Transport)?;
+        if !response.status().is_success() {
+            return Err(DeliveryError::Rejected(i64::from(
+                response.status().as_u16(),
+            )));
+        }
+        Ok(response)
+    }
+
     async fn message(
         &self,
         chat: String,
@@ -291,15 +330,9 @@ impl Messenger for FeishuRest {
                 ),
             };
             form = form.part(field, part);
-            let response = self
-                .http
-                .post(self.endpoint(&["im", "v1", endpoint])?)
-                .bearer_auth(self.token().await?)
-                .multipart(form)
-                .send()
-                .await
-                .map_err(|_| DeliveryError::Transport)?;
-            let data = checked(response).await?;
+            let data = self
+                .authenticated_post(self.endpoint(&["im", "v1", endpoint])?, form)
+                .await?;
             let key_field = if kind == ResourceKind::Image {
                 "image_key"
             } else {
@@ -341,18 +374,7 @@ impl ResourceFetcher for FeishuRest {
                     "file"
                 },
             );
-            let response = self
-                .http
-                .get(url)
-                .bearer_auth(self.token().await?)
-                .send()
-                .await
-                .map_err(|_| DeliveryError::Transport)?;
-            if !response.status().is_success() {
-                return Err(DeliveryError::Rejected(i64::from(
-                    response.status().as_u16(),
-                )));
-            }
+            let response = self.authenticated_get(url).await?;
             if response
                 .content_length()
                 .is_some_and(|size| size > self.max_attachment)

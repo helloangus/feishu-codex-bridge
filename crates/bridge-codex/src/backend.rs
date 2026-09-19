@@ -58,6 +58,27 @@ fn thread(value: Value) -> Result<ThreadSummary, BackendError> {
     })
 }
 
+/// Every `sourceKind` the pinned `thread/list` schema defines (see
+/// `schemas/codex/`); an unlisted kind would hide archived threads from
+/// reconciliation, so the list must track the schema, not a sample.
+const ARCHIVED_SOURCE_KINDS: &[&str] = &[
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+];
+/// Hard page bound for one reconciliation sweep; the cursor chain must end
+/// before this or the scan fails closed.
+const MAX_PAGES: usize = 100;
+const MAX_PAGE_SIZE: usize = 100;
+const MAX_CURSOR_LEN: usize = 4096;
+
 impl CodexBackend {
     /// Read every archive page before returning evidence for local reconciliation.
     /// Missing IDs are never interpreted as proof that a thread is active.
@@ -78,13 +99,17 @@ impl CodexBackend {
         let mut found = BTreeSet::new();
         let mut cursors = BTreeSet::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..100 {
-            let result = self.call("thread/list", json!({
-                "archived":true, "cursor":cursor, "limit":100,
-                "sortKey":"updated_at", "sortDirection":"desc", "modelProviders":[],
-                "sourceKinds":["cli","vscode","exec","appServer","subAgent",
-                    "subAgentReview","subAgentCompact","subAgentThreadSpawn","subAgentOther","unknown"]
-            })).await?;
+        for _ in 0..MAX_PAGES {
+            let result = self
+                .call(
+                    "thread/list",
+                    json!({
+                        "archived":true, "cursor":cursor, "limit":MAX_PAGE_SIZE,
+                        "sortKey":"updated_at", "sortDirection":"desc", "modelProviders":[],
+                        "sourceKinds": ARCHIVED_SOURCE_KINDS
+                    }),
+                )
+                .await?;
             let data = result
                 .get("data")
                 .and_then(Value::as_array)
@@ -106,7 +131,7 @@ impl CodexBackend {
             }
             match result.get("nextCursor") {
                 Some(Value::Null) => return Ok(found),
-                Some(Value::String(next)) if !next.is_empty() && next.len() <= 4096 => {
+                Some(Value::String(next)) if !next.is_empty() && next.len() <= MAX_CURSOR_LEN => {
                     if !cursors.insert(next.clone()) {
                         return Err(BackendError::Incompatible);
                     }

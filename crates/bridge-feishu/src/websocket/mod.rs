@@ -21,6 +21,9 @@ use wire::{Fragments, Frame};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Every network-stage failure in this crate: DNS, dial, HTTP CONNECT or
+    /// SOCKS5 handshake (see `proxy.rs`), WebSocket frames and reads. Proxy
+    /// misconfiguration has its own variant; authentication has its own.
     #[error("飞书长连接网络失败")]
     Transport,
     #[error("飞书长连接协议无效")]
@@ -96,6 +99,23 @@ pub struct Endpoint {
     pub service: i32,
     pub config: ClientConfig,
 }
+
+/// A connection shorter than this never resets the retry budget: only a
+/// genuinely stable session proves the failure was transient.
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
+/// Pending frame-receipt tasks before new events are NAKed (backpressure).
+const MAX_PENDING_REPLIES: usize = 64;
+/// Budget for one socket write and for one event receipt round-trip.
+const WRITE_BUDGET: Duration = Duration::from_secs(1);
+/// A missing pong for this long kills the session even if pings still go out.
+fn pong_deadline(ping_interval: u64) -> Duration {
+    Duration::from_secs(ping_interval.saturating_mul(2) + 5)
+}
+
+/// One connection attempt's result: how long it stayed up, and how it ended.
+type AttemptResult = (bool, Result<(), Error>);
+type Attempt<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<AttemptResult, Error>> + Send + 'a>>;
 pub fn endpoint(bytes: &[u8]) -> Result<Endpoint, Error> {
     #[derive(Deserialize)]
     struct Response {
@@ -252,16 +272,13 @@ impl Client {
                     &client.diagnostics,
                 )
                 .await;
-                Ok((started.elapsed() >= Duration::from_secs(60), result))
+                Ok((started.elapsed() >= STABLE_CONNECTION, result))
             })
         })
         .await
     }
 }
 
-type Attempt<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(bool, Result<(), Error>), Error>> + Send + 'a>,
->;
 async fn reconnect<F>(
     diagnostics: &bridge_app::diagnostics::Diagnostics,
     incoming: &mpsc::Sender<Received>,
@@ -277,7 +294,15 @@ where
     loop {
         let result = tokio::select! {
             _=cancel.cancelled()=>return Ok(()),
-            result=attempt(&mut config)=>match result {Ok((stable,result))=>{if stable {attempts=0;}result},Err(error)=>Err(error)},
+            result = attempt(&mut config) => match result {
+                Ok((stable, outcome)) => {
+                    if stable {
+                        attempts = 0;
+                    }
+                    outcome
+                }
+                Err(error) => Err(error),
+            },
         };
         if cancel.is_cancelled() {
             return Ok(());
@@ -330,12 +355,92 @@ async fn write<S: AsyncRead + AsyncWrite + Unpin>(
     frame: Frame,
 ) -> Result<(), Error> {
     timeout(
-        Duration::from_secs(1),
+        WRITE_BUDGET,
         socket.send(Message::Binary(frame.encode_to_vec().into())),
     )
     .await
     .map_err(|_| Error::Transport)?
     .map_err(|_| Error::Transport)
+}
+
+/// Session state threaded through frame handling.
+struct SessionState<'a> {
+    service: i32,
+    config: &'a mut ClientConfig,
+    fragments: &'a mut Fragments,
+    replies: &'a mut JoinSet<Message>,
+    incoming: &'a mpsc::Sender<Received>,
+    last_pong: &'a mut Instant,
+    next_ping: &'a mut Instant,
+}
+
+/// One decoded binary frame: either a heartbeat control frame (method 0) or a
+/// data frame carrying an event or card. The protocol multiplexes both kinds
+/// over the same socket; `method` distinguishes them.
+async fn handle_frame<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut WebSocketStream<S>,
+    frame: Frame,
+    state: &mut SessionState<'_>,
+) -> Result<(), Error> {
+    if frame.service != Some(state.service) {
+        return Err(Error::Protocol);
+    }
+    let kind = frame.header("type")?;
+    // Method 0 is the heartbeat channel: pongs carry server-side config
+    // updates that take effect on the live session.
+    if frame.method == Some(0) {
+        if kind == "pong" {
+            *state.last_pong = Instant::now();
+            if let Some(payload) = frame.payload.filter(|payload| !payload.is_empty()) {
+                state.config.update(&payload)?;
+                *state.next_ping = Instant::now() + Duration::from_secs(state.config.ping_interval);
+            }
+        }
+        return Ok(());
+    }
+    if !matches!(kind, "event" | "card") {
+        return Ok(());
+    }
+    let Some(frame) = state.fragments.push(frame, Instant::now())? else {
+        return Ok(()); // partial: more fragments still coming
+    };
+    dispatch_event(socket, frame, state.replies, state.incoming).await
+}
+
+/// Deliver one fully assembled event frame: forward it with a receipt the
+/// runtime settles, and answer Feishu's acknowledgment with the decision.
+/// When the reply queue is saturated the frame is NAKed instead of queued.
+async fn dispatch_event<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut WebSocketStream<S>,
+    mut frame: Frame,
+    replies: &mut JoinSet<Message>,
+    incoming: &mpsc::Sender<Received>,
+) -> Result<(), Error> {
+    let started = Instant::now();
+    let event = wire::event(&frame.payload.take().unwrap_or_default());
+    match event {
+        Ok(Some(event)) => {
+            let card = matches!(&event, Event::Card { .. });
+            if replies.len() >= MAX_PENDING_REPLIES {
+                return write(socket, frame.reply(false, started.elapsed())).await;
+            }
+            let (receipt, wait) = oneshot::channel();
+            let sent = incoming
+                .try_send(Received {
+                    event,
+                    acceptance: Some(Acceptance(receipt)),
+                })
+                .is_ok();
+            replies.spawn(async move {
+                let accepted = sent && matches!(timeout(WRITE_BUDGET, wait).await, Ok(Ok(true)));
+                let reply = frame.reply_with_card(accepted, started.elapsed(), card);
+                Message::Binary(reply.encode_to_vec().into())
+            });
+        }
+        Ok(None) => write(socket, frame.reply(true, started.elapsed())).await?,
+        Err(_) => write(socket, frame.reply(false, started.elapsed())).await?,
+    }
+    Ok(())
 }
 /// Public for deterministic in-memory WebSocket tests; one owner reads and writes the socket.
 pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
@@ -348,61 +453,64 @@ pub async fn session<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), Error> {
     config.validate()?;
     let mut fragments = Fragments::default();
-    let mut replies = JoinSet::new();
+    let mut replies: JoinSet<Message> = JoinSet::new();
     let mut last_pong = Instant::now();
     let mut next_ping = Instant::now();
     loop {
         tokio::select! {
-            _=cancel.cancelled()=>{let _=timeout(Duration::from_secs(1),socket.close(None)).await;return Ok(());},
-            _=tokio::time::sleep_until(next_ping)=>{
-                if last_pong.elapsed()>Duration::from_secs(config.ping_interval.saturating_mul(2)+5) {
-                    diagnostics.emit(bridge_app::diagnostics::Event::HeartbeatTimeout,bridge_app::diagnostics::Status::Transport,None,0);
+            _ = cancel.cancelled() => {
+                let _ = timeout(WRITE_BUDGET, socket.close(None)).await;
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(next_ping) => {
+                if last_pong.elapsed() > pong_deadline(config.ping_interval) {
+                    diagnostics.emit(
+                        bridge_app::diagnostics::Event::HeartbeatTimeout,
+                        bridge_app::diagnostics::Status::Transport,
+                        None,
+                        0,
+                    );
                     return Err(Error::Transport);
                 }
-                write(&mut socket,Frame::ping(service)).await?;next_ping=Instant::now()+Duration::from_secs(config.ping_interval);
+                write(&mut socket, Frame::ping(service)).await?;
+                next_ping = Instant::now() + Duration::from_secs(config.ping_interval);
             }
-            reply=replies.join_next(),if !replies.is_empty()=>{write(&mut socket,reply.ok_or(Error::Protocol)?.map_err(|_|Error::Protocol)?).await?;}
-            message=socket.next()=>{
-                let message=message.ok_or(Error::Transport)?.map_err(|_|Error::Transport)?;
-                let bytes=match message {
-                    Message::Binary(bytes)=>bytes,
-                    Message::Ping(bytes)=>{timeout(Duration::from_secs(1),socket.send(Message::Pong(bytes))).await.map_err(|_|Error::Transport)?.map_err(|_|Error::Transport)?;continue;},
-                    Message::Pong(_)=>continue,
-                    Message::Close(_)=>return Err(Error::Transport),
-                    _=>return Err(Error::Protocol),
+            reply = replies.join_next(), if !replies.is_empty() => {
+                let reply = reply.ok_or(Error::Protocol)?.map_err(|_| Error::Protocol)?;
+                timeout(WRITE_BUDGET, socket.send(reply))
+                    .await
+                    .map_err(|_| Error::Transport)?
+                    .map_err(|_| Error::Transport)?;
+            }
+            message = socket.next() => {
+                let message = message.ok_or(Error::Transport)?.map_err(|_| Error::Transport)?;
+                let bytes = match message {
+                    Message::Binary(bytes) => bytes,
+                    Message::Ping(bytes) => {
+                        timeout(WRITE_BUDGET, socket.send(Message::Pong(bytes)))
+                            .await
+                            .map_err(|_| Error::Transport)?
+                            .map_err(|_| Error::Transport)?;
+                        continue;
+                    }
+                    Message::Pong(_) => continue,
+                    Message::Close(_) => return Err(Error::Transport),
+                    _ => return Err(Error::Protocol),
                 };
-                if bytes.len()>MAX_FRAME_BYTES {return Err(Error::Protocol);}
-                let frame=Frame::parse(&bytes)?;
-                if frame.service!=Some(service) {return Err(Error::Protocol);}
-                let kind=frame.header("type")?;
-                if frame.method==Some(0) {
-                    if kind=="pong" {
-                        last_pong=Instant::now();
-                        if let Some(payload)=frame.payload.filter(|p|!p.is_empty()) {
-                            config.update(&payload)?;
-                            next_ping=Instant::now()+Duration::from_secs(config.ping_interval);
-                        }
-                    }
-                    continue;
+                if bytes.len() > MAX_FRAME_BYTES {
+                    return Err(Error::Protocol);
                 }
-                if !matches!(kind,"event"|"card") {continue;}
-                let Some(mut frame)=fragments.push(frame,Instant::now())? else {continue;};
-                let started=Instant::now();
-                let event=wire::event(&frame.payload.take().unwrap_or_default());
-                match event {
-                    Ok(Some(event))=>{
-                        let card=matches!(&event,Event::Card {..});
-                        if replies.len()>=64 {write(&mut socket,frame.reply(false,started.elapsed())).await?;continue;}
-                        let (receipt,wait)=oneshot::channel();
-                        let sent=incoming.try_send(Received {event,acceptance:Some(Acceptance(receipt))}).is_ok();
-                        replies.spawn(async move {
-                            let accepted=sent && matches!(timeout(Duration::from_secs(1),wait).await,Ok(Ok(true)));
-                            frame.reply_with_card(accepted,started.elapsed(),card)
-                        });
-                    }
-                    Ok(None)=>write(&mut socket,frame.reply(true,started.elapsed())).await?,
-                    Err(_)=>write(&mut socket,frame.reply(false,started.elapsed())).await?,
-                }
+                let frame = Frame::parse(&bytes)?;
+                let mut state = SessionState {
+                    service,
+                    config,
+                    fragments: &mut fragments,
+                    replies: &mut replies,
+                    incoming: &incoming,
+                    last_pong: &mut last_pong,
+                    next_ping: &mut next_ping,
+                };
+                handle_frame(&mut socket, frame, &mut state).await?;
             }
         }
     }

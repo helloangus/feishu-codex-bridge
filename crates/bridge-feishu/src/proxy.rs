@@ -88,6 +88,10 @@ fn host(url: &Url) -> Result<&str, Error> {
         .map(|h| h.trim_matches(['[', ']']))
         .ok_or(Error::Proxy)
 }
+/// Evaluate a NO_PROXY rule list against the target URL: comma-separated
+/// entries match by full host, domain suffix (leading dot), IP or CIDR
+/// (v4/v6), optionally `:port`-scoped. IPv6 bracket literals in rules are
+/// honored. A match means "connect directly, no proxy".
 fn bypass(rules: &str, target: &Url) -> bool {
     let Ok(host) = host(target) else {
         return false;
@@ -252,6 +256,12 @@ async fn handshake(
 #[cfg(test)]
 #[path = "proxy_tls_tests.rs"]
 mod tls_tests;
+/// Tunnel through an HTTP proxy:
+/// 1. send `CONNECT host:port HTTP/1.1` with Proxy-Authorization,
+/// 2. read the status line and headers byte-wise until CRLFCRLF,
+/// 3. require 2xx; the stream then carries the tunneled bytes.
+///
+/// This is a minimal RFC 7231 CONNECT; failures collapse to Transport.
 pub async fn http_connect<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     host: &str,
@@ -305,6 +315,12 @@ pub async fn http_connect<S: AsyncRead + AsyncWrite + Unpin>(
     }
     Ok(())
 }
+/// Tunnel through a SOCKS5 proxy (RFC 1928), no-auth only:
+/// 1. greeting `05 01 00` and server method choice,
+/// 2. CONNECT request with domain-name addressing,
+/// 3. verify the reply's ATYP/BND and reserve code.
+///
+/// All failures collapse to Transport/Proxy; no reply detail is echoed.
 pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     host: &str,

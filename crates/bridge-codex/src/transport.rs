@@ -74,6 +74,23 @@ pub struct RpcClient {
     cancel: CancellationToken,
 }
 
+/// Run one bounded wait that loses to both the deadline and cancellation.
+/// The same shape (`timeout_at(deadline, …)` racing `cancel.cancelled()`,
+/// mapping failures to `Timeout`/`Closed`) previously appeared five times.
+async fn bounded<T>(
+    deadline: Instant,
+    cancel: &CancellationToken,
+    future: impl std::future::Future<Output = Result<T, RpcError>>,
+) -> Result<T, RpcError> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(RpcError::Closed),
+        result = timeout_at(deadline, future) => {
+            result.map_err(|_| RpcError::Timeout).and_then(|value| value)
+        }
+    }
+}
+
 impl RpcClient {
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -89,10 +106,10 @@ impl RpcClient {
         if self.cancel.is_cancelled() {
             return Err(RpcError::Closed);
         }
-        let _permit = tokio::select! {
-            _ = self.cancel.cancelled() => return Err(RpcError::Closed),
-            permit = timeout_at(deadline, self.slots.acquire()) => permit.map_err(|_| RpcError::Timeout)?.map_err(|_| RpcError::Closed)?,
-        };
+        let _permit = bounded(deadline, &self.cancel, async {
+            self.slots.acquire().await.map_err(|_| RpcError::Closed)
+        })
+        .await?;
         let id = RpcId::String(format!(
             "{}:{}",
             self.epoch,
@@ -107,38 +124,42 @@ impl RpcClient {
             pending: self.pending.clone(),
             id: id.clone(),
         };
-        self.write_before(
+        self.send_bounded(
             json!({"id": id, "method": method, "params": params}),
             deadline,
         )
         .await?;
-        tokio::select! {
-            biased;
-            answer = timeout_at(deadline, receiver) => answer.map_err(|_| RpcError::Timeout)?.map_err(|_| RpcError::Closed)?,
-            _ = self.cancel.cancelled() => Err(RpcError::Closed),
-        }
+        bounded(deadline, &self.cancel, async {
+            receiver.await.map_err(|_| RpcError::Closed)
+        })
+        .await?
     }
 
-    async fn write_before(&self, message: Value, deadline: Instant) -> Result<(), RpcError> {
+    /// Queue one frame and wait for the writer to flush it. The deadline
+    /// covers queuing, writing and flushing: once this returns, the frame is
+    /// on the wire (or the request is definitely not out).
+    async fn send_bounded(&self, message: Value, deadline: Instant) -> Result<(), RpcError> {
         let (flushed, received) = oneshot::channel();
         let outgoing = Outgoing {
             message,
             deadline,
             flushed,
         };
-        tokio::select! {
-            _ = self.cancel.cancelled() => return Err(RpcError::Closed),
-            sent = timeout_at(deadline, self.writer.send(outgoing)) => sent.map_err(|_| RpcError::Timeout)?.map_err(|_| RpcError::Closed)?,
-        }
-        tokio::select! {
-            biased;
-            result = timeout_at(deadline, received) => result.map_err(|_| RpcError::Timeout)?.map_err(|_| RpcError::Closed)?,
-            _ = self.cancel.cancelled() => Err(RpcError::Closed),
-        }
+        bounded(deadline, &self.cancel, async {
+            self.writer
+                .send(outgoing)
+                .await
+                .map_err(|_| RpcError::Timeout)
+        })
+        .await?;
+        bounded(deadline, &self.cancel, async {
+            received.await.map_err(|_| RpcError::Timeout)?
+        })
+        .await
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), RpcError> {
-        self.write_before(
+        self.send_bounded(
             json!({"method": method, "params": params}),
             Instant::now() + Duration::from_secs(5),
         )
@@ -150,7 +171,7 @@ impl RpcClient {
         if epoch != self.epoch {
             return Err(RpcError::StaleConnection);
         }
-        self.write_before(json!({"id":id,"error":{"code":-32602,"message":"Unsupported or invalid bridge request"}}),
+        self.send_bounded(json!({"id":id,"error":{"code":-32602,"message":"Unsupported or invalid bridge request"}}),
             Instant::now() + Duration::from_secs(5)).await
     }
 
@@ -159,7 +180,7 @@ impl RpcClient {
         if epoch != self.epoch {
             return Err(RpcError::StaleConnection);
         }
-        self.write_before(
+        self.send_bounded(
             json!({"id": id, "result": result}),
             Instant::now() + Duration::from_secs(5),
         )

@@ -57,6 +57,12 @@ fn parse<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, BackendError
     serde_json::from_value(value).map_err(|_| BackendError::Incompatible)
 }
 
+/// File-change snapshots above these bounds are emptied (never an error):
+/// the approval card cannot render them completely, and an incomplete
+/// display must not offer "allow".
+const MAX_FILE_CHANGES: usize = 20;
+const MAX_FILE_CHANGE_BYTES: usize = 16 * 1024;
+
 /// Only call for notifications. Requests must retain their ID for an explicit
 /// response; ignoring an unknown notification never permits ignoring a request.
 /// The application still compares the full TurnRef to its active execution.
@@ -65,148 +71,156 @@ pub fn notification(
     method: &str,
     params: Value,
 ) -> Result<Option<AgentEvent>, BackendError> {
-    Ok(Some(match method {
-        "item/started" => {
-            let data: ItemEvent = parse(params)?;
-            if data.item.get("type").and_then(Value::as_str) != Some("fileChange") {
-                return Ok(None);
-            }
-            let item = identifier(
-                data.item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or(BackendError::Incompatible)?
-                    .into(),
-            )?;
-            let entries = data
-                .item
-                .get("changes")
-                .and_then(Value::as_array)
-                .ok_or(BackendError::Incompatible)?;
-            let mut changes = Vec::new();
-            let mut size = 0usize;
-            for entry in entries {
-                let path = entry
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or(BackendError::Incompatible)?;
-                let diff = entry
-                    .get("diff")
-                    .and_then(Value::as_str)
-                    .ok_or(BackendError::Incompatible)?;
-                let kind = entry.get("kind").ok_or(BackendError::Incompatible)?;
-                let operation = kind
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .ok_or(BackendError::Incompatible)?;
-                if !matches!(operation, "add" | "delete" | "update") {
-                    return Err(BackendError::Incompatible);
-                }
-                let move_path = match kind.get("movePath") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(path)) => Some(path.clone()),
-                    _ => return Err(BackendError::Incompatible),
-                };
-                size = size
-                    .saturating_add(path.len())
-                    .saturating_add(diff.len())
-                    .saturating_add(move_path.as_ref().map_or(0, String::len));
-                if entries.len() > 20 || size > 16 * 1024 {
-                    changes.clear();
-                    break;
-                }
-                changes.push(bridge_app::requests::FileChange {
-                    path: path.into(),
-                    diff: diff.into(),
-                    operation: operation.into(),
-                    move_path,
-                });
-            }
-            AgentEvent::FileChanges {
-                turn: TurnRef {
-                    epoch,
-                    thread_id: identifier(data.thread_id)?,
-                    turn_id: identifier(data.turn_id)?,
-                },
-                item,
-                changes,
-            }
+    match method {
+        "item/started" => file_changes(epoch, params),
+        "turn/started" => turn_started(epoch, params).map(Some),
+        "item/agentMessage/delta" => agent_message_delta(epoch, params).map(Some),
+        "turn/completed" => turn_completed(epoch, params).map(Some),
+        "item/completed" => plan_completed(epoch, params),
+        "thread/archived" => thread_archived(epoch, params).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn turn(epoch: u64, thread_id: String, turn_id: String) -> Result<TurnRef, BackendError> {
+    Ok(TurnRef {
+        epoch,
+        thread_id: identifier(thread_id)?,
+        turn_id: identifier(turn_id)?,
+    })
+}
+
+/// `item/started` with a `fileChange` item: collect the per-file diffs the
+/// approval card will show. Other item types are ignored.
+fn file_changes(epoch: u64, params: Value) -> Result<Option<AgentEvent>, BackendError> {
+    let data: ItemEvent = parse(params)?;
+    if data.item.get("type").and_then(Value::as_str) != Some("fileChange") {
+        return Ok(None);
+    }
+    let item = identifier(
+        data.item
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(BackendError::Incompatible)?
+            .into(),
+    )?;
+    let entries = data
+        .item
+        .get("changes")
+        .and_then(Value::as_array)
+        .ok_or(BackendError::Incompatible)?;
+    let mut changes = Vec::new();
+    let mut size = 0usize;
+    for entry in entries {
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or(BackendError::Incompatible)?;
+        let diff = entry
+            .get("diff")
+            .and_then(Value::as_str)
+            .ok_or(BackendError::Incompatible)?;
+        let kind = entry.get("kind").ok_or(BackendError::Incompatible)?;
+        let operation = kind
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(BackendError::Incompatible)?;
+        if !matches!(operation, "add" | "delete" | "update") {
+            return Err(BackendError::Incompatible);
         }
-        "turn/started" => {
-            let data: Completed = parse(params)?;
-            if data.turn.status != "inProgress" {
-                return Err(BackendError::Incompatible);
-            }
-            AgentEvent::Started {
-                turn: TurnRef {
-                    epoch,
-                    thread_id: identifier(data.thread_id)?,
-                    turn_id: identifier(data.turn.id)?,
-                },
-            }
+        let move_path = match kind.get("movePath") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(path)) => Some(path.clone()),
+            _ => return Err(BackendError::Incompatible),
+        };
+        size = size
+            .saturating_add(path.len())
+            .saturating_add(diff.len())
+            .saturating_add(move_path.as_ref().map_or(0, String::len));
+        if entries.len() > MAX_FILE_CHANGES || size > MAX_FILE_CHANGE_BYTES {
+            changes.clear();
+            break;
         }
-        "item/agentMessage/delta" => {
-            let data: Delta = parse(params)?;
-            AgentEvent::Output {
-                turn: TurnRef {
-                    epoch,
-                    thread_id: identifier(data.thread_id)?,
-                    turn_id: identifier(data.turn_id)?,
-                },
-                item: identifier(data.item_id)?,
-                delta: data.delta,
-            }
-        }
-        "turn/completed" => {
-            let data: Completed = parse(params)?;
-            let outcome = match data.turn.status.as_str() {
-                "completed" => TurnOutcome::Completed,
-                "failed" => TurnOutcome::Failed {
-                    message: data.turn.error.as_ref().map(|e| e.message.clone()),
-                    details: data.turn.error.and_then(|e| e.additional_details),
-                },
-                "interrupted" => TurnOutcome::Interrupted,
-                _ => return Err(BackendError::Incompatible),
-            };
-            AgentEvent::Finished {
-                turn: TurnRef {
-                    epoch,
-                    thread_id: identifier(data.thread_id)?,
-                    turn_id: identifier(data.turn.id)?,
-                },
-                outcome,
-            }
-        }
-        "item/completed" => {
-            let data: ItemEvent = parse(params)?;
-            if data.item.get("type").and_then(Value::as_str) != Some("plan") {
-                return Ok(None);
-            }
-            #[derive(Deserialize)]
-            struct Plan {
-                id: String,
-                text: String,
-            }
-            let plan: Plan = parse(data.item)?;
-            AgentEvent::Plan {
-                turn: TurnRef {
-                    epoch,
-                    thread_id: identifier(data.thread_id)?,
-                    turn_id: identifier(data.turn_id)?,
-                },
-                item: identifier(plan.id)?,
-                text: plan.text,
-            }
-        }
-        "thread/archived" => {
-            let data: Archived = parse(params)?;
-            AgentEvent::Archived {
-                epoch,
-                thread: identifier(data.thread_id)?,
-            }
-        }
-        _ => return Ok(None),
+        changes.push(bridge_app::requests::FileChange {
+            path: path.into(),
+            diff: diff.into(),
+            operation: operation.into(),
+            move_path,
+        });
+    }
+    Ok(Some(AgentEvent::FileChanges {
+        turn: turn(epoch, data.thread_id, data.turn_id)?,
+        item,
+        changes,
     }))
+}
+
+/// `turn/started`: the turn identity becomes the execution gate's bind point.
+fn turn_started(epoch: u64, params: Value) -> Result<AgentEvent, BackendError> {
+    let data: Completed = parse(params)?;
+    if data.turn.status != "inProgress" {
+        return Err(BackendError::Incompatible);
+    }
+    Ok(AgentEvent::Started {
+        turn: turn(epoch, data.thread_id, data.turn.id)?,
+    })
+}
+
+/// `item/agentMessage/delta`: streaming output for the progress preview.
+fn agent_message_delta(epoch: u64, params: Value) -> Result<AgentEvent, BackendError> {
+    let data: Delta = parse(params)?;
+    Ok(AgentEvent::Output {
+        turn: turn(epoch, data.thread_id, data.turn_id)?,
+        item: identifier(data.item_id)?,
+        delta: data.delta,
+    })
+}
+
+/// `turn/completed`: the authoritative terminal outcome of a turn.
+fn turn_completed(epoch: u64, params: Value) -> Result<AgentEvent, BackendError> {
+    let data: Completed = parse(params)?;
+    let outcome = match data.turn.status.as_str() {
+        "completed" => TurnOutcome::Completed,
+        "failed" => TurnOutcome::Failed {
+            message: data.turn.error.as_ref().map(|e| e.message.clone()),
+            details: data.turn.error.and_then(|e| e.additional_details),
+        },
+        "interrupted" => TurnOutcome::Interrupted,
+        _ => return Err(BackendError::Incompatible),
+    };
+    Ok(AgentEvent::Finished {
+        turn: turn(epoch, data.thread_id, data.turn.id)?,
+        outcome,
+    })
+}
+
+/// `item/completed` with a `plan` item: the authoritative plan text. Other
+/// item types are ignored.
+fn plan_completed(epoch: u64, params: Value) -> Result<Option<AgentEvent>, BackendError> {
+    let data: ItemEvent = parse(params)?;
+    if data.item.get("type").and_then(Value::as_str) != Some("plan") {
+        return Ok(None);
+    }
+    #[derive(Deserialize)]
+    struct Plan {
+        id: String,
+        text: String,
+    }
+    let plan: Plan = parse(data.item)?;
+    Ok(Some(AgentEvent::Plan {
+        turn: turn(epoch, data.thread_id, data.turn_id)?,
+        item: identifier(plan.id)?,
+        text: plan.text,
+    }))
+}
+
+/// `thread/archived`: the thread's local binding must be cleared later.
+fn thread_archived(epoch: u64, params: Value) -> Result<AgentEvent, BackendError> {
+    let data: Archived = parse(params)?;
+    Ok(AgentEvent::Archived {
+        epoch,
+        thread: identifier(data.thread_id)?,
+    })
 }
 
 #[cfg(test)]

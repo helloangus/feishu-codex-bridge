@@ -86,6 +86,8 @@ impl Frame {
             key: "biz_rt".into(),
             value: elapsed.as_millis().to_string(),
         });
+        // The card callback's `data` field is base64 of "{}": an empty JSON
+        // object, required only for card deliveries.
         let body = if accepted && card {
             json!({"code":200,"data":"e30="})
         } else {
@@ -95,17 +97,59 @@ impl Frame {
         self
     }
 }
+/// Identifies which logical message a frame belongs to: all fragments of one
+/// message must agree on these five header fields. A mismatch means a sender
+/// reused `message_id` for a different message — ambiguous, so the assembly
+/// is dropped rather than interleaved.
+#[derive(PartialEq, Clone)]
+struct MessageSignature {
+    kind: String,
+    trace_id: String,
+    service: String,
+    payload_encoding: String,
+    payload_type: String,
+}
+impl MessageSignature {
+    fn read(frame: &Frame) -> Result<Self, Error> {
+        Ok(Self {
+            kind: frame.header("type")?.into(),
+            trace_id: frame.header("trace_id").unwrap_or("").into(),
+            service: frame.service.unwrap_or_default().to_string(),
+            payload_encoding: frame.payload_encoding.clone().unwrap_or_default(),
+            payload_type: frame.payload_type.clone().unwrap_or_default(),
+        })
+    }
+}
+
+/// One in-progress multi-fragment message.
 struct Assembly {
     parts: Vec<Option<Vec<u8>>>,
-    signature: Vec<String>,
+    signature: MessageSignature,
     bytes: usize,
     deadline: Instant,
 }
+
+/// Max message id length, protocol-bounded.
+const MAX_MESSAGE_ID: usize = 1024;
+/// Max fragments per message, protocol-bounded.
+const MAX_FRAGMENTS: usize = 64;
+/// Max concurrently assembling messages; further new ids fail closed.
+const MAX_ASSEMBLIES: usize = 64;
+/// Global byte budget across all assemblies (anti memory amplification).
+const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+/// Per-message byte budget; a message that stays above it was not fragmented
+/// honestly.
+const MAX_ASSEMBLED_BYTES: usize = MAX_FRAME_BYTES;
+/// How long an incomplete assembly may wait for its next fragment.
+const ASSEMBLY_TTL: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 pub struct Fragments {
     entries: BTreeMap<String, Assembly>,
 }
 impl Fragments {
+    /// Fold one frame into the fragment reassembly. Returns `Ok(None)` while
+    /// fragments are still missing; `Ok(Some(frame))` once a message is whole.
     pub fn push(&mut self, mut frame: Frame, now: Instant) -> Result<Option<Frame>, Error> {
         self.entries.retain(|_, a| now < a.deadline);
         let id = frame.header("message_id")?.to_owned();
@@ -117,16 +161,17 @@ impl Fragments {
             .header("seq")?
             .parse::<usize>()
             .map_err(|_| Error::Protocol)?;
-        if id.is_empty() || id.len() > 1024 || total == 0 || total > 64 || index >= total {
+        // Identity bounds: the id must exist and fit, the fragment index must
+        // address a real slot.
+        if id.is_empty()
+            || id.len() > MAX_MESSAGE_ID
+            || total == 0
+            || total > MAX_FRAGMENTS
+            || index >= total
+        {
             return Err(Error::Protocol);
         }
-        let signature = vec![
-            frame.header("type")?.into(),
-            frame.header("trace_id").unwrap_or("").into(),
-            frame.service.unwrap_or_default().to_string(),
-            frame.payload_encoding.clone().unwrap_or_default(),
-            frame.payload_type.clone().unwrap_or_default(),
-        ];
+        let signature = MessageSignature::read(&frame)?;
         let bytes = frame.payload.take().unwrap_or_default();
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(Error::Protocol);
@@ -138,17 +183,17 @@ impl Fragments {
             frame.payload = Some(bytes);
             return Ok(Some(frame));
         }
-        if !self.entries.contains_key(&id) && self.entries.len() >= 64 {
+        if !self.entries.contains_key(&id) && self.entries.len() >= MAX_ASSEMBLIES {
             return Err(Error::Overloaded);
         }
-        if self.entries.values().map(|a| a.bytes).sum::<usize>() + bytes.len() > 8 * 1024 * 1024 {
+        if self.entries.values().map(|a| a.bytes).sum::<usize>() + bytes.len() > MAX_TOTAL_BYTES {
             return Err(Error::Overloaded);
         }
         let a = self.entries.entry(id.clone()).or_insert_with(|| Assembly {
             parts: vec![None; total],
             signature: signature.clone(),
             bytes: 0,
-            deadline: now + Duration::from_secs(5),
+            deadline: now + ASSEMBLY_TTL,
         });
         if a.parts.len() != total
             || a.signature != signature
@@ -161,7 +206,7 @@ impl Fragments {
             a.bytes += bytes.len();
             a.parts[index] = Some(bytes);
         }
-        if a.bytes > MAX_FRAME_BYTES {
+        if a.bytes > MAX_ASSEMBLED_BYTES {
             self.entries.remove(&id);
             return Err(Error::Protocol);
         }

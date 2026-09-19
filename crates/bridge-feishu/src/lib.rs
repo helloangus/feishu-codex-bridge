@@ -94,45 +94,32 @@ pub mod ingress;
 
 pub mod proxy;
 pub mod websocket;
-/// Decode media without downloading or trusting remote filenames as paths.
+
+/// Hard node budget when walking a rich-text post; keeps pathological
+/// payloads from dominating decode time.
+const MAX_POST_NODES: usize = 4096;
+/// One more than the application's `ATTACHMENTS_PER_MESSAGE`: the overflow
+/// sentinel makes the application reject the message instead of silently
+/// dropping files.
+const ATTACHMENT_OVERFLOW_SENTINEL: usize = 11;
+/// Max attachment key length, protocol-bounded.
+const MAX_ATTACHMENT_KEY: usize = 1024;
+/// Max attachment display-name characters.
+const MAX_ATTACHMENT_NAME_CHARS: usize = 200;
+
+/// Decode media references without downloading or trusting remote filenames
+/// as paths. `kind` is the Feishu message type; for rich-text posts the
+/// `img`/`file`/`media` child nodes are walked recursively with dedup by key.
 pub fn attachments(
     message_id: &str,
     kind: &str,
     content: &serde_json::Value,
 ) -> Vec<bridge_app::files::Attachment> {
+    if kind == "post" {
+        return post_attachments(message_id, post_body(content));
+    }
     use bridge_app::files::Attachment;
     use bridge_app::messaging::{ResourceKind, ResourceRef};
-    if kind == "post" {
-        let post = post_body(content);
-        let mut result = Vec::new();
-        if let Some(rows) = post.get("content").and_then(serde_json::Value::as_array) {
-            for node in rows
-                .iter()
-                .filter_map(serde_json::Value::as_array)
-                .flatten()
-                .take(4096)
-            {
-                let kind = match node.get("tag").and_then(serde_json::Value::as_str) {
-                    Some("img") => "image",
-                    Some("file" | "media") => "file",
-                    _ => continue,
-                };
-                for attachment in attachments(message_id, kind, node) {
-                    if !result
-                        .iter()
-                        .any(|a: &Attachment| a.resource.key == attachment.resource.key)
-                    {
-                        result.push(attachment);
-                    }
-                }
-                // Preserve an overflow sentinel so the application rejects instead of silently dropping files.
-                if result.len() > 10 {
-                    break;
-                }
-            }
-        }
-        return result;
-    }
     let (field, resource_kind) = match kind {
         "image" => ("image_key", ResourceKind::Image),
         "file" | "audio" | "media" | "video" => ("file_key", ResourceKind::File),
@@ -146,7 +133,7 @@ pub fn attachments(
                 .flatten()
         })
         .and_then(serde_json::Value::as_str)
-        .filter(|key| !key.is_empty() && key.len() <= 1024)
+        .filter(|key| !key.is_empty() && key.len() <= MAX_ATTACHMENT_KEY)
         .map(|key| {
             vec![Attachment {
                 resource: ResourceRef {
@@ -163,13 +150,55 @@ pub fn attachments(
                         "attachment.bin"
                     })
                     .chars()
-                    .take(200)
+                    .take(MAX_ATTACHMENT_NAME_CHARS)
                     .collect(),
             }]
         })
         .unwrap_or_default()
 }
 
+/// Extract attachments from one rich-text post body: walk at most
+/// `MAX_POST_NODES` child nodes, dedup by resource key, and stop at the
+/// overflow sentinel (one past the application limit) so an overloaded post
+/// is rejected upstream rather than silently truncated.
+fn post_attachments(
+    message_id: &str,
+    post: &serde_json::Value,
+) -> Vec<bridge_app::files::Attachment> {
+    use bridge_app::files::Attachment;
+    let mut result = Vec::new();
+    let Some(rows) = post.get("content").and_then(serde_json::Value::as_array) else {
+        return result;
+    };
+    for node in rows
+        .iter()
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .take(MAX_POST_NODES)
+    {
+        let kind = match node.get("tag").and_then(serde_json::Value::as_str) {
+            Some("img") => "image",
+            Some("file" | "media") => "file",
+            _ => continue,
+        };
+        for attachment in attachments(message_id, kind, node) {
+            if !result
+                .iter()
+                .any(|a: &Attachment| a.resource.key == attachment.resource.key)
+            {
+                result.push(attachment);
+            }
+        }
+        if result.len() >= ATTACHMENT_OVERFLOW_SENTINEL {
+            break;
+        }
+    }
+    result
+}
+
+/// Locate the post payload: inline `content`, the `zh_cn`/`en_us` locale
+/// objects, or failing those, the first object value. The order matches the
+/// official SDK's message shape.
 fn post_body(content: &serde_json::Value) -> &serde_json::Value {
     if content.get("content").is_some() {
         return content;

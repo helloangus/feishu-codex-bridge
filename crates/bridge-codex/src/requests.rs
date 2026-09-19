@@ -44,6 +44,37 @@ fn text(value: &Value, field: &str) -> Result<Option<String>, BackendError> {
     }
 }
 
+/// Whether this port can honestly render an "allow" button for one approval:
+/// every rule must hold, and each rule exists because the card cannot fully
+/// display or scope what allowing would grant.
+fn can_allow(
+    params: &Value,
+    command: bool,
+    permissions_supported: bool,
+    network_context: Option<&str>,
+) -> Result<bool, BackendError> {
+    // Remote execution environments are not represented by this port.
+    let no_remote_environment = text(params, "environmentId")?.is_none();
+    // A session-wide root grant outlives one approval and is not renderable.
+    let no_session_grant = text(params, "grantRoot")?.is_none();
+    // An unsupported permission profile or an oversized network context
+    // cannot be shown completely, so it cannot be consented to.
+    let displayable =
+        permissions_supported && network_context.is_none_or(|value| value.len() <= 4096);
+    let mut can_allow = no_remote_environment && no_session_grant && displayable;
+    if command {
+        if let Some(decisions) = params.get("availableDecisions").filter(|v| !v.is_null()) {
+            let decisions = decisions.as_array().ok_or(BackendError::Incompatible)?;
+            can_allow &= decisions.iter().any(|v| v == "accept");
+            // A request that cannot be declined leaves no safe reply path.
+            if !decisions.iter().any(|v| v == "decline") {
+                return Err(BackendError::Incompatible);
+            }
+        }
+    }
+    Ok(can_allow)
+}
+
 pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, BackendError> {
     let wire: WireRequest =
         serde_json::from_value(params.clone()).map_err(|_| BackendError::Incompatible)?;
@@ -59,11 +90,12 @@ pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, B
                 return Err(BackendError::Incompatible);
             }
             let command = method == "item/commandExecution/requestApproval";
-            let (permissions, permissions_supported) = if command {
+            let permissions = if command {
                 crate::permissions::profile(params.get("additionalPermissions"))?
             } else {
-                (None, true)
+                None
             };
+            let permissions_supported = permissions.as_ref().is_none_or(|notice| notice.can_allow);
             let network_context = if command {
                 crate::permissions::context(params.get("networkApprovalContext"))?
             } else {
@@ -78,22 +110,14 @@ pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, B
             } else {
                 ApprovalKind::FileChange
             };
-            // Remote execution environments are not represented by this port.
-            let mut can_allow =
-                text(&params, "environmentId")?.is_none() && text(&params, "grantRoot")?.is_none();
-            can_allow &=
-                permissions_supported && network_context.as_ref().is_none_or(|v| v.len() <= 4096);
-            if command {
-                if let Some(decisions) = params.get("availableDecisions").filter(|v| !v.is_null()) {
-                    let decisions = decisions.as_array().ok_or(BackendError::Incompatible)?;
-                    can_allow &= decisions.iter().any(|v| v == "accept");
-                    if !decisions.iter().any(|v| v == "decline") {
-                        return Err(BackendError::Incompatible);
-                    }
-                }
-            }
+            let can_allow = can_allow(
+                &params,
+                command,
+                permissions_supported,
+                network_context.as_deref(),
+            )?;
             RequestKind::Approval(Approval {
-                permissions,
+                permissions: permissions.map(|notice| notice.text),
                 network_context,
                 changes: None,
                 kind: approval_kind,
@@ -104,49 +128,7 @@ pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, B
                 can_allow,
             })
         }
-        "item/tool/requestUserInput" => {
-            let blocking = params
-                .get("isBlocking")
-                .and_then(Value::as_bool)
-                .ok_or(BackendError::Incompatible)?;
-            let questions: Vec<WireQuestion> = serde_json::from_value(
-                params
-                    .get("questions")
-                    .cloned()
-                    .ok_or(BackendError::Incompatible)?,
-            )
-            .map_err(|_| BackendError::Incompatible)?;
-            if questions.is_empty() || questions.len() > 32 {
-                return Err(BackendError::Incompatible);
-            }
-            let mut ids = BTreeSet::new();
-            let mut result = Vec::new();
-            for question in questions {
-                if question.id.trim().is_empty() || !ids.insert(question.id.clone()) {
-                    return Err(BackendError::Incompatible);
-                }
-                result.push(Question {
-                    id: question.id,
-                    header: question.header,
-                    text: question.question,
-                    other: question.is_other,
-                    secret: question.is_secret,
-                    options: question
-                        .options
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|o| QuestionOption {
-                            label: o.label,
-                            description: o.description,
-                        })
-                        .collect(),
-                });
-            }
-            RequestKind::Questions {
-                blocking,
-                questions: result,
-            }
-        }
+        "item/tool/requestUserInput" => questions(params)?,
         _ => return Err(BackendError::Incompatible),
     };
     Ok(AgentRequest {
@@ -157,6 +139,53 @@ pub fn decode(epoch: u64, method: &str, params: Value) -> Result<AgentRequest, B
         },
         item: wire.item_id,
         kind,
+    })
+}
+
+/// `item/tool/requestUserInput`: one bounded group of questions with unique
+/// ids. The group must be non-empty and renderable in one card batch.
+fn questions(params: Value) -> Result<RequestKind, BackendError> {
+    const MAX_QUESTIONS: usize = 32;
+    let blocking = params
+        .get("isBlocking")
+        .and_then(Value::as_bool)
+        .ok_or(BackendError::Incompatible)?;
+    let questions: Vec<WireQuestion> = serde_json::from_value(
+        params
+            .get("questions")
+            .cloned()
+            .ok_or(BackendError::Incompatible)?,
+    )
+    .map_err(|_| BackendError::Incompatible)?;
+    if questions.is_empty() || questions.len() > MAX_QUESTIONS {
+        return Err(BackendError::Incompatible);
+    }
+    let mut ids = BTreeSet::new();
+    let mut result = Vec::new();
+    for question in questions {
+        if question.id.trim().is_empty() || !ids.insert(question.id.clone()) {
+            return Err(BackendError::Incompatible);
+        }
+        result.push(Question {
+            id: question.id,
+            header: question.header,
+            text: question.question,
+            other: question.is_other,
+            secret: question.is_secret,
+            options: question
+                .options
+                .unwrap_or_default()
+                .into_iter()
+                .map(|o| QuestionOption {
+                    label: o.label,
+                    description: o.description,
+                })
+                .collect(),
+        });
+    }
+    Ok(RequestKind::Questions {
+        blocking,
+        questions: result,
     })
 }
 
