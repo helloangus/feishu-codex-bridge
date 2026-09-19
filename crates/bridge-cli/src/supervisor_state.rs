@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Starting,
@@ -18,6 +18,24 @@ pub enum Phase {
     Stopped,
     Failed,
 }
+
+/// The supervisor's live phase as answered over the control socket: the same
+/// [`Phase`] state machine the durable snapshot records, observed while it is
+/// still running. `retry_delay_seconds` is meaningful only in `Backoff`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePhase {
+    pub phase: Phase,
+    pub retry_delay_seconds: u64,
+}
+impl Default for LivePhase {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Starting,
+            retry_delay_seconds: 0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,

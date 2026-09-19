@@ -1,5 +1,20 @@
 //! Foreground composition of the native bridge: Feishu ingress, Codex app
 //! server, durable state and the application runtime.
+//!
+//! One run spawns five tasks around the serial runtime loop and connects them
+//! with four bounded channels (see the diagram in `docs/architecture.md`):
+//!
+//! | task        | reads                        | writes                        |
+//! |-------------|------------------------------|-------------------------------|
+//! | `transport` | Feishu WebSocket             | `incoming` (128)              |
+//! | `gateway`   | `incoming`                   | `input` (64), health file     |
+//! | `agent`     | Codex app-server events      | `event` (256), server shutdown|
+//! | `heartbeat` | runtime cancel token         | health file pulses            |
+//! | `signal`    | SIGTERM/SIGINT               | runtime cancel token          |
+//!
+//! The `gateway` is `route_events`; archive reconciliation before startup
+//! is `reconcile_archives`. Any task failure cancels the shared token and
+//! the loop joins every task before publishing the final health phase.
 use crate::{AccessMode, Config, credentials::valid_pairing_code, valid_env_name};
 use bridge_app::runtime;
 use bridge_codex::process::AppServer;
@@ -155,22 +170,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     let backend = Arc::new(server.backend());
-    // Reconcile before Feishu connects or any business task is admitted. A failed
-    // scan leaves bindings untouched; a failed commit prevents runtime startup.
-    let reconciliation = tokio::time::timeout(Duration::from_secs(60), async {
-        let bindings = store
-            .bound_threads()
-            .await
-            .map_err(|_| "无法读取待核对会话绑定")?;
-        let archived = backend
-            .archived_bindings(&bindings)
-            .await
-            .map_err(|_| "归档状态核对失败，未启动业务接收")?;
-        store
-            .clear_archived_bindings(archived)
-            .await
-            .map_err(|_| "归档绑定修复保存失败，未启动业务接收")
-    })
+    // Reconcile before Feishu connects or any business task is admitted.
+    let reconciliation = tokio::time::timeout(
+        Duration::from_secs(60),
+        reconcile_archives(&store, &backend),
+    )
     .await;
     match reconciliation {
         Ok(Ok(removed)) => diagnostics.emit(
@@ -194,7 +198,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         cancel.clone(),
         diagnostics.clone(),
     ));
-    let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
+    let (incoming_tx, incoming_rx) = mpsc::channel(128);
     let (input_tx, input_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(256);
     let stop = cancel.clone();
@@ -204,75 +208,13 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         result
     });
     let stop = cancel.clone();
-    let connection_health = health.clone();
-    let gateway_diagnostics = diagnostics.clone();
-    let gateway = tokio::spawn(async move {
-        let diagnostics = &gateway_diagnostics;
-        let mut healthy = true;
-        while let Some(received) = incoming_rx.recv().await {
-            // Feishu payloads become application inputs inside the ingress;
-            // this loop only routes lifecycle state and bounded admission.
-            let connection = match received.event {
-                Event::Connection { state } => state,
-                _ => {
-                    if let Some(input) = received.into_runtime_input() {
-                        if input_tx.try_send(input).is_err() {
-                            diagnostics.emit(
-                                bridge_app::diagnostics::Event::Overloaded,
-                                bridge_app::diagnostics::Status::Overloaded,
-                                None,
-                                0,
-                            );
-                        }
-                    }
-                    continue;
-                }
-            };
-            diagnostics.emit(
-                match connection {
-                    bridge_feishu::ingress::ConnectionState::Starting => {
-                        bridge_app::diagnostics::Event::ConnectionStarting
-                    }
-                    bridge_feishu::ingress::ConnectionState::Connected => {
-                        bridge_app::diagnostics::Event::ConnectionEstablished
-                    }
-                    bridge_feishu::ingress::ConnectionState::Reconnecting => {
-                        bridge_app::diagnostics::Event::ConnectionReconnecting
-                    }
-                },
-                bridge_app::diagnostics::Status::Ok,
-                None,
-                0,
-            );
-            let phase = match connection {
-                bridge_feishu::ingress::ConnectionState::Starting => crate::health::Phase::Starting,
-                bridge_feishu::ingress::ConnectionState::Connected => {
-                    crate::health::Phase::Connected
-                }
-                bridge_feishu::ingress::ConnectionState::Reconnecting => {
-                    crate::health::Phase::Reconnecting
-                }
-            };
-            if connection_health
-                .lock()
-                .map_err(|_| ())
-                .and_then(|mut h| h.set(phase).map_err(|_| ()))
-                .is_err()
-            {
-                diagnostics.emit(
-                    bridge_app::diagnostics::Event::HealthWriteFailed,
-                    bridge_app::diagnostics::Status::Failed,
-                    None,
-                    0,
-                );
-                healthy = false;
-                stop.cancel();
-                break;
-            }
-        }
-        stop.cancel();
-        healthy
-    });
+    let gateway = tokio::spawn(route_events(
+        incoming_rx,
+        input_tx,
+        health.clone(),
+        diagnostics.clone(),
+        stop,
+    ));
     let stop = cancel.clone();
     let agent = tokio::spawn(async move {
         let mut unhealthy = false;
@@ -378,4 +320,100 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         0,
     );
     Ok(())
+}
+
+/// Reconcile archived session bindings against the backend before Feishu
+/// connects or any business task is admitted. A failed scan leaves bindings
+/// untouched; a failed commit prevents runtime startup.
+async fn reconcile_archives(
+    store: &Arc<AsyncState>,
+    backend: &Arc<bridge_codex::backend::CodexBackend>,
+) -> Result<usize, &'static str> {
+    let bindings = store
+        .bound_threads()
+        .await
+        .map_err(|_| "无法读取待核对会话绑定")?;
+    let archived = backend
+        .archived_bindings(&bindings)
+        .await
+        .map_err(|_| "归档状态核对失败，未启动业务接收")?;
+    store
+        .clear_archived_bindings(archived)
+        .await
+        .map_err(|_| "归档绑定修复保存失败，未启动业务接收")
+}
+
+/// Route Feishu payloads between the transport and the runtime: connection
+/// lifecycle updates the health file; everything else becomes a runtime input
+/// on the bounded admission channel. Returns whether the health file stayed
+/// writable; a failure cancels the run.
+async fn route_events(
+    mut incoming: mpsc::Receiver<bridge_feishu::ingress::Received>,
+    inputs: mpsc::Sender<bridge_app::runtime::Input>,
+    health: Arc<std::sync::Mutex<crate::health::Health>>,
+    diagnostics: bridge_app::diagnostics::Diagnostics,
+    stop: CancellationToken,
+) -> bool {
+    let mut healthy = true;
+    while let Some(received) = incoming.recv().await {
+        // Feishu payloads become application inputs inside the ingress;
+        // this loop only routes lifecycle state and bounded admission.
+        let connection = match received.event {
+            Event::Connection { state } => state,
+            _ => {
+                if let Some(input) = received.into_runtime_input() {
+                    if inputs.try_send(input).is_err() {
+                        diagnostics.emit(
+                            bridge_app::diagnostics::Event::Overloaded,
+                            bridge_app::diagnostics::Status::Overloaded,
+                            None,
+                            0,
+                        );
+                    }
+                }
+                continue;
+            }
+        };
+        diagnostics.emit(
+            match connection {
+                bridge_feishu::ingress::ConnectionState::Starting => {
+                    bridge_app::diagnostics::Event::ConnectionStarting
+                }
+                bridge_feishu::ingress::ConnectionState::Connected => {
+                    bridge_app::diagnostics::Event::ConnectionEstablished
+                }
+                bridge_feishu::ingress::ConnectionState::Reconnecting => {
+                    bridge_app::diagnostics::Event::ConnectionReconnecting
+                }
+            },
+            bridge_app::diagnostics::Status::Ok,
+            None,
+            0,
+        );
+        let phase = match connection {
+            bridge_feishu::ingress::ConnectionState::Starting => crate::health::Phase::Starting,
+            bridge_feishu::ingress::ConnectionState::Connected => crate::health::Phase::Connected,
+            bridge_feishu::ingress::ConnectionState::Reconnecting => {
+                crate::health::Phase::Reconnecting
+            }
+        };
+        if health
+            .lock()
+            .map_err(|_| ())
+            .and_then(|mut h| h.set(phase).map_err(|_| ()))
+            .is_err()
+        {
+            diagnostics.emit(
+                bridge_app::diagnostics::Event::HealthWriteFailed,
+                bridge_app::diagnostics::Status::Failed,
+                None,
+                0,
+            );
+            healthy = false;
+            stop.cancel();
+            break;
+        }
+    }
+    stop.cancel();
+    healthy
 }

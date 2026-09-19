@@ -44,7 +44,10 @@ pub struct Report {
 /// Render the intentionally compact operator-facing status.  The serialized
 /// [`Report`] remains available to Rust callers, but command-line users should
 /// not have to infer service health from lock files, PIDs, or timestamps.
-pub fn display(report: &Report, supervisor_phase: Option<&str>) -> String {
+pub fn display(
+    report: &Report,
+    supervisor_phase: Option<crate::supervisor_state::LivePhase>,
+) -> String {
     let feishu = match report.snapshot.as_ref().map(|snapshot| snapshot.phase) {
         Some(Phase::Connected) if report.heartbeat_fresh == Some(true) => {
             "已连接，服务正常接收飞书消息。"
@@ -65,11 +68,12 @@ pub fn display(report: &Report, supervisor_phase: Option<&str>) -> String {
         _ if report.running => "运行异常（心跳未就绪）",
         _ => "未运行",
     };
+    use crate::supervisor_state::Phase as SupervisorPhase;
     let recovery = match supervisor_phase {
-        Some("running") => "监督器正在运行。",
-        Some("stopping") => "正在停止。",
-        Some(phase) if phase.strip_prefix("backoff:").is_some() => {
-            let seconds = phase.strip_prefix("backoff:").unwrap_or_default();
+        Some(live) if live.phase == SupervisorPhase::Running => "监督器正在运行。",
+        Some(live) if live.phase == SupervisorPhase::Stopping => "正在停止。",
+        Some(live) if live.phase == SupervisorPhase::Backoff => {
+            let seconds = live.retry_delay_seconds;
             return format!(
                 "桥接状态：{bridge}\n飞书连接：{feishu}\n自动恢复：将在 {seconds} 秒后重试。\n\n提示：本次失败发生在飞书连接之前；请检查服务启动错误。"
             );
@@ -315,7 +319,10 @@ mod tests {
     fn display_explains_pre_connection_failure_and_retry() {
         let text = display(
             &report(Some(Phase::Failed), false, Some(false)),
-            Some("backoff:30"),
+            Some(crate::supervisor_state::LivePhase {
+                phase: crate::supervisor_state::Phase::Backoff,
+                retry_delay_seconds: 30,
+            }),
         );
         assert_eq!(
             text,
@@ -327,7 +334,10 @@ mod tests {
     fn display_only_calls_feishu_connected_when_heartbeat_is_fresh() {
         let text = display(
             &report(Some(Phase::Connected), true, Some(true)),
-            Some("running"),
+            Some(crate::supervisor_state::LivePhase {
+                phase: crate::supervisor_state::Phase::Running,
+                retry_delay_seconds: 0,
+            }),
         );
         assert!(text.contains("飞书连接：已连接"));
         assert!(!text.contains("PID"));

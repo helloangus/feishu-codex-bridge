@@ -101,11 +101,11 @@ fn print_status(settings: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 bridge_cli::service_control::ControlCommand::Phase,
             ))
             .ok()
-            .and_then(|response| response.as_phase().map(str::to_owned))
+            .and_then(|response| response.as_phase())
     } else {
         None
     };
-    println!("{}", bridge_cli::health::display(&report, phase.as_deref()));
+    println!("{}", bridge_cli::health::display(&report, phase));
     Ok(())
 }
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {

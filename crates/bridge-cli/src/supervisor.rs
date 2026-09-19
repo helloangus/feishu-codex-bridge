@@ -1,5 +1,5 @@
 //! Foreground supervision. Each attempt is a new process with its own runtime.
-use crate::supervisor_state::{Phase as StoredPhase, Recorder};
+use crate::supervisor_state::{LivePhase, Phase, Recorder};
 use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
@@ -57,10 +57,28 @@ fn validate_lock(lock: &fs::File) -> io::Result<()> {
     Ok(())
 }
 
+/// Longest single backoff delay; the schedule caps at this value.
+const RETRY_DELAY_CAP_SECS: u64 = 30;
+
 #[derive(Default)]
 struct Backoff {
     failures: u32,
 }
+
+/// Watchdog thresholds. The startup grace must exceed the health heartbeat
+/// interval plus its freshness window (`health.rs`: 10s + 30s) plus one probe
+/// round, so a slow start is never mistaken for a stalled bridge; the
+/// progress grace is the silence budget once heartbeats flow.
+const STARTUP_GRACE: Duration = Duration::from_secs(120);
+const PROGRESS_GRACE: Duration = Duration::from_secs(45);
+const WATCHDOG_PROBE: Duration = Duration::from_secs(5);
+/// Stop grace for the foreground bridge itself.
+const STOP_GRACE_BRIDGE: Duration = Duration::from_secs(20);
+/// Stop grace for the inner supervisor, which may in turn be stopping a bridge.
+const STOP_GRACE_SUPERVISOR: Duration = Duration::from_secs(45);
+/// A run shorter than this never resets the retry budget: only a genuinely
+/// stable run proves the failure was transient.
+const STABLE_RUN: Duration = Duration::from_secs(60);
 
 struct HeartbeatWatch {
     started: tokio::time::Instant,
@@ -83,9 +101,9 @@ impl HeartbeatWatch {
             }
         }
         if self.last.is_none() {
-            now.duration_since(self.started) >= Duration::from_secs(120)
+            now.duration_since(self.started) >= STARTUP_GRACE
         } else {
-            now.duration_since(self.progress) >= Duration::from_secs(45)
+            now.duration_since(self.progress) >= PROGRESS_GRACE
         }
     }
 }
@@ -93,7 +111,7 @@ impl HeartbeatWatch {
 async fn watch_heartbeat(state: &Path, pid: Option<u32>) {
     let mut watch = HeartbeatWatch::new(tokio::time::Instant::now());
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(WATCHDOG_PROBE).await;
         // Probe on the blocking pool; local filesystem failure must not block
         // control cancellation. One probe at a time, no unbounded retry workers.
         let path = state.to_owned();
@@ -117,7 +135,7 @@ impl Backoff {
         if success {
             return None;
         }
-        if elapsed >= Duration::from_secs(60) {
+        if elapsed >= STABLE_RUN {
             self.failures = 0;
         }
         self.failures += 1;
@@ -126,13 +144,13 @@ impl Backoff {
             return None;
         }
         Some(Duration::from_secs(
-            (2u64 << (self.failures - 1).min(4)).min(30),
+            (2u64 << (self.failures - 1).min(4)).min(RETRY_DELAY_CAP_SECS),
         ))
     }
 }
 
 async fn stop_child(child: &mut Child) -> io::Result<()> {
-    stop_child_with_grace(child, Duration::from_secs(20)).await
+    stop_child_with_grace(child, STOP_GRACE_BRIDGE).await
 }
 async fn stop_child_with_grace(child: &mut Child, grace: Duration) -> io::Result<()> {
     if child.try_wait()?.is_some() {
@@ -162,12 +180,50 @@ async fn stop_child_with_grace(child: &mut Child, grace: Duration) -> io::Result
 }
 
 pub async fn run(config: &Path, state: &Path) -> io::Result<()> {
-    run_layer(config, state, false).await
+    run_layer(config, state, Layer::Supervisor).await
 }
 pub async fn guard(config: &Path, state: &Path) -> io::Result<()> {
-    run_layer(config, state, true).await
+    run_layer(config, state, Layer::Guard).await
 }
-async fn run_layer(config: &Path, state: &Path, outer: bool) -> io::Result<()> {
+
+/// Which supervision layer this process is. The chain is
+/// `guard` → `supervise` → `run`: the guard restarts the supervisor, the
+/// supervisor restarts the bridge and watches its heartbeat; only the inner
+/// layer owns the heartbeat watchdog.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    Guard,
+    Supervisor,
+}
+impl Layer {
+    /// The subcommand this layer spawns as its child.
+    fn child_action(self) -> &'static str {
+        match self {
+            Self::Guard => "supervise",
+            Self::Supervisor => "run",
+        }
+    }
+    fn lock_name(self) -> &'static str {
+        match self {
+            Self::Guard => "guard.lock",
+            Self::Supervisor => "supervisor.lock",
+        }
+    }
+    fn socket_name(self) -> &'static str {
+        match self {
+            Self::Guard => "guard.sock",
+            Self::Supervisor => "control.sock",
+        }
+    }
+    fn stop_grace(self) -> Duration {
+        match self {
+            Self::Guard => STOP_GRACE_SUPERVISOR,
+            Self::Supervisor => STOP_GRACE_BRIDGE,
+        }
+    }
+}
+
+async fn run_layer(config: &Path, state: &Path, layer: Layer) -> io::Result<()> {
     let directory = state.join("runtime");
     fs::DirBuilder::new()
         .recursive(true)
@@ -183,19 +239,18 @@ async fn run_layer(config: &Path, state: &Path, outer: bool) -> io::Result<()> {
         .truncate(false)
         .mode(0o600)
         .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
-        .open(directory.join(if outer {
-            "guard.lock"
-        } else {
-            "supervisor.lock"
-        }))?;
+        .open(directory.join(layer.lock_name()))?;
     validate_lock(&lock)?;
     lock.try_lock_exclusive()?;
     let guard_state = state.join("guard");
-    let recorder = Recorder::open(if outer { &guard_state } else { state })?;
-    recorder.publish(StoredPhase::Starting, 0)?;
+    let recorder = Recorder::open(match layer {
+        Layer::Guard => &guard_state,
+        Layer::Supervisor => state,
+    })?;
+    recorder.publish(Phase::Starting, 0)?;
     crate::descendants::enable()?;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    let socket = directory.join(if outer { "guard.sock" } else { "control.sock" });
+    let socket = directory.join(layer.socket_name());
     match fs::symlink_metadata(&socket) {
         Ok(meta) if meta.file_type().is_socket() => fs::remove_file(&socket)?,
         Ok(_) => return Err(io::Error::other("control path is not a socket")),
@@ -210,9 +265,9 @@ async fn run_layer(config: &Path, state: &Path, outer: bool) -> io::Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let cancel = CancellationToken::new();
-    let phase = std::sync::Arc::new(std::sync::Mutex::new("starting".to_string()));
+    let live = std::sync::Arc::new(std::sync::Mutex::new(LivePhase::default()));
     let control_cancel = cancel.clone();
-    let control_phase = phase.clone();
+    let control_phase = live.clone();
     let control = tokio::spawn(async move {
         let result =
             crate::service_control::serve(listener, control_cancel.clone(), control_phase).await;
@@ -228,9 +283,9 @@ async fn run_layer(config: &Path, state: &Path, outer: bool) -> io::Result<()> {
         &executable,
         &config,
         cancel.clone(),
-        phase.clone(),
+        live.clone(),
         Some(&recorder),
-        if outer { "supervise" } else { "run" },
+        layer,
         Some(state),
     )
     .await;
@@ -252,9 +307,9 @@ async fn supervise(
     executable: &Path,
     config: &Path,
     cancel: CancellationToken,
-    phase: std::sync::Arc<std::sync::Mutex<String>>,
+    live: std::sync::Arc<std::sync::Mutex<LivePhase>>,
     recorder: Option<&Recorder>,
-    action: &str,
+    layer: Layer,
     state: Option<&Path>,
 ) -> io::Result<()> {
     let mut backoff = Backoff::default();
@@ -264,7 +319,7 @@ async fn supervise(
         }
         let mut command = Command::new(executable);
         command
-            .arg(action)
+            .arg(layer.child_action())
             .arg("--config")
             .arg(config)
             .stdin(Stdio::null())
@@ -274,19 +329,28 @@ async fn supervise(
             .process_group(0);
         let mut child = command.spawn()?;
         if let Some(recorder) = recorder {
-            if let Err(error) = recorder.publish(StoredPhase::Running, 0) {
+            if let Err(error) = recorder.publish(Phase::Running, 0) {
                 let _ = stop_child(&mut child).await;
                 crate::descendants::clean().await?;
                 return Err(error);
             }
         }
-        *phase
-            .lock()
-            .map_err(|_| io::Error::other("phase poisoned"))? = "running".into();
+        let set_live = |phase: Phase, delay: u64| -> io::Result<()> {
+            *live
+                .lock()
+                .map_err(|_| io::Error::other("phase poisoned"))? = LivePhase {
+                phase,
+                retry_delay_seconds: delay,
+            };
+            Ok(())
+        };
+        set_live(Phase::Running, 0)?;
         let started = tokio::time::Instant::now();
         let child_id = child.id();
+        // Only the inner layer watches heartbeats: the guard's child is the
+        // supervisor, which runs its own watchdog over the bridge.
         let watchdog = async {
-            if action != "run" {
+            if layer != Layer::Supervisor {
                 std::future::pending::<()>().await;
             }
             if let Some(state) = state {
@@ -298,9 +362,9 @@ async fn supervise(
         let status = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                let recorded = recorder.map(|r| r.publish(StoredPhase::Stopping, 0)).transpose();
-                *phase.lock().map_err(|_| io::Error::other("phase poisoned"))? = "stopping".into();
-                let stopped = stop_child_with_grace(&mut child, Duration::from_secs(if action == "supervise" {45} else {20})).await;
+                let recorded = recorder.map(|r| r.publish(Phase::Stopping, 0)).transpose();
+                set_live(Phase::Stopping, 0)?;
+                let stopped = stop_child_with_grace(&mut child, layer.stop_grace()).await;
                 crate::descendants::clean().await?;
                 recorded?;
                 return stopped;
@@ -312,9 +376,9 @@ async fn supervise(
                 if child.try_wait()?.is_none() {return Err(io::Error::other("bridge did not exit after stalled heartbeat"));}
                 crate::descendants::clean().await?;
                 if backoff.after_exit(false, Duration::ZERO).is_none() {return Err(io::Error::other("heartbeat recovery budget exhausted"));}
-                if let Some(recorder) = recorder {recorder.publish(StoredPhase::Backoff, 30)?;}
-                *phase.lock().map_err(|_| io::Error::other("phase poisoned"))? = "backoff:30".into();
-                tokio::select! {_ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(30)) => {}}
+                if let Some(recorder) = recorder {recorder.publish(Phase::Backoff, RETRY_DELAY_CAP_SECS)?;}
+                set_live(Phase::Backoff, RETRY_DELAY_CAP_SECS)?;
+                tokio::select! {_ = cancel.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(RETRY_DELAY_CAP_SECS)) => {}}
                 continue;
             },
         };
@@ -324,22 +388,18 @@ async fn supervise(
         }
         let Some(delay) = backoff.after_exit(
             false,
-            if action == "supervise" {
-                Duration::ZERO
-            } else {
-                started.elapsed()
+            match layer {
+                Layer::Guard => Duration::ZERO,
+                Layer::Supervisor => started.elapsed(),
             },
         ) else {
             return Err(io::Error::other(
                 "bridge repeatedly exited; restart budget exhausted",
             ));
         };
-        *phase
-            .lock()
-            .map_err(|_| io::Error::other("phase poisoned"))? =
-            format!("backoff:{}", delay.as_secs());
+        set_live(Phase::Backoff, delay.as_secs())?;
         if let Some(recorder) = recorder {
-            recorder.publish(StoredPhase::Backoff, delay.as_secs())?;
+            recorder.publish(Phase::Backoff, delay.as_secs())?;
         }
         eprintln!(
             "{{\"event\":\"supervisor_retry\",\"delay_seconds\":{}}}",
@@ -444,9 +504,9 @@ mod tests {
             Path::new("/nonexistent/bridge"),
             Path::new("/nonexistent/config"),
             cancel,
-            std::sync::Arc::new(std::sync::Mutex::new("starting".into())),
+            std::sync::Arc::new(std::sync::Mutex::new(LivePhase::default())),
             None,
-            "run",
+            Layer::Supervisor,
             None,
         )
         .await

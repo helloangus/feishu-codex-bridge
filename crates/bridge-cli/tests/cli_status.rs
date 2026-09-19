@@ -116,7 +116,10 @@ fn supervisor_control_socket_phase_is_displayed() -> Result<(), BoxError> {
     let config = write_config(temp.path())?;
     let state = temp.path().join("state");
     let _lock = hold_lock(&state, "supervisor.lock")?;
-    let replies = serve_once(&state.join("runtime/control.sock"), "running".into())?;
+    let replies = serve_once(
+        &state.join("runtime/control.sock"),
+        "{\"phase\":\"running\"}".into(),
+    )?;
     let (code, stdout, stderr) =
         run_status(&["status", "--config", config.to_string_lossy().as_ref()])?;
     replies.recv()??;
@@ -131,7 +134,10 @@ fn guard_control_socket_phase_is_displayed() -> Result<(), BoxError> {
     let config = write_config(temp.path())?;
     let state = temp.path().join("state");
     let _lock = hold_lock(&state, "guard.lock")?;
-    let replies = serve_once(&state.join("runtime/guard.sock"), "backoff:5".into())?;
+    let replies = serve_once(
+        &state.join("runtime/guard.sock"),
+        "{\"phase\":\"backoff\",\"retry_delay_seconds\":5}".into(),
+    )?;
     let (code, stdout, stderr) =
         run_status(&["status", "--config", config.to_string_lossy().as_ref()])?;
     replies.recv()??;

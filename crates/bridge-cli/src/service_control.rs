@@ -1,4 +1,10 @@
 //! Local control protocol; the supervisor lock owns the socket pathname.
+//!
+//! Every response is one JSON object describing the answering process: the
+//! live supervision phase (with its retry delay while backing off), the pid,
+//! a stop acknowledgement — or an empty object for an unknown command byte.
+use crate::supervisor_state::{LivePhase, Phase};
+use serde::{Deserialize, Serialize};
 use std::{io, path::Path, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -31,34 +37,57 @@ impl ControlCommand {
     }
 }
 
-/// Supervisor control responses; unknown payloads are surfaced verbatim.
+/// One JSON object on the wire; every field is optional.
+#[derive(Serialize, Deserialize, Default)]
+struct Wire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<Phase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_delay_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+}
+
+fn encode(wire: &Wire) -> String {
+    serde_json::to_string(wire).unwrap_or_default()
+}
+
+/// Supervisor control responses; anything undecodable is [`Self::Invalid`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlResponse {
-    Phase(String),
-    Pid(String),
+    Phase(LivePhase),
+    Pid(u32),
     Stopping,
     Invalid,
 }
 impl ControlResponse {
-    fn parse(payload: String) -> Self {
-        match payload.as_str() {
-            "stopping" => Self::Stopping,
-            "invalid" => Self::Invalid,
-            digits if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
-                Self::Pid(payload)
-            }
-            _ => Self::Phase(payload),
+    fn decode(payload: &str) -> Self {
+        let Ok(wire) = serde_json::from_str::<Wire>(payload) else {
+            return Self::Invalid;
+        };
+        if let Some(pid) = wire.pid {
+            return Self::Pid(pid);
         }
+        if let Some(phase) = wire.phase {
+            return match phase {
+                Phase::Stopping => Self::Stopping,
+                other => Self::Phase(LivePhase {
+                    phase: other,
+                    retry_delay_seconds: wire.retry_delay_seconds.unwrap_or(0),
+                }),
+            };
+        }
+        Self::Invalid
     }
-    pub fn as_phase(&self) -> Option<&str> {
+    pub fn as_phase(&self) -> Option<LivePhase> {
         match self {
-            Self::Phase(phase) => Some(phase),
+            Self::Phase(live) => Some(*live),
             _ => None,
         }
     }
     pub fn as_pid(&self) -> Option<u32> {
         match self {
-            Self::Pid(pid) => pid.parse().ok(),
+            Self::Pid(pid) => Some(*pid),
             _ => None,
         }
     }
@@ -108,7 +137,7 @@ pub async fn request(state: &Path, command: ControlCommand) -> io::Result<Contro
         let payload = String::from_utf8(bytes).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "control response is not UTF-8")
         })?;
-        Ok(ControlResponse::parse(payload))
+        Ok(ControlResponse::decode(&payload))
     })
     .await
     .map_err(|_| io::Error::other("supervisor control timed out"))?
@@ -117,7 +146,7 @@ pub async fn request(state: &Path, command: ControlCommand) -> io::Result<Contro
 pub async fn serve(
     listener: UnixListener,
     cancel: CancellationToken,
-    phase: std::sync::Arc<std::sync::Mutex<String>>,
+    phase: std::sync::Arc<std::sync::Mutex<LivePhase>>,
 ) -> io::Result<()> {
     loop {
         let (mut stream, _) = tokio::select! {
@@ -127,16 +156,29 @@ pub async fn serve(
         let result = tokio::time::timeout(Duration::from_secs(1), async {
             let command = ControlCommand::from_byte(stream.read_u8().await?);
             let response = match command {
-                Some(ControlCommand::Phase) => phase
-                    .lock()
-                    .map_err(|_| io::Error::other("phase poisoned"))?
-                    .clone(),
-                Some(ControlCommand::Pid) => std::process::id().to_string(),
+                Some(ControlCommand::Phase) => {
+                    let live = *phase
+                        .lock()
+                        .map_err(|_| io::Error::other("phase poisoned"))?;
+                    encode(&Wire {
+                        phase: Some(live.phase),
+                        retry_delay_seconds: (live.retry_delay_seconds > 0)
+                            .then_some(live.retry_delay_seconds),
+                        pid: None,
+                    })
+                }
+                Some(ControlCommand::Pid) => encode(&Wire {
+                    pid: Some(std::process::id()),
+                    ..Wire::default()
+                }),
                 Some(ControlCommand::Stop) => {
                     cancel.cancel();
-                    "stopping".into()
+                    encode(&Wire {
+                        phase: Some(Phase::Stopping),
+                        ..Wire::default()
+                    })
                 }
-                None => "invalid".into(),
+                None => encode(&Wire::default()),
             };
             stream.write_all(response.as_bytes()).await
         })
@@ -248,11 +290,17 @@ mod tests {
         lock.lock_exclusive()?;
         let listener = UnixListener::bind(tmp.path().join("runtime/guard.sock"))?;
         let cancel = CancellationToken::new();
-        let phase = std::sync::Arc::new(std::sync::Mutex::new("backoff:8".into()));
+        let phase = std::sync::Arc::new(std::sync::Mutex::new(LivePhase {
+            phase: Phase::Backoff,
+            retry_delay_seconds: 8,
+        }));
         let task = tokio::spawn(serve(listener, cancel.clone(), phase));
         assert_eq!(
             request(tmp.path(), ControlCommand::Phase).await?,
-            ControlResponse::Phase("backoff:8".into())
+            ControlResponse::Phase(LivePhase {
+                phase: Phase::Backoff,
+                retry_delay_seconds: 8
+            })
         );
         assert_eq!(
             request(tmp.path(), ControlCommand::Stop).await?,
@@ -277,18 +325,24 @@ mod tests {
         std::fs::create_dir(tmp.path().join("runtime"))?;
         let listener = UnixListener::bind(tmp.path().join("runtime/control.sock"))?;
         let cancel = CancellationToken::new();
-        let phase = std::sync::Arc::new(std::sync::Mutex::new("backoff:4".into()));
+        let phase = std::sync::Arc::new(std::sync::Mutex::new(LivePhase {
+            phase: Phase::Backoff,
+            retry_delay_seconds: 4,
+        }));
         let task = tokio::spawn(serve(listener, cancel.clone(), phase));
         assert_eq!(
             request(tmp.path(), ControlCommand::Phase).await?,
-            ControlResponse::Phase("backoff:4".into())
+            ControlResponse::Phase(LivePhase {
+                phase: Phase::Backoff,
+                retry_delay_seconds: 4
+            })
         );
         // An unknown wire byte must stay rejected by the responder itself.
         let mut raw = UnixStream::connect(tmp.path().join("runtime/control.sock")).await?;
         raw.write_all(b"?").await?;
         let mut bytes = Vec::new();
         raw.read_to_end(&mut bytes).await?;
-        assert_eq!(bytes, b"invalid");
+        assert_eq!(bytes, b"{}");
         assert!(!cancel.is_cancelled());
         assert_eq!(
             request(tmp.path(), ControlCommand::Stop).await?,
