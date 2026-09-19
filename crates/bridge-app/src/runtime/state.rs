@@ -47,9 +47,12 @@ impl<T: SessionStore + DurableJournal + DirectoryStore> Store for T {}
 
 pub(crate) enum ActiveKind {
     Task,
+    /// A compaction flow. Before the backend acknowledges the request, a
+    /// terminal event parks its outcome in `terminal` while the mutation
+    /// gate stays closed; `thread` is the expected compaction thread.
     Compact {
         acknowledged: bool,
-        terminal: Option<String>,
+        terminal: Option<crate::outcome::Compaction>,
         thread: Option<String>,
     },
 }

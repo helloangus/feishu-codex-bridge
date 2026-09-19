@@ -8,6 +8,7 @@ use crate::{
     Scheduler,
     events::{AgentEvent, TurnOutcome},
     messaging::{DeliveryError, MessageId, Messenger},
+    outcome::{Compaction, Outcome},
     ports::TurnRef,
     presentation::Request as DeliveryRequest,
 };
@@ -172,46 +173,36 @@ pub(crate) fn finish(
     active: &mut Option<Active>,
     scheduler: &mut Scheduler,
     delivery: &mpsc::Sender<DeliveryRequest>,
-    outcome: String,
+    outcome: Outcome,
 ) -> Result<(), RuntimeError> {
     if let Some(active) = active.take() {
         diagnostics.emit(
             crate::diagnostics::Event::TaskFinished,
-            if outcome.starts_with("执行完成") {
-                crate::diagnostics::Status::Ok
-            } else {
-                crate::diagnostics::Status::Failed
-            },
+            crate::presentation::finished_status(&outcome),
             Some(active.spec.id.as_str()),
             active.output.len(),
         );
         if active.is_compact() {
             scheduler.end_session_mutation();
-            return tell(delivery, &active.spec.chat, outcome);
+            return tell(
+                delivery,
+                &active.spec.chat,
+                crate::presentation::label(&outcome),
+            );
         }
         scheduler.finish(&active.spec.id);
-        let (text, truncated) = active
+        let (body, truncated) = active
             .plan
             .as_ref()
-            .map(|(text, truncated)| (text.as_str(), *truncated))
-            .unwrap_or((&active.output, active.truncated));
-        let output = if text.is_empty() {
-            "（无文本输出）"
-        } else {
-            text
-        };
+            .map(|(text, truncated)| (text.clone(), *truncated))
+            .unwrap_or((active.output.clone(), active.truncated));
         delivery
             .try_send(DeliveryRequest::Answer {
                 task: active.spec.id.as_str().to_owned(),
                 chat: active.spec.chat,
-                text: format!(
-                    "{outcome}\n\n{output}{}",
-                    if truncated {
-                        "\n\n输出超过 32 KiB 上限，已截断。"
-                    } else {
-                        ""
-                    }
-                ),
+                outcome,
+                body: Some(body),
+                truncated,
             })
             .map_err(|_| RuntimeError::Capacity("回复队列已满"))?;
     }
@@ -277,48 +268,54 @@ pub(crate) fn event(
         }
         AgentEvent::Finished { outcome, .. } => {
             if let Some(current) = active.as_mut().filter(|active| active.is_compact()) {
-                let label = match outcome {
-                    TurnOutcome::Completed => "上下文压缩完成。".into(),
-                    TurnOutcome::Interrupted => "上下文压缩已停止。".into(),
-                    TurnOutcome::Failed { message, .. } => format!(
-                        "上下文压缩失败：{}",
-                        message
-                            .unwrap_or_else(|| "Codex 未返回原因".into())
-                            .chars()
-                            .take(limits::PREVIEW_CHARS)
-                            .collect::<String>()
-                    ),
+                let terminal = match outcome {
+                    TurnOutcome::Completed => Compaction::Completed,
+                    TurnOutcome::Interrupted => Compaction::Stopped,
+                    TurnOutcome::Failed { message, .. } => Compaction::Failed {
+                        detail: preview(message),
+                    },
                 };
                 if let ActiveKind::Compact {
                     acknowledged,
-                    terminal,
+                    terminal: parked,
                     ..
                 } = &mut current.kind
                 {
                     if !*acknowledged {
-                        *terminal = Some(label);
+                        *parked = Some(terminal);
                         return Ok(None);
                     }
                 }
-                return finish(diagnostics, active, scheduler, delivery, label).map(|_| None);
+                return finish(
+                    diagnostics,
+                    active,
+                    scheduler,
+                    delivery,
+                    Outcome::Compact(terminal),
+                )
+                .map(|_| None);
             }
-            let label = match outcome {
-                TurnOutcome::Completed => "执行完成".into(),
-                TurnOutcome::Interrupted => "任务已停止".into(),
-                TurnOutcome::Failed { message, .. } => format!(
-                    "执行失败：{}",
-                    message
-                        .unwrap_or_else(|| "Codex 未返回原因".into())
-                        .chars()
-                        .take(limits::PREVIEW_CHARS)
-                        .collect::<String>()
-                ),
+            let outcome = match outcome {
+                TurnOutcome::Completed => Outcome::Completed,
+                TurnOutcome::Interrupted => Outcome::Stopped,
+                TurnOutcome::Failed { message, .. } => Outcome::Failed {
+                    detail: preview(message),
+                },
             };
-            finish(diagnostics, active, scheduler, delivery, label)?;
+            finish(diagnostics, active, scheduler, delivery, outcome)?;
         }
         _ => {}
     }
     Ok(offer)
+}
+
+/// Bound a backend-provided failure reason to the diagnostic preview budget.
+fn preview(message: Option<String>) -> String {
+    message
+        .unwrap_or_else(|| "Codex 未返回原因".into())
+        .chars()
+        .take(limits::PREVIEW_CHARS)
+        .collect()
 }
 
 /// Interrupt a turn on the reserved control capacity.
@@ -414,7 +411,7 @@ mod tests {
         )?;
         assert!(messages.try_recv().is_err());
         assert!(!scheduler.begin_session_mutation());
-        let label = match active.as_mut().map(|active| &mut active.kind) {
+        let terminal = match active.as_mut().map(|active| &mut active.kind) {
             Some(ActiveKind::Compact { terminal, .. }) => terminal
                 .take()
                 .ok_or(RuntimeError::Internal("missing terminal"))?,
@@ -425,7 +422,7 @@ mod tests {
             &mut active,
             &mut scheduler,
             &delivery,
-            label,
+            Outcome::Compact(terminal),
         )?;
         assert!(active.is_none());
         assert!(scheduler.begin_session_mutation());

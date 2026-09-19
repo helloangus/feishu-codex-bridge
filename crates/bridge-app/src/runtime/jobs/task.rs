@@ -5,6 +5,7 @@ use super::super::flow::{can_spawn, spawn_interrupt, tell};
 use super::super::limits;
 use super::super::state::{Done, Runtime, TaskDone};
 use crate::execution::Execution;
+use crate::outcome::Outcome;
 use bridge_core::task::{TaskId, TaskSpec};
 use tokio::task::JoinSet;
 
@@ -144,7 +145,9 @@ impl Runtime {
                 &mut self.tasks.active,
                 &mut self.tasks.scheduler,
                 &self.delivery,
-                "系统繁忙，任务未启动；请稍后重试。".into(),
+                Outcome::NotStarted {
+                    label: "系统繁忙，任务未启动；请稍后重试。".into(),
+                },
             )?;
             return Ok(());
         }
@@ -160,7 +163,9 @@ impl Runtime {
                     &mut self.tasks.active,
                     &mut self.tasks.scheduler,
                     &self.delivery,
-                    "准备阶段已停止，未启动任务".into(),
+                    Outcome::NotStarted {
+                        label: "准备阶段已停止，未启动任务".into(),
+                    },
                 )?;
                 return Ok(());
             }
@@ -186,7 +191,7 @@ impl Runtime {
                     &mut self.tasks.active,
                     &mut self.tasks.scheduler,
                     &self.delivery,
-                    format!("准备失败：{error}"),
+                    Outcome::PrepareFailed { detail: error },
                 )?,
             }
         }
@@ -248,7 +253,9 @@ impl Runtime {
                         &mut self.tasks.active,
                         &mut self.tasks.scheduler,
                         &self.delivery,
-                        format!("启动结果未知或失败：{error}；不会自动重试。"),
+                        Outcome::StartUnknown {
+                            detail: error.to_string(),
+                        },
                     )?;
                     return Err(RuntimeError::Backend(
                         "Codex 启动失败，已停止运行以避免重复执行",

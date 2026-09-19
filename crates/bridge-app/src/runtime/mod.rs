@@ -124,12 +124,26 @@ pub async fn run(
                     )
                     .await
                 }
-                crate::presentation::Request::Answer { task, chat, text } => {
+                crate::presentation::Request::Answer {
+                    task,
+                    chat,
+                    outcome,
+                    body,
+                    truncated,
+                } => {
                     let id = task.clone();
+                    let text = crate::presentation::full_text(&outcome, body.as_deref(), truncated);
                     let result = if text_messenger.rich_output() {
                         timeout(
                             limits::ANSWER_DELIVERY_TIMEOUT,
-                            presentation.answer(text_messenger.as_ref(), task, chat, text),
+                            presentation.answer(
+                                text_messenger.as_ref(),
+                                task,
+                                chat,
+                                outcome,
+                                body,
+                                truncated,
+                            ),
                         )
                         .await
                     } else {
@@ -226,7 +240,9 @@ pub async fn run(
             .try_send(crate::presentation::Request::Answer {
                 task: active.spec.id.as_str().to_owned(),
                 chat: active.spec.chat,
-                text: "桥接已停止；未完成任务不会自动重跑。".into(),
+                outcome: crate::outcome::Outcome::BridgeStopped,
+                body: None,
+                truncated: false,
             });
     }
     jobs.abort_all();

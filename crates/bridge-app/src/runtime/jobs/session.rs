@@ -11,6 +11,7 @@ use super::super::flow::{can_spawn, tell};
 use super::super::limits;
 use super::super::state::{Active, ActiveKind, Done, Runtime, SessionDone};
 use crate::execution::Execution;
+use crate::outcome::{Compaction, Outcome};
 use crate::sessions;
 use bridge_core::ExecutionMode;
 use bridge_core::task::{TaskId, TaskSpec};
@@ -423,7 +424,9 @@ impl Runtime {
                         &mut self.tasks.active,
                         &mut self.tasks.scheduler,
                         &self.delivery,
-                        "系统繁忙，压缩未启动；请稍后重试。".into(),
+                        Outcome::NotStarted {
+                            label: "系统繁忙，压缩未启动；请稍后重试。".into(),
+                        },
                     )?;
                     return Ok(());
                 }
@@ -479,7 +482,9 @@ impl Runtime {
                 &mut self.tasks.active,
                 &mut self.tasks.scheduler,
                 &self.delivery,
-                "系统繁忙，压缩未提交；请稍后重试。".into(),
+                Outcome::NotStarted {
+                    label: "系统繁忙，压缩未提交；请稍后重试。".into(),
+                },
             )?;
             return Ok(());
         }
@@ -495,7 +500,9 @@ impl Runtime {
                     &mut self.tasks.active,
                     &mut self.tasks.scheduler,
                     &self.delivery,
-                    "准备阶段已停止，未启动压缩。".into(),
+                    Outcome::NotStarted {
+                        label: "准备阶段已停止，未启动压缩。".into(),
+                    },
                 )?;
                 return Ok(());
             }
@@ -527,7 +534,9 @@ impl Runtime {
                     &mut self.tasks.active,
                     &mut self.tasks.scheduler,
                     &self.delivery,
-                    format!("压缩准备失败：{error}；不会自动重试。"),
+                    Outcome::Compact(Compaction::PrepareFailed {
+                        detail: error.to_string(),
+                    }),
                 )?,
             }
         }
@@ -558,13 +567,13 @@ impl Runtime {
                         }
                         ActiveKind::Task => None,
                     };
-                    if let Some(label) = terminal {
+                    if let Some(terminal) = terminal {
                         super::super::flow::finish(
                             &self.diagnostics,
                             &mut self.tasks.active,
                             &mut self.tasks.scheduler,
                             &self.delivery,
-                            label,
+                            Outcome::Compact(terminal),
                         )?;
                     } else {
                         let chat = active.spec.chat.clone();
@@ -581,7 +590,9 @@ impl Runtime {
                         &mut self.tasks.active,
                         &mut self.tasks.scheduler,
                         &self.delivery,
-                        "压缩请求被拒绝；不会自动重试。".into(),
+                        Outcome::NotStarted {
+                            label: "压缩请求被拒绝；不会自动重试。".into(),
+                        },
                     )?;
                 }
                 Err(error) => {

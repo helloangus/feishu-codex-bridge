@@ -358,6 +358,7 @@ mod tests {
 }
 
 pub mod messaging;
+pub mod outcome;
 pub mod ports;
 
 pub mod events;

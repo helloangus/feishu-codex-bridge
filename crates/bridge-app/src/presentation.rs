@@ -1,7 +1,11 @@
 //! Serial answer and preview delivery. Platform JSON stays in the messenger adapter.
+//!
+//! This module is the only place that turns an [`Outcome`] into user-visible
+//! wording, card tone and diagnostic status.
 use crate::{
-    diagnostics::Diagnostics,
+    diagnostics::{Diagnostics, Status},
     messaging::{DeliveryError, MessageId, Messenger},
+    outcome::{Compaction, Outcome},
 };
 use bridge_core::view::{Panel, Tone};
 use tokio::time::{Duration, timeout};
@@ -11,13 +15,86 @@ pub enum Request {
     Answer {
         task: String,
         chat: String,
-        text: String,
+        outcome: Outcome,
+        /// The selected task output; `None` for flow notices that carry no
+        /// output section at all.
+        body: Option<String>,
+        truncated: bool,
     },
     Progress {
         task: String,
         chat: String,
         text: String,
     },
+}
+
+/// The user-visible first line of an [`Outcome`]. Fixed sentences live here
+/// and nowhere else.
+pub fn label(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Completed => "执行完成".into(),
+        Outcome::Stopped => "任务已停止".into(),
+        Outcome::BridgeStopped => "桥接已停止；未完成任务不会自动重跑。".into(),
+        Outcome::Failed { detail } => format!("执行失败：{detail}"),
+        Outcome::PrepareFailed { detail } => format!("准备失败：{detail}"),
+        Outcome::StartUnknown { detail } => {
+            format!("启动结果未知或失败：{detail}；不会自动重试。")
+        }
+        Outcome::Compact(Compaction::Completed) => "上下文压缩完成。".into(),
+        Outcome::Compact(Compaction::Stopped) => "上下文压缩已停止。".into(),
+        Outcome::Compact(Compaction::Failed { detail }) => format!("上下文压缩失败：{detail}"),
+        Outcome::Compact(Compaction::PrepareFailed { detail }) => {
+            format!("压缩准备失败：{detail}；不会自动重试。")
+        }
+        Outcome::NotStarted { label } => label.clone(),
+    }
+}
+
+/// The full user-visible text of a final answer: headline plus optional
+/// output section. Used for the rich-card path and the plain-text fallback.
+pub fn full_text(outcome: &Outcome, body: Option<&str>, truncated: bool) -> String {
+    let headline = label(outcome);
+    match body {
+        Some(body) => {
+            let body = if body.is_empty() {
+                "（无文本输出）"
+            } else {
+                body
+            };
+            format!(
+                "{headline}\n\n{body}{}",
+                if truncated {
+                    "\n\n输出超过 32 KiB 上限，已截断。"
+                } else {
+                    ""
+                }
+            )
+        }
+        None => headline,
+    }
+}
+
+/// Card tone for a final answer. Compaction and not-started notices travel as
+/// plain text and never reach this mapping, but keep a neutral tone anyway.
+pub fn tone(outcome: &Outcome) -> Tone {
+    match outcome {
+        Outcome::Completed => Tone::Success,
+        Outcome::Stopped | Outcome::BridgeStopped => Tone::Warning,
+        Outcome::Failed { .. } | Outcome::PrepareFailed { .. } | Outcome::StartUnknown { .. } => {
+            Tone::Error
+        }
+        Outcome::Compact(_) | Outcome::NotStarted { .. } => Tone::Info,
+    }
+}
+
+/// Diagnostic status of a finished task: only a normal completion counts as
+/// success.
+pub fn finished_status(outcome: &Outcome) -> Status {
+    if matches!(outcome, Outcome::Completed) {
+        Status::Ok
+    } else {
+        Status::Failed
+    }
 }
 
 /// Bounded UTF-8 parts; split code blocks are closed and reopened with their language.
@@ -137,11 +214,14 @@ impl Presentation {
         m: &dyn Messenger,
         task: String,
         chat: String,
-        text: String,
+        outcome: Outcome,
+        body: Option<String>,
+        truncated: bool,
     ) -> Result<(), DeliveryError> {
+        let headline = label(&outcome);
         if let Some((previous, id)) = self.preview.take() {
             if previous == task {
-                let title = text
+                let title = headline
                     .lines()
                     .next()
                     .filter(|line| line.len() <= 128)
@@ -157,20 +237,10 @@ impl Presentation {
             }
         }
         self.failed_task = None;
+        let text = full_text(&outcome, body.as_deref(), truncated);
         let parts = markdown_parts(&text);
         let total = parts.len();
-        let tone = if text.starts_with("执行完成") {
-            Tone::Success
-        } else if text.starts_with("任务已停止") || text.starts_with("桥接已停止") {
-            Tone::Warning
-        } else if text.starts_with("执行失败")
-            || text.starts_with("准备失败")
-            || text.starts_with("启动结果未知")
-        {
-            Tone::Error
-        } else {
-            Tone::Info
-        };
+        let tone = tone(&outcome);
         let mut failed = false;
         for (index, body) in parts.into_iter().enumerate() {
             let title = if total == 1 {
@@ -303,7 +373,9 @@ mod tests {
             &m,
             "task".into(),
             "chat".into(),
-            "执行完成\n**完整回复**".into(),
+            Outcome::Completed,
+            Some("**完整回复**".into()),
+            false,
         )
         .await?;
         let events = m.events();
@@ -320,7 +392,11 @@ mod tests {
             &m,
             "failed".into(),
             "chat".into(),
-            "执行失败：测试错误".into(),
+            Outcome::Failed {
+                detail: "测试错误".into(),
+            },
+            None,
+            false,
         )
         .await?;
         assert_eq!(
@@ -352,8 +428,17 @@ mod tests {
         )
         .await;
         assert_eq!(m.events().len(), 1);
-        p.answer(&m, "task".into(), "chat".into(), "final".into())
-            .await?;
+        p.answer(
+            &m,
+            "task".into(),
+            "chat".into(),
+            Outcome::NotStarted {
+                label: "final".into(),
+            },
+            None,
+            false,
+        )
+        .await?;
         assert!(
             m.events()
                 .last()
@@ -405,8 +490,15 @@ mod tests {
         )
         .await;
         assert_eq!(m.events().len(), 2);
-        p.answer(&m, "task".into(), "chat".into(), "文".repeat(6000))
-            .await?;
+        p.answer(
+            &m,
+            "task".into(),
+            "chat".into(),
+            Outcome::Completed,
+            Some("文".repeat(6000)),
+            false,
+        )
+        .await?;
         let events = m.events();
         assert_eq!(
             events
